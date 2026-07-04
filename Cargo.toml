@@ -15,7 +15,13 @@ path = "src/bin/spike_naga.rs"
 name = "spike_render"
 path = "src/bin/spike_render.rs"
 
+[[bin]]
+name = "spike_decode"
+path = "src/bin/spike_decode.rs"
+
 [dependencies]
+ffmpeg-next = "8.1"
+crossbeam-channel = "0.5"
 naga = { version = "29", features = ["glsl-in", "wgsl-in"] }
 snap = "1.1"
 wgpu = { version = "29", features = ["glsl", "naga-ir"] }
