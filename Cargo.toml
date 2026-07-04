@@ -11,15 +11,23 @@ path = "src/main.rs"
 name = "spike_naga"
 path = "src/bin/spike_naga.rs"
 
+[[bin]]
+name = "spike_render"
+path = "src/bin/spike_render.rs"
+
 [dependencies]
 naga = { version = "29", features = ["glsl-in", "wgsl-in"] }
 snap = "1.1"
+wgpu = { version = "29", features = ["glsl", "naga-ir"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
 
-# heavier deps added incrementally as milestones need them:
+# added as later increments need them:
 # winit = "0.30.13"
-# wgpu  = { version = "29", features = ["glsl", "naga-ir"] }
 # egui = "0.35"; egui-wgpu = "0.35"; egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links"] }
 # cpal = "0.18"; rustfft = "6"; triple_buffer = "9"; rtrb = "0.3"
-# ffmpeg-next = "8.1"; snap = "1.1"; notify = "8.2"
-# crossbeam-channel = "0.5"; rfd = "0.17"; bytemuck = { version = "1", features = ["derive"] }
-# pollster = "0.4"; anyhow = "1"; thiserror = "2"; log = "0.4"; env_logger = "0.11"; clap = { version = "4", features = ["derive"] }
+# ffmpeg-next = "8.1"; notify = "8.2"
+# crossbeam-channel = "0.5"; rfd = "0.17"; thiserror = "2"; clap = { version = "4", features = ["derive"] }

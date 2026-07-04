@@ -328,6 +328,23 @@ fn parse_and_validate_glsl(pre: &Preprocessed) -> Result<naga::Module, ShaderErr
     Ok(module)
 }
 
+/// Parse + validate a fixed built-in GLSL vertex shader (the fullscreen triangle).
+/// No preamble/preprocessing; used so GLSL fragment shaders get a stage whose
+/// varying interpolation matches naga's GLSL convention.
+pub fn compile_glsl_vertex_module(src: &str) -> Result<naga::Module, ShaderError> {
+    let mut frontend = naga::front::glsl::Frontend::default();
+    let options = naga::front::glsl::Options::from(naga::ShaderStage::Vertex);
+    let module = frontend.parse(&options, src).map_err(|errs| ShaderError::Parse {
+        msg: errs.emit_to_string(src),
+        line: errs.errors.first().map(|e| e.meta.location(src).line_number),
+    })?;
+    validate(&module).map_err(|e| ShaderError::Validation {
+        msg: format!("{e:?}"),
+        line: None,
+    })?;
+    Ok(module)
+}
+
 /// Parse + validate a WGSL user shader (no preamble; documented binding contract).
 pub fn compile_wgsl_to_module(user_src: &str) -> Result<naga::Module, ShaderError> {
     let module = naga::front::wgsl::parse_str(user_src).map_err(|e| {
