@@ -19,7 +19,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::analysis::AudioFrame;
 use crate::audio::{self, AudioCapture};
 use crate::clippool::{self, Clip, Thumbnail};
-use crate::clock::{ClockSource, InternalClock, LinkClock};
+use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{ClipEntry, ClipId, ClipRole, Command, SyncKind, UiMirror};
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -31,6 +31,11 @@ use crate::video::decoder::{self, DecodeHandle};
 use crate::video::frame::DecodedFrame;
 
 const SHADER_DEBOUNCE: Duration = Duration::from_millis(75);
+
+/// Tap-tempo: a gap longer than this starts a fresh measurement, and at most
+/// this many recent taps are averaged.
+const TAP_TIMEOUT: Duration = Duration::from_millis(2000);
+const TAP_MAX: usize = 8;
 
 pub struct Boot {
     pub shader_path: PathBuf,
@@ -72,6 +77,12 @@ pub struct App {
     current: Option<ClipId>,
     video_mode: i32,
     last_beat: f64,
+    // musical re-loop: force the current clip back to its start on a beat grid,
+    // measured in 1/32-beat ticks. None = let the clip loop on EOF only.
+    loop_len: Option<u32>,
+    loop_tracker: BoundaryTracker,
+    // traditional tap-tempo: recent tap instants, averaged into a BPM.
+    tap_times: Vec<Instant>,
 
     // audio
     audio_out: triple_buffer::Output<AudioFrame>,
@@ -121,6 +132,9 @@ impl App {
             current: None,
             video_mode: 0,
             last_beat: 0.0,
+            loop_len: None,
+            loop_tracker: BoundaryTracker::new(),
+            tap_times: Vec::new(),
             audio_out: boot.audio_out,
             audio_capture: boot.audio_capture,
             audio_err_rx: boot.audio_err_rx,
@@ -190,6 +204,9 @@ impl App {
                     self.ensure_decoder(c);
                     self.current = Some(c);
                     self.retain_decoders();
+                    // A freshly swapped clip starts from the top; re-anchor the
+                    // re-loop grid so it doesn't restart mid-clip immediately.
+                    self.loop_tracker.reset();
                 }
                 SequencerEvent::DisarmDecoder => self.retain_decoders(),
             }
@@ -237,6 +254,7 @@ impl App {
         };
         self.sync = kind;
         self.sequencer.reset_boundary(); // beat numbering may jump on switch
+        self.loop_tracker.reset();
         log::info!("sync source: {kind:?}");
     }
 
@@ -258,6 +276,38 @@ impl App {
         }
     }
 
+    /// Derive BPM from the spacing of recent taps. A gap over `TAP_TIMEOUT`
+    /// starts a fresh measurement; the last `TAP_MAX` taps are averaged.
+    fn tap_tempo(&mut self) {
+        let now = Instant::now();
+        if self
+            .tap_times
+            .last()
+            .is_some_and(|&last| now.duration_since(last) > TAP_TIMEOUT)
+        {
+            self.tap_times.clear();
+        }
+        self.tap_times.push(now);
+        if self.tap_times.len() > TAP_MAX {
+            let excess = self.tap_times.len() - TAP_MAX;
+            self.tap_times.drain(0..excess);
+        }
+        if self.tap_times.len() >= 2 {
+            let first = self.tap_times[0];
+            let intervals = (self.tap_times.len() - 1) as f64;
+            let avg = now.duration_since(first).as_secs_f64() / intervals;
+            if avg > 0.0 {
+                let bpm = (60.0 / avg).clamp(20.0, 300.0);
+                self.clock.set_bpm(bpm);
+            }
+        }
+    }
+
+    fn set_loop_len(&mut self, ticks: Option<u32>) {
+        self.loop_len = ticks;
+        self.loop_tracker.reset();
+    }
+
     fn apply_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
         match cmd {
             Command::SetBpm(b) => self.clock.set_bpm(b),
@@ -267,11 +317,13 @@ impl App {
             }
             Command::NudgeBpm(r) => self.clock.nudge_bpm(r),
             Command::TapDownbeat => self.clock.tap_downbeat(),
+            Command::TapTempo => self.tap_tempo(),
             Command::SetSyncSource(kind) => self.set_sync_source(kind),
             Command::SetPhraseLen(n) => {
                 let ev = self.sequencer.set_phrase_len(n);
                 self.apply_seq_events(ev);
             }
+            Command::SetLoopLen(beats) => self.set_loop_len(beats),
             Command::ToggleClipActive(id) => {
                 let ev = self.sequencer.toggle_active(id, self.last_beat);
                 self.apply_seq_events(ev);
@@ -325,6 +377,19 @@ impl App {
         self.last_beat = snap.beat;
         let ev = self.sequencer.tick(&snap);
         self.apply_seq_events(ev);
+
+        // 5b. Musical re-loop: on each grid boundary of `loop_len` (in 1/32-beat
+        // ticks), seek the current clip back to its start so it restarts on the beat.
+        if let (Some(ticks), Some(cur)) = (self.loop_len, self.current) {
+            let grid = ticks as f64 / crate::commands::LOOP_TICKS_PER_BEAT as f64;
+            if snap.is_playing && self.loop_tracker.crossed(snap.beat, grid).is_some() {
+                if let Some(h) = self.decoders.get(&cur) {
+                    h.request_restart();
+                }
+            }
+        } else {
+            self.loop_tracker.reset();
+        }
 
         // 6. Pull the newest frame from the current clip and upload it.
         if let Some(cur) = self.current {
@@ -395,6 +460,7 @@ impl App {
         self.mirror.phase = snap.phase;
         self.mirror.quantum = snap.quantum;
         self.mirror.phrase_len = phrase as u32;
+        self.mirror.loop_len = self.loop_len;
         self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
         self.mirror.sync = Some(self.sync);
@@ -506,6 +572,9 @@ impl App {
             Key::Character(c) => match c.as_str() {
                 "t" if !ev.repeat => {
                     let _ = tx.send(Command::TapDownbeat);
+                }
+                "b" if !ev.repeat => {
+                    let _ = tx.send(Command::TapTempo);
                 }
                 "+" | "=" => {
                     let _ = tx.send(Command::BpmDelta(1.0));

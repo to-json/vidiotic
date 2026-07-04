@@ -72,17 +72,26 @@ error keeps the last good shader and shows the error in the control window.
 
 ## Control window
 
-- **BPM** readout + drag, **±0.1%** nudge, **TAP** (or spacebar) to set the
-  downbeat, phrase length **16/32**.
+- **BPM** readout + drag, **±0.1%** nudge.
+- **TAP** (or spacebar) sets the downbeat — phase only, tempo unchanged.
+- **TEMPO** (or `b`) is a traditional tap tempo: tap it 2+ times and the BPM is
+  set from the average interval (taps more than 2 s apart start fresh).
+- **Next every** *(bars)*: how often the sequencer advances to the next active
+  clip, quantized to the beat grid.
+- **Loop every** *(bars, or off)*: force the current clip back to its start on
+  that beat grid, so the video re-loops on a musical boundary regardless of its
+  own length. `off` = let the clip play through and loop on its own EOF.
 - **Sync**: Internal or **Link** (peer count shown).
 - **Clips** grid: click to toggle a clip in/out of the loop rotation. With two or
-  more active, the sequencer cuts between them on phrase boundaries, pre-arming
-  the next clip a bar early. Markers: gold = active, ▶ = playing, ○ = armed.
+  more active, the sequencer cuts between them on the **Next every** boundary,
+  pre-arming the next clip a bar early. Markers: gold = active, ▶ = playing,
+  ○ = armed.
 - **Shader…** / **Folder…** pickers; audio input device selector (mic, line-in,
   BlackHole loopback); 21-band spectrum.
 
-Output-window hotkeys: `t` tap · `+`/`-` bpm ±1 · `[`/`]` nudge ∓/±0.1% ·
-digits then `Enter` set BPM · `f` fullscreen · `Cmd+Q` quit.
+Output-window hotkeys: `t` tap downbeat · `b` tap tempo · `+`/`-` bpm ±1 ·
+`[`/`]` nudge ∓/±0.1% · digits then `Enter` set BPM · `f` fullscreen · `Cmd+Q`
+quit.
 
 ## Notes on sync gear
 

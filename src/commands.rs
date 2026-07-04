@@ -6,6 +6,11 @@ use std::path::PathBuf;
 
 pub type ClipId = u32;
 
+/// Resolution of the musical re-loop grid: 32 ticks per beat (quarter note), so
+/// an eighth note is 16 ticks and a 4/4 bar is 128. Lets `SetLoopLen` stay an
+/// integer while still expressing sub-beat divisions.
+pub const LOOP_TICKS_PER_BEAT: u32 = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncKind {
     Internal,
@@ -17,9 +22,11 @@ pub enum Command {
     SetBpm(f64),
     BpmDelta(f64),   // ±1 from the +/- keys
     NudgeBpm(f64),   // ratio ±0.001 for the ±0.1% controls
-    TapDownbeat,
+    TapDownbeat,     // snap the downbeat phase to now (does not change tempo)
+    TapTempo,        // derive BPM from the interval between successive taps
     SetSyncSource(SyncKind),
-    SetPhraseLen(u32), // 16 | 32
+    SetPhraseLen(u32),          // beats between auto-transitions to the next clip
+    SetLoopLen(Option<u32>),    // forced video re-loop grid, in 1/32-beat ticks (LOOP_TICKS_PER_BEAT); None = loop on EOF only
     ToggleClipActive(ClipId),
     SetClipDir(PathBuf),
     SetShaderPath(PathBuf),
@@ -54,6 +61,7 @@ pub struct UiMirror {
     pub bar_in_phrase: u32,
     pub bars_per_phrase: u32,
     pub phrase_len: u32,
+    pub loop_len: Option<u32>, // forced re-loop grid in 1/32-beat ticks; None = EOF-only
     pub sync: Option<SyncKind>,
     pub peers: u64,
     pub audio_devices: Vec<(String, String)>, // (id key, name)
