@@ -19,7 +19,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::analysis::AudioFrame;
 use crate::audio::{self, AudioCapture};
 use crate::clippool::{self, Clip, Thumbnail};
-use crate::clock::{ClockSource, InternalClock};
+use crate::clock::{ClockSource, InternalClock, LinkClock};
 use crate::commands::{ClipEntry, ClipId, ClipRole, Command, SyncKind, UiMirror};
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -39,6 +39,7 @@ pub struct Boot {
     pub bpm: f64,
     pub quantum: f64,
     pub phrase_len: u32,
+    pub initial_sync: SyncKind,
     pub clip_dir: Option<PathBuf>,
     pub clips: Vec<Clip>,
     pub auto_active: Vec<ClipId>,
@@ -60,7 +61,9 @@ pub struct App {
     egui: Option<EguiCtl>,
 
     // engine state
-    clock: InternalClock,
+    clock: Box<dyn ClockSource>,
+    sync: SyncKind,
+    quantum: f64,
     sequencer: Sequencer,
     clips: Vec<Clip>,
     clip_dir: Option<PathBuf>,
@@ -107,7 +110,9 @@ impl App {
             graphics: None,
             renderer: None,
             egui: None,
-            clock: InternalClock::new(boot.bpm, boot.quantum),
+            clock: Box::new(InternalClock::new(boot.bpm, boot.quantum)),
+            sync: SyncKind::Internal,
+            quantum: boot.quantum,
             sequencer: Sequencer::new(boot.phrase_len as f64),
             clips: boot.clips,
             clip_dir: boot.clip_dir,
@@ -143,6 +148,9 @@ impl App {
         for id in boot.auto_active {
             let ev = app.sequencer.toggle_active(id, 0.0);
             app.apply_seq_events(ev);
+        }
+        if boot.initial_sync == SyncKind::Link {
+            app.set_sync_source(SyncKind::Link);
         }
         app
     }
@@ -218,6 +226,20 @@ impl App {
         }
     }
 
+    fn set_sync_source(&mut self, kind: SyncKind) {
+        if kind == self.sync {
+            return;
+        }
+        let snap = self.clock.snapshot();
+        self.clock = match kind {
+            SyncKind::Internal => Box::new(InternalClock::from_snapshot(&snap)),
+            SyncKind::Link => Box::new(LinkClock::new(snap.bpm, self.quantum)),
+        };
+        self.sync = kind;
+        self.sequencer.reset_boundary(); // beat numbering may jump on switch
+        log::info!("sync source: {kind:?}");
+    }
+
     fn switch_audio_device(&mut self, name: Option<String>) {
         let (err_tx, err_rx) = crossbeam_channel::bounded::<cpal::Error>(8);
         match audio::build_capture(
@@ -245,10 +267,7 @@ impl App {
             }
             Command::NudgeBpm(r) => self.clock.nudge_bpm(r),
             Command::TapDownbeat => self.clock.tap_downbeat(),
-            Command::SetSyncSource(SyncKind::Internal) => {}
-            Command::SetSyncSource(SyncKind::Link) => {
-                log::info!("Link sync arrives in M3; staying on internal clock")
-            }
+            Command::SetSyncSource(kind) => self.set_sync_source(kind),
             Command::SetPhraseLen(n) => {
                 let ev = self.sequencer.set_phrase_len(n);
                 self.apply_seq_events(ev);
@@ -378,8 +397,8 @@ impl App {
         self.mirror.phrase_len = phrase as u32;
         self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
-        self.mirror.sync = Some(SyncKind::Internal);
-        self.mirror.peers = 0;
+        self.mirror.sync = Some(self.sync);
+        self.mirror.peers = self.clock.caps().peers;
         self.mirror.audio_devices = self
             .audio_devices
             .iter()

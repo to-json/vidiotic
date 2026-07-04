@@ -42,6 +42,7 @@ egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false, features = ["links"] }
 rfd = "0.15"
+rusty_link = "0.4"
 
 # added as later milestones need them:
-# rusty_link = "0.4"; midir = "0.10"
+# midir = "0.10"

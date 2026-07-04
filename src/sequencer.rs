@@ -175,6 +175,12 @@ impl Sequencer {
         vec![]
     }
 
+    /// Reset the phrase-boundary tracker (on a sync-source switch, where beat
+    /// numbering may jump discontinuously).
+    pub fn reset_boundary(&mut self) {
+        self.tracker.reset();
+    }
+
     /// Currently displayed clip, if any.
     pub fn playing(&self) -> Option<ClipId> {
         match self.state {

@@ -118,6 +118,81 @@ impl ClockSource for InternalClock {
     }
 }
 
+/// Ableton Link clock: follows a shared session's tempo and phase. rekordbox 6+
+/// in Performance mode speaks Link, as do Ableton Live and many apps. We always
+/// report `is_playing = true` — VJ visuals should keep running regardless of the
+/// session's transport (start/stop) state.
+pub struct LinkClock {
+    link: rusty_link::AblLink,
+    state: rusty_link::SessionState, // reusable scratch; capture fills it in place
+    quantum: f64,
+}
+
+impl LinkClock {
+    pub fn new(initial_bpm: f64, quantum: f64) -> Self {
+        let link = rusty_link::AblLink::new(initial_bpm);
+        link.enable_start_stop_sync(true);
+        link.enable(true); // begins peer discovery
+        LinkClock {
+            link,
+            state: rusty_link::SessionState::new(),
+            quantum,
+        }
+    }
+}
+
+impl ClockSource for LinkClock {
+    fn snapshot(&mut self) -> ClockSnapshot {
+        let t = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        ClockSnapshot {
+            bpm: self.state.tempo(),
+            beat: self.state.beat_at_time(t, self.quantum),
+            phase: self.state.phase_at_time(t, self.quantum),
+            quantum: self.quantum,
+            is_playing: true,
+        }
+    }
+
+    fn set_bpm(&mut self, bpm: f64) {
+        let t = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        self.state.set_tempo(bpm.clamp(BPM_MIN, BPM_MAX), t);
+        self.link.commit_app_session_state(&self.state);
+    }
+
+    fn nudge_bpm(&mut self, ratio: f64) {
+        let t = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        let new = (self.state.tempo() * (1.0 + ratio)).clamp(BPM_MIN, BPM_MAX);
+        self.state.set_tempo(new, t);
+        self.link.commit_app_session_state(&self.state);
+    }
+
+    fn tap_downbeat(&mut self) {
+        let t = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        let beat = self.state.beat_at_time(t, self.quantum);
+        let target = (beat / self.quantum).round() * self.quantum;
+        self.state.request_beat_at_time(target, t, self.quantum);
+        self.link.commit_app_session_state(&self.state);
+    }
+
+    fn caps(&self) -> ClockCaps {
+        ClockCaps {
+            can_set_tempo: true,
+            can_set_phase: true,
+            peers: self.link.num_peers(),
+        }
+    }
+}
+
+impl Drop for LinkClock {
+    fn drop(&mut self) {
+        self.link.enable(false);
+    }
+}
+
 /// Detects when the beat clock crosses a phrase boundary, tolerating the
 /// backwards jumps a tap can cause.
 pub struct BoundaryTracker {
@@ -204,6 +279,19 @@ mod tests {
         // beat must not jump on a tempo change (allow tiny elapsed advance)
         assert!((b1 - b0).abs() < 0.05, "beat jumped by {}", b1 - b0);
         assert_eq!(c.snapshot().bpm, 174.0);
+    }
+
+    #[test]
+    fn link_clock_constructs_and_snapshots() {
+        // Proves the Ableton Link FFI binding works: construct, follow tempo,
+        // read peers. (No assertion on exact tempo — another Link app on the LAN
+        // could negotiate it; peers may be >0 for the same reason.)
+        let mut c = LinkClock::new(128.0, 4.0);
+        let s = c.snapshot();
+        assert!(s.bpm.is_finite() && s.bpm > 0.0);
+        assert!(s.is_playing);
+        assert_eq!(s.quantum, 4.0);
+        let _ = c.caps().peers;
     }
 
     #[test]

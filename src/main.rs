@@ -6,7 +6,7 @@ use vidiotic::analysis::{self, AudioCtl, AudioFrame};
 use vidiotic::app::{self, Boot};
 use vidiotic::audio;
 use vidiotic::clippool;
-use vidiotic::commands::{ClipId, Command};
+use vidiotic::commands::{ClipId, Command, SyncKind};
 use vidiotic::transcode;
 
 const QUANTUM: f64 = 4.0;
@@ -52,6 +52,10 @@ struct RunArgs {
     /// Phrase length in beats for auto-transitions (16 or 32).
     #[arg(long, default_value_t = 16)]
     phrase_len: u32,
+
+    /// Clock sync source at startup: internal or link (Ableton Link).
+    #[arg(long, default_value = "internal")]
+    sync: String,
 
     /// Output monitor index for fullscreen (default: first non-primary).
     #[arg(long)]
@@ -128,6 +132,11 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         bpm: cli.bpm,
         quantum: QUANTUM,
         phrase_len: cli.phrase_len,
+        initial_sync: if cli.sync.eq_ignore_ascii_case("link") {
+            SyncKind::Link
+        } else {
+            SyncKind::Internal
+        },
         clip_dir,
         clips,
         auto_active,

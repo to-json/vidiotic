@@ -225,7 +225,7 @@ fn control_ui(
                     if ui.selectable_label(cur == SyncKind::Internal, "Internal").clicked() {
                         let _ = tx.send(Command::SetSyncSource(SyncKind::Internal));
                     }
-                    if ui.selectable_label(cur == SyncKind::Link, "Link (M3)").clicked() {
+                    if ui.selectable_label(cur == SyncKind::Link, "Link").clicked() {
                         let _ = tx.send(Command::SetSyncSource(SyncKind::Link));
                     }
                 });
