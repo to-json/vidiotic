@@ -1,25 +1,92 @@
-//! wgpu setup for the output window. M1 is single-window; M2 adds the control
-//! window sharing this Device/Queue.
+//! wgpu setup: one shared Device/Queue driving two window surfaces — the
+//! fullscreen output (video+shader) and the control window (egui).
 
 use std::sync::Arc;
 
 use winit::window::Window;
 
-pub struct Gfx {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+pub struct WindowSurface {
+    pub window: Arc<Window>,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
-    pub window: Arc<Window>,
 }
 
-impl Gfx {
-    pub fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+impl WindowSurface {
+    fn configure(
+        device: &wgpu::Device,
+        adapter: &wgpu::Adapter,
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
+        present_mode: wgpu::PresentMode,
+    ) -> Self {
+        // Gamma-space pipeline everywhere: prefer a non-sRGB surface format.
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+        };
+        surface.configure(device, &config);
+        WindowSurface {
+            window,
+            surface,
+            config,
+        }
+    }
+
+    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            self.config.width = w;
+            self.config.height = h;
+            self.surface.configure(device, &self.config);
+        }
+    }
+
+    pub fn acquire(&self, device: &wgpu::Device) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                Some(t)
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(device, &self.config);
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => None,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::error!("surface validation error");
+                None
+            }
+        }
+    }
+}
+
+pub struct Graphics {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub output: WindowSurface,
+    pub control: WindowSurface,
+}
+
+impl Graphics {
+    pub fn new(output_win: Arc<Window>, control_win: Arc<Window>) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone())?;
+        let out_surface = instance.create_surface(output_win.clone())?;
+        let ctl_surface = instance.create_surface(control_win.clone())?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
+            compatible_surface: Some(&out_surface),
             force_fallback_adapter: false,
         }))?;
         anyhow::ensure!(
@@ -36,58 +103,25 @@ impl Gfx {
                 ..Default::default()
             }))?;
 
-        // Gamma-space pipeline: prefer a non-sRGB surface (see plan reconciliation).
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo, // vsync; blocks -> paces the loop
-            desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
-        };
-        surface.configure(&device, &config);
-
-        Ok(Gfx {
+        let output = WindowSurface::configure(
+            &device,
+            &adapter,
+            output_win,
+            out_surface,
+            wgpu::PresentMode::Fifo,
+        );
+        let control = WindowSurface::configure(
+            &device,
+            &adapter,
+            control_win,
+            ctl_surface,
+            wgpu::PresentMode::AutoVsync,
+        );
+        Ok(Graphics {
             device,
             queue,
-            surface,
-            config,
-            window,
+            output,
+            control,
         })
-    }
-
-    pub fn resize(&mut self, w: u32, h: u32) {
-        if w > 0 && h > 0 {
-            self.config.width = w;
-            self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
-
-    /// Acquire the next swapchain texture, reconfiguring on lost/outdated.
-    pub fn acquire(&self) -> Option<wgpu::SurfaceTexture> {
-        match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                None
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => None,
-            wgpu::CurrentSurfaceTexture::Validation => {
-                log::error!("surface validation error");
-                None
-            }
-        }
     }
 }

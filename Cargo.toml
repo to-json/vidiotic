@@ -38,7 +38,10 @@ rtrb = "0.3"
 winit = "0.30.13"
 notify = "8.2"
 clap = { version = "4", features = ["derive"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = { version = "0.35", default-features = false, features = ["links"] }
+rfd = "0.15"
 
 # added as later milestones need them:
-# egui = "0.35"; egui-wgpu = "0.35"; egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links"] }
-# rfd = "0.17"; thiserror = "2"; rusty_link = "0.4"; midir = "0.10"
+# rusty_link = "0.4"; midir = "0.10"
