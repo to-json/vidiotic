@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use vidiotic::analysis::{self, AudioCtl, AudioFrame};
 use vidiotic::app::{self, Boot};
 use vidiotic::audio;
 use vidiotic::clock::InternalClock;
+use vidiotic::transcode;
 use vidiotic::video::decoder;
 
 const QUANTUM: f64 = 4.0;
@@ -13,6 +14,25 @@ const QUANTUM: f64 = 4.0;
 #[derive(Parser)]
 #[command(name = "vidiotic", version, about = "VJ controller: audio-reactive shader over video clips")]
 struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the VJ player.
+    Run(RunArgs),
+    /// Transcode a video to a HAP .mov for fast, near-zero-CPU playback.
+    Transcode {
+        /// Source video (any format ffmpeg can decode).
+        input: PathBuf,
+        /// Destination .mov (HAP1).
+        output: PathBuf,
+    },
+}
+
+#[derive(Parser)]
+struct RunArgs {
     /// Video clip to loop (HAP .mov preferred; H.264/etc. via software decode).
     #[arg(short, long)]
     clip: PathBuf,
@@ -40,8 +60,13 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let cli = Cli::parse();
+    match Cli::parse().cmd {
+        Cmd::Transcode { input, output } => transcode::run(&input, &output),
+        Cmd::Run(args) => run_player(args),
+    }
+}
 
+fn run_player(cli: RunArgs) -> anyhow::Result<()> {
     // Audio analysis handoff: capture ring control channel + wait-free band output.
     let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded::<AudioCtl>();
     let (err_tx, err_rx) = crossbeam_channel::bounded::<cpal::Error>(8);
@@ -50,20 +75,12 @@ fn main() -> anyhow::Result<()> {
         .name("analysis".into())
         .spawn(move || analysis::run(ctl_rx, audio_in))?;
 
-    // Live capture from the chosen (or default) input device.
     let host = cpal::default_host();
-    let audio_capture = audio::build_capture(
-        &host,
-        None,
-        cli.audio_device.as_deref(),
-        &ctl_tx,
-        err_tx,
-    )?;
+    let audio_capture =
+        audio::build_capture(&host, None, cli.audio_device.as_deref(), &ctl_tx, err_tx)?;
     log::info!("capturing audio from '{}'", audio_capture.device_name);
 
-    // Clip decode worker (loops).
     let decode = decoder::spawn(cli.clip.clone())?;
-
     let clock = InternalClock::new(cli.bpm, QUANTUM);
 
     let boot = Boot {

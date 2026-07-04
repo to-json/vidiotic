@@ -263,9 +263,39 @@ pub fn decode_frame(
     }
 }
 
+/// Encode BC1 (DXT1) texture bytes as a single-section Snappy-compressed HAP1
+/// frame (the inverse of `decode_frame` for the Hap1 path). Used by the
+/// transcode helper to produce `.mov` clips this app can play back.
+pub fn encode_hap1_frame(bc1: &[u8]) -> Vec<u8> {
+    let compressed = snap::raw::Encoder::new()
+        .compress_vec(bc1)
+        .expect("snappy compression is infallible for valid input");
+    let ty = COMP_SNAPPY | FMT_RGB_DXT1;
+    let n = compressed.len();
+    let mut out = Vec::with_capacity(n + 8);
+    if n < (1 << 24) {
+        out.extend_from_slice(&[n as u8, (n >> 8) as u8, (n >> 16) as u8, ty]);
+    } else {
+        out.extend_from_slice(&[0, 0, 0, ty]);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    }
+    out.extend_from_slice(&compressed);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let bc1: Vec<u8> = (0..(64u32 * 8)).map(|i| (i * 5) as u8).collect(); // 64 blocks
+        let frame = encode_hap1_frame(&bc1);
+        let (mut main, mut alpha) = (Vec::new(), Vec::new());
+        let meta = decode_frame(&frame, 1, &mut main, &mut alpha).unwrap();
+        assert_eq!(meta.format, HapTextureFormat::Bc1);
+        assert_eq!(main, bc1);
+    }
 
     /// Build a section: 3-byte LE size + type byte + payload.
     fn section(ty: u8, payload: &[u8]) -> Vec<u8> {

@@ -9,4 +9,5 @@ pub mod gfx;
 pub mod render;
 pub mod shader;
 pub mod shaderwatch;
+pub mod transcode;
 pub mod video;
