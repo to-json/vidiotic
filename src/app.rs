@@ -131,6 +131,14 @@ pub struct App {
     should_quit: bool,
     output_id: Option<WindowId>,
     control_id: Option<WindowId>,
+    // While occluded (screen locked/asleep, window covered/minimized), the
+    // compositor never hands back a drawable, so `get_current_texture()`
+    // returns instantly instead of blocking on vsync. Poll-driving redraw
+    // requests in that state spins the render loop at native CPU speed and
+    // leaks GPU-side surface resources (see memcheck-* repro). Skip drawing
+    // entirely while occluded instead.
+    output_occluded: bool,
+    control_occluded: bool,
 }
 
 impl App {
@@ -183,6 +191,8 @@ impl App {
             should_quit: false,
             output_id: None,
             control_id: None,
+            output_occluded: false,
+            control_occluded: false,
         };
         // Activate any clips requested at startup (e.g. from --clip): each becomes
         // a default full-length cue in the live bank.
@@ -509,6 +519,15 @@ impl App {
         self.loop_tracker.reset();
     }
 
+    /// Hard-reset the beat grid to its origin (bar 1, beat 1, phrase 1) and
+    /// re-prime the phrase/loop boundary trackers so nothing misfires on the
+    /// backward jump.
+    fn reset_clock(&mut self) {
+        self.clock.reset();
+        self.loop_tracker.reset();
+        self.sequencer.reset_boundary();
+    }
+
     fn apply_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
         match cmd {
             Command::SetBpm(b) => self.clock.set_bpm(b),
@@ -519,6 +538,7 @@ impl App {
             Command::NudgeBpm(r) => self.clock.nudge_bpm(r),
             Command::TapDownbeat => self.clock.tap_downbeat(),
             Command::TapTempo => self.tap_tempo(),
+            Command::ResetClock => self.reset_clock(),
             Command::SetSyncSource(kind) => self.set_sync_source(kind),
             Command::SetPhraseLen(n) => {
                 let ev = self.sequencer.set_phrase_len(n);
@@ -618,12 +638,17 @@ impl App {
                     newest = Some(f);
                 }
             }
-            if let (Some(frame), Some(g), Some(r)) =
-                (newest, self.graphics.as_ref(), self.renderer.as_mut())
-            {
+            if let Some(frame) = newest {
                 self.current_pts = frame.pts_sec;
                 self.video_mode = frame.pixels.video_mode();
-                r.upload_frame(&g.device, &g.queue, &frame);
+                // Skipped while occluded — nothing will ever present this
+                // texture, and the write_texture call leaks GPU-side staging
+                // memory when no frame is ever submitted to reclaim it.
+                if !self.output_occluded {
+                    if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
+                        r.upload_frame(&g.device, &g.queue, &frame);
+                    }
+                }
             }
         }
 
@@ -637,45 +662,68 @@ impl App {
             r.set_active_shader(override_shader);
         }
 
-        // 7. Uniforms.
+        // 7. Uniforms. Skipped while occluded: these are two GPU queue writes
+        // (globals buffer + audio texture) that would otherwise fire on every
+        // Poll-loop tick with no frame ever submitted to reclaim them — the
+        // actual leak mechanism (see memcheck-* repro), independent of the
+        // acquire-spin fixed above.
         let audio: AudioFrame = *self.audio_out.read();
-        if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_ref()) {
-            let phrase = self.sequencer.phrase_len();
-            let mut globals = Globals {
-                resolution: [g.output.config.width as f32, g.output.config.height as f32],
-                mouse: [0.0, 0.0],
-                time: self.start.elapsed().as_secs_f32(),
-                lvl: audio.level,
-                beat: snap.beat.rem_euclid(16384.0) as f32,
-                bar_phase: (snap.phase / snap.quantum) as f32,
-                phrase_phase: (snap.beat.rem_euclid(phrase) / phrase) as f32,
-                bpm: snap.bpm as f32,
-                video_mode: self.video_mode,
-                _pad0: 0.0,
-                freqs: [[0.0; 4]; 6],
-            };
-            globals.set_bands(&audio.bands);
-            r.update_globals(&g.queue, &globals);
+        if !self.output_occluded {
+            if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_ref()) {
+                let phrase = self.sequencer.phrase_len();
+                let mut globals = Globals {
+                    resolution: [g.output.config.width as f32, g.output.config.height as f32],
+                    mouse: [0.0, 0.0],
+                    time: self.start.elapsed().as_secs_f32(),
+                    lvl: audio.level,
+                    beat: snap.beat.rem_euclid(16384.0) as f32,
+                    bar_phase: (snap.phase / snap.quantum) as f32,
+                    phrase_phase: (snap.beat.rem_euclid(phrase) / phrase) as f32,
+                    bpm: snap.bpm as f32,
+                    video_mode: self.video_mode,
+                    _pad0: 0.0,
+                    freqs: [[0.0; 4]; 6],
+                };
+                globals.set_bands(&audio.bands);
+                r.update_globals(&g.queue, &globals);
+                r.upload_audio(&g.queue, &audio.audio_tex);
+            }
         }
 
         // 8. Publish the mirror for the control window.
         self.build_mirror(&snap, &audio);
 
-        // 9. Redraw scheduling.
+        // 9. Redraw scheduling. Skip windows that are occluded (screen locked/
+        // asleep, covered, minimized): the compositor has no drawable to hand
+        // back, so `get_current_texture()` returns instantly instead of
+        // blocking on vsync, and polling it in that state spins the loop at
+        // full CPU speed leaking GPU-side surface resources.
         if let Some(g) = self.graphics.as_ref() {
-            g.output.window.request_redraw();
+            if !self.output_occluded {
+                g.output.window.request_redraw();
+            }
             let repaint_due = self
                 .egui
                 .as_ref()
                 .and_then(|e| e.repaint_at)
                 .is_some_and(|t| Instant::now() >= t);
             // control repaints ~each tick while shown (cheap; it clears on occlusion)
-            g.control.window.request_redraw();
+            if !self.control_occluded {
+                g.control.window.request_redraw();
+            }
             let _ = repaint_due;
         }
 
         if self.should_quit {
             event_loop.exit();
+        }
+
+        // Nothing paces `ControlFlow::Poll` while both windows are occluded
+        // (no vsync wait, no redraw request) — without this the loop free-spins
+        // at raw CPU speed. A short sleep is a cheap, robust backstop regardless
+        // of what future per-tick work might get added.
+        if self.output_occluded && self.control_occluded {
+            std::thread::sleep(Duration::from_millis(16));
         }
     }
 
@@ -787,6 +835,13 @@ impl App {
             .collect();
 
         self.mirror.levels = audio.bands;
+        // The 512-bin linear FFT row of the iChannel0 texture, already 0..1.
+        self.mirror.spectrum_linear.clear();
+        self.mirror.spectrum_linear.extend(
+            audio.audio_tex[..crate::analysis::AUDIO_TEX_W]
+                .iter()
+                .map(|&b| b as f32 / 255.0),
+        );
         self.mirror.level = audio.level;
         self.mirror.fullscreen = self.fullscreen;
     }
@@ -795,6 +850,9 @@ impl App {
         let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_ref()) else {
             return;
         };
+        if self.output_occluded {
+            return;
+        }
         if let Some(frame) = g.output.acquire(&g.device) {
             let view = frame
                 .texture
@@ -816,6 +874,9 @@ impl App {
         let (Some(g), Some(egui)) = (self.graphics.as_ref(), self.egui.as_mut()) else {
             return;
         };
+        if self.control_occluded {
+            return;
+        }
         egui.render(&g.device, &g.queue, &g.control, &self.mirror, &self.cmd_tx);
     }
 
@@ -986,6 +1047,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(m) if is_output => self.modifiers = m,
             WindowEvent::KeyboardInput { event, .. } if is_output => self.handle_key(&event),
+            WindowEvent::Occluded(occluded) if is_output => self.output_occluded = occluded,
+            WindowEvent::Occluded(occluded) if is_control => self.control_occluded = occluded,
             WindowEvent::RedrawRequested if is_output => self.render_output(),
             WindowEvent::RedrawRequested if is_control => self.render_control(),
             _ => {}

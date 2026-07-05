@@ -31,6 +31,8 @@ pub trait ClockSource {
     fn nudge_bpm(&mut self, ratio: f64);
     /// Make "now" an exact quantum (bar) boundary — sets the downbeat anchor.
     fn tap_downbeat(&mut self);
+    /// Reset the grid to its origin: `beat = 0` — note one of bar one, phrase one.
+    fn reset(&mut self);
     fn caps(&self) -> ClockCaps;
 }
 
@@ -109,6 +111,11 @@ impl ClockSource for InternalClock {
         self.beats_at_anchor = (self.beats_at_anchor / self.quantum).round() * self.quantum;
     }
 
+    fn reset(&mut self) {
+        self.anchor = Instant::now();
+        self.beats_at_anchor = 0.0;
+    }
+
     fn caps(&self) -> ClockCaps {
         ClockCaps {
             can_set_tempo: true,
@@ -175,6 +182,15 @@ impl ClockSource for LinkClock {
         let beat = self.state.beat_at_time(t, self.quantum);
         let target = (beat / self.quantum).round() * self.quantum;
         self.state.request_beat_at_time(target, t, self.quantum);
+        self.link.commit_app_session_state(&self.state);
+    }
+
+    fn reset(&mut self) {
+        // Request the current instant be beat 0. With peers this shifts the
+        // whole session's grid — that's the intended meaning of a manual reset.
+        let t = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        self.state.request_beat_at_time(0.0, t, self.quantum);
         self.link.commit_app_session_state(&self.state);
     }
 
@@ -302,5 +318,16 @@ mod tests {
         c.tap_downbeat();
         let phase = c.snapshot().phase;
         assert!(phase < 0.05 || phase > 3.95, "phase not near boundary: {phase}");
+    }
+
+    #[test]
+    fn reset_returns_to_grid_origin() {
+        // A high tempo so a few beats accrue quickly, then reset → beat ~0.
+        let mut c = InternalClock::new(600.0, 4.0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(c.snapshot().beat > 0.1, "expected the beat to advance first");
+        c.reset();
+        let beat = c.snapshot().beat;
+        assert!(beat < 0.05, "beat not at origin after reset: {beat}");
     }
 }

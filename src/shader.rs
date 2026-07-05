@@ -28,6 +28,12 @@ const KNOWN_UNIFORMS: &[&str] = &[
 
 const GLSL_TYPES: &[&str] = &["float", "int", "vec2", "vec3", "vec4"];
 
+/// Shadertoy sampler channels. `iChannel0` is backed by the audio texture via a
+/// preamble `#define`; a user redeclaring any of these as a `sampler2D` uniform
+/// is stripped (naga rejects combined-sampler uniforms, and it would collide
+/// with the define).
+const KNOWN_SAMPLERS: &[&str] = &["iChannel0", "iChannel1", "iChannel2", "iChannel3"];
+
 /// Varyings the built-in vertex shader / preamble provide.
 const KNOWN_IN_VARYINGS: &[&str] = &["fragTexCoord", "fragColor"];
 
@@ -131,13 +137,14 @@ fn strip_layout_prefix(s: &str) -> &str {
     t
 }
 
-/// True if the (trimmed) line declares one of the preamble-provided uniforms.
+/// True if the (trimmed) line declares one of the preamble-provided uniforms,
+/// or a Shadertoy `sampler2D iChannelN` the preamble/app already back.
 fn is_known_uniform_decl(line: &str) -> bool {
     let w = ident_words(line);
     w.len() >= 3
         && w[0] == "uniform"
-        && GLSL_TYPES.contains(&w[1])
-        && KNOWN_UNIFORMS.contains(&w[2])
+        && ((GLSL_TYPES.contains(&w[1]) && KNOWN_UNIFORMS.contains(&w[2]))
+            || (w[1] == "sampler2D" && KNOWN_SAMPLERS.contains(&w[2])))
 }
 
 /// If the (trimmed) line is `#version ...` or `precision ...;`, blank it.
@@ -395,6 +402,18 @@ mod tests {
         assert!(!pre.combined.contains("uniform float time;"));
         // preamble still declares Globals { ... time ... }
         assert!(pre.combined.contains("uniform Globals"));
+    }
+
+    #[test]
+    fn strips_shadertoy_channel_uniforms() {
+        // A fully-pasted Shadertoy shader may declare its channels; the audio
+        // one is backed by the preamble #define and must be stripped (naga also
+        // rejects combined-sampler uniforms). A `void main` using iChannel0 then
+        // compiles end to end.
+        let src = "uniform sampler2D iChannel0;\nvoid main(){ FragColor = vec4(texture(iChannel0, fragTexCoord.xy).x); }\n";
+        let pre = preprocess_glsl(src);
+        assert!(!pre.combined.contains("uniform sampler2D iChannel0;"));
+        compile_glsl_to_module(src).expect("iChannel0 audio shader must compile");
     }
 
     #[test]

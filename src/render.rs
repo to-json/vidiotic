@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use crate::analysis::{AUDIO_TEX_LEN, AUDIO_TEX_W};
 use crate::commands::ShaderId;
 use crate::shader::{self, ShaderError, ShaderLang};
 use crate::video::frame::{DecodedFrame, PixelData};
@@ -96,6 +97,11 @@ pub struct Renderer {
     vs_wgsl: wgpu::ShaderModule, // paired with WGSL fragment shaders
     sampler: wgpu::Sampler,
     dummy_alpha_view: wgpu::TextureView,
+    // Shadertoy audio texture (512x2 R8): row 0 FFT, row 1 waveform. Persistent,
+    // rewritten every frame, and bound into every video bind group.
+    audio_tex: wgpu::Texture,
+    audio_view: wgpu::TextureView,
+    audio_sampler: wgpu::Sampler,
     color_format: wgpu::TextureFormat,
 
     video: Option<VideoTexture>,
@@ -165,6 +171,13 @@ impl Renderer {
                     count: None,
                 },
                 tex_entry(2),
+                tex_entry(3), // audioTex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, // audioSmp
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -217,6 +230,36 @@ impl Renderer {
         });
         let dummy_alpha_view = dummy.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Persistent 512x2 R8 audio texture, rewritten each frame from the
+        // analysis thread's packed spectrum + waveform rows.
+        let audio_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("audio-tex"),
+            size: wgpu::Extent3d {
+                width: AUDIO_TEX_W as u32,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let audio_view = audio_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Clamp on x so the top FFT bin doesn't wrap under linear filtering;
+        // Shadertoy audio channels are clamp+linear.
+        let audio_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("audio-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         // Built-in passthrough so the app always renders (startup / compile failure).
         let passthrough = {
             let module = shader::compile_glsl_to_module(
@@ -239,6 +282,9 @@ impl Renderer {
             vs_wgsl,
             sampler,
             dummy_alpha_view,
+            audio_tex,
+            audio_view,
+            audio_sampler,
             color_format,
             video: None,
             pipeline: None,
@@ -450,6 +496,14 @@ impl Renderer {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(alpha_binding),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.audio_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.audio_sampler),
+                },
             ],
         });
 
@@ -468,6 +522,29 @@ impl Renderer {
 
     pub fn update_globals(&self, queue: &wgpu::Queue, g: &Globals) {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(g));
+    }
+
+    /// Upload the packed 512x2 audio texture (row 0 FFT, row 1 waveform).
+    pub fn upload_audio(&self, queue: &wgpu::Queue, bytes: &[u8; AUDIO_TEX_LEN]) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.audio_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(AUDIO_TEX_W as u32),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: AUDIO_TEX_W as u32,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Draw the composite into `view`. Uses the active user pipeline, or the

@@ -72,6 +72,10 @@ struct RunArgs {
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Quiets libswscale's "No accelerated colorspace conversion found" notice
+    // (and similar av_log() chatter) — it's a perf-path note, not an error, and
+    // it bypasses our own log filtering since it's FFmpeg's own logger.
+    ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
     match Cli::parse().cmd {
         Cmd::Transcode { input, output } => transcode::run(&input, &output),
         Cmd::Run(args) => run_player(args),

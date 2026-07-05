@@ -20,8 +20,18 @@ layout(set = 0, binding = 0) uniform Globals {
 layout(set = 1, binding = 0) uniform texture2D videoTex;
 layout(set = 1, binding = 1) uniform sampler   videoSmp;
 layout(set = 1, binding = 2) uniform texture2D alphaTex;   // 1x1 white R8 dummy unless HapM
+layout(set = 1, binding = 3) uniform texture2D audioTex;   // Shadertoy audio: 512x2 R8
+layout(set = 1, binding = 4) uniform sampler   audioSmp;   // clamp + linear
 
 float fftBand(int i) { return uFreqs[i >> 2][i & 3]; }
+
+// Shadertoy audio convention: a 512x2 texture on iChannel0. Row 0 (y=0.25) is
+// the FFT spectrum (linear frequency, 0..1); row 1 (y=0.75) is the waveform
+// (0..1, centered on 0.5). `texture(iChannel0, vec2(x, 0.25)).x` works directly;
+// fftAt()/waveAt() are shorthands.
+#define iChannel0 sampler2D(audioTex, audioSmp)
+float fftAt(float x)  { return texture(sampler2D(audioTex, audioSmp), vec2(x, 0.25)).x; }
+float waveAt(float x) { return texture(sampler2D(audioTex, audioSmp), vec2(x, 0.75)).x; }
 
 vec4 video(vec2 uv) {
     vec2 st = vec2(uv.x, 1.0 - uv.y);                 // video rows stored top-down

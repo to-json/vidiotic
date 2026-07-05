@@ -211,14 +211,24 @@ fn control_ui(
             });
             if ui
                 .add(
-                    egui::Button::new(egui::RichText::new("TAP").size(22.0))
-                        .min_size(egui::vec2(72.0, 46.0)),
+                    egui::Button::new(egui::RichText::new("DOWNBEAT").size(17.0))
+                        .min_size(egui::vec2(80.0, 46.0)),
                 )
-                .on_hover_text("Snap the downbeat to now (phase only). Key: t / Space")
+                .on_hover_text("Snap the downbeat to now (phase only, nearest bar). Key: t / Space")
                 .clicked()
                 || ui.input(|i| i.key_pressed(egui::Key::Space))
             {
                 let _ = tx.send(Command::TapDownbeat);
+            }
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("RESET").size(18.0))
+                        .min_size(egui::vec2(64.0, 46.0)),
+                )
+                .on_hover_text("Reset the clock to bar 1, beat 1 (phrase 1). Tempo unchanged.")
+                .clicked()
+            {
+                let _ = tx.send(Command::ResetClock);
             }
             if ui
                 .add(
@@ -352,7 +362,7 @@ fn control_ui(
                 }
             });
         }
-        spectrum(ui, &m.levels);
+        spectrum(ui, m);
         if let Some(err) = &m.shader_error {
             egui::ScrollArea::vertical()
                 .id_salt("shader_err")
@@ -702,21 +712,62 @@ fn trim_label(cue: &CueView) -> String {
     format!("{}–{}", fmt_time(cue.in_sec), out)
 }
 
-fn spectrum(ui: &mut egui::Ui, bands: &[f32; 21]) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(21.0 * 8.0, 36.0), egui::Sense::hover());
-    let p = ui.painter_at(rect);
-    p.rect_filled(rect, egui::CornerRadius::same(2), egui::Color32::from_gray(20));
-    let w = rect.width() / 21.0;
-    for (i, v) in bands.iter().enumerate() {
-        // bands are large FFT magnitudes; log-compress for display
-        let mag = (1.0 + v).ln() / 12.0;
-        let h = rect.height() * mag.clamp(0.0, 1.0);
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + i as f32 * w + 1.0, rect.max.y - h),
-            egui::pos2(rect.min.x + (i as f32 + 1.0) * w - 1.0, rect.max.y),
-        );
-        p.rect_filled(bar, egui::CornerRadius::ZERO, egui::Color32::from_rgb(90, 200, 130));
-    }
+/// Audio meter with a view toggle: the native 21 perceptual log bands (what
+/// `fftBand`/the shaders react to) or the 512 linear bins the Shadertoy
+/// `iChannel0` FFT row exposes. Toggle state lives in egui memory (display-only).
+fn spectrum(ui: &mut egui::Ui, m: &UiMirror) {
+    let id = egui::Id::new("spectrum_linear_view");
+    let mut linear = ui.data_mut(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    let col = egui::Color32::from_rgb(90, 200, 130);
+
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(21.0 * 8.0, 36.0), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, egui::CornerRadius::same(2), egui::Color32::from_gray(20));
+        if linear {
+            // 512-bin linear spectrum (iChannel0 row 0), already 0..1. One
+            // vertical line per pixel column, taking the max bin it covers.
+            let spec = &m.spectrum_linear;
+            let n = spec.len();
+            let cols = rect.width() as usize;
+            if n > 0 && cols > 0 {
+                for cx in 0..cols {
+                    let lo = cx * n / cols;
+                    let hi = ((cx + 1) * n / cols).clamp(lo + 1, n);
+                    let v = spec[lo..hi].iter().copied().fold(0.0_f32, f32::max);
+                    let h = rect.height() * v.clamp(0.0, 1.0);
+                    let x = rect.min.x + cx as f32;
+                    p.line_segment(
+                        [egui::pos2(x, rect.max.y), egui::pos2(x, rect.max.y - h)],
+                        egui::Stroke::new(1.0, col),
+                    );
+                }
+            }
+        } else {
+            let w = rect.width() / 21.0;
+            for (i, v) in m.levels.iter().enumerate() {
+                // bands are large FFT magnitudes; log-compress for display
+                let mag = (1.0 + v).ln() / 12.0;
+                let h = rect.height() * mag.clamp(0.0, 1.0);
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x + i as f32 * w + 1.0, rect.max.y - h),
+                    egui::pos2(rect.min.x + (i as f32 + 1.0) * w - 1.0, rect.max.y),
+                );
+                p.rect_filled(bar, egui::CornerRadius::ZERO, col);
+            }
+        }
+        if ui
+            .selectable_label(linear, if linear { "512·lin" } else { "21·log" })
+            .on_hover_text(
+                "spectrum view — 21 perceptual log bands (fftBand) \
+                 vs 512 linear bins (iChannel0)",
+            )
+            .clicked()
+        {
+            linear = !linear;
+            ui.data_mut(|d| d.insert_temp(id, linear));
+        }
+    });
 }
 
 enum PickKind {

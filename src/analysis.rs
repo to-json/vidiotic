@@ -14,17 +14,35 @@ pub const NUM_BANDS: usize = 21;
 const ATTACK: f32 = 0.7; // throw-shade values, unchanged
 const DECAY: f32 = 0.88;
 
+/// Shadertoy-style audio texture geometry: 512 texels wide, 2 rows.
+/// Row 0 = FFT spectrum (sampled at y=0.25), row 1 = waveform (y=0.75).
+pub const AUDIO_TEX_W: usize = 512;
+pub const AUDIO_TEX_LEN: usize = AUDIO_TEX_W * 2;
+/// Compression divisor for the normalized spectrum row (matches the demo
+/// shaders' `log(1+mag)/8` convention so raw magnitudes land in 0..1).
+const SPEC_LOG_SCALE: f32 = 8.0;
+
 #[derive(Clone, Copy)]
 pub struct AudioFrame {
     pub bands: [f32; NUM_BANDS],
     pub level: f32,
+    /// Packed 512x2 R8 audio texture, row-major: `[0..512]` = FFT spectrum
+    /// (linear frequency DC..Nyquist, normalized 0..1), `[512..1024]` = waveform
+    /// (raw PCM, 0..1 centered on 0.5). Uploaded verbatim as a Shadertoy iChannel.
+    pub audio_tex: [u8; AUDIO_TEX_LEN],
 }
 
 impl Default for AudioFrame {
     fn default() -> Self {
+        let mut audio_tex = [0u8; AUDIO_TEX_LEN];
+        // Silence: flat spectrum (0), waveform centered at 0.5.
+        for w in &mut audio_tex[AUDIO_TEX_W..] {
+            *w = 128;
+        }
         AudioFrame {
             bands: [0.0; NUM_BANDS],
             level: 0.0,
+            audio_tex,
         }
     }
 }
@@ -68,6 +86,7 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
 
     let mut samples = [0.0f32; FFT_SIZE]; // sliding window of the most recent input
     let mut smoothed = [0.0f32; NUM_BANDS];
+    let mut spec_smoothed = [0.0f32; AUDIO_TEX_W]; // per-bin state for the FFT texture row
     let mut cons: Option<rtrb::Consumer<f32>> = None;
     let mut bands = log_bands(48000.0);
     let mut hop = 48000usize / 60; // ~60 Hz updates
@@ -83,6 +102,7 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
                 hop = (sample_rate as usize / 60).max(64);
                 samples.fill(0.0);
                 smoothed.fill(0.0);
+                spec_smoothed.fill(0.0);
             }
             Ok(AudioCtl::Shutdown) => return,
             Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -134,9 +154,35 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
             }
         }
 
+        // Shadertoy-style 512x2 audio texture.
+        let mut audio_tex = [0u8; AUDIO_TEX_LEN];
+        // Row 0: linear-frequency spectrum. The 2048-pt FFT gives 1024 usable
+        // bins (DC..Nyquist); average adjacent pairs down to 512, log-compress
+        // to 0..1, and apply the same attack/decay smoothing as the bands.
+        for i in 0..AUDIO_TEX_W {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            let mag = 0.5
+                * ((a.re * a.re + a.im * a.im).sqrt() + (b.re * b.re + b.im * b.im).sqrt());
+            let v = ((1.0 + mag).ln() / SPEC_LOG_SCALE).clamp(0.0, 1.0);
+            if v > spec_smoothed[i] {
+                spec_smoothed[i] = spec_smoothed[i] * (1.0 - ATTACK) + v * ATTACK;
+            } else {
+                spec_smoothed[i] *= DECAY;
+            }
+            audio_tex[i] = (spec_smoothed[i] * 255.0).round() as u8;
+        }
+        // Row 1: waveform = the most recent 512 raw (un-windowed) samples,
+        // mapped to 0..1 centered on 0.5.
+        for i in 0..AUDIO_TEX_W {
+            let s = samples[FFT_SIZE - AUDIO_TEX_W + i];
+            audio_tex[AUDIO_TEX_W + i] = ((s * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+
         tri_in.write(AudioFrame {
             bands: smoothed,
             level: smoothed[0] + smoothed[1] + smoothed[2],
+            audio_tex,
         });
     }
 }

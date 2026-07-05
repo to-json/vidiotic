@@ -62,10 +62,21 @@ Uniforms in scope:
 | `resolution` / `iResolution` | output size |
 | `lvl` | overall audio level |
 | `fftBand(i)` | one of 21 log-spaced FFT bands (0..20) |
+| `iChannel0` | Shadertoy audio texture (see below) |
+| `fftAt(x)` / `waveAt(x)` | spectrum / waveform at `x` ∈ 0..1 |
 | `beat` | continuous beats since the downbeat |
 | `bar_phase` | 0..1 across each bar (flash on the downbeat) |
 | `phrase_phase` | 0..1 across each phrase |
 | `bpm`, `mouse` | current tempo, cursor |
+
+**Shadertoy audio compat**: `iChannel0` is a 512×2 audio texture using the
+Shadertoy convention — row 0 (`vec2(x, 0.25)`) is the FFT spectrum (linear
+frequency, DC→Nyquist, normalized 0..1); row 1 (`vec2(x, 0.75)`) is the
+waveform (0..1, silence at 0.5). So `texture(iChannel0, vec2(uv.x, 0.25)).x`
+reads the spectrum exactly as on shadertoy.com; `fftAt(x)`/`waveAt(x)` are
+shorthands. Pasted Shadertoy audio shaders that declare `uniform sampler2D
+iChannel0;` have that line stripped automatically. (`fftBand(i)` is the older,
+native 21-log-band API and still works — the control-window spectrum uses it.)
 
 The shader file is watched — save it and the output updates live. A compile
 error keeps the last good shader and shows the error in the control window.
@@ -88,11 +99,14 @@ loud input.
 | `tunnel.frag` | infinite tunnel; depth scrolls on the beat, treble sparkle rings |
 | `spectrum-warp.frag` | the FFT spectrum ripples and rainbow-stains each row |
 | `glitch-vhs.frag` | datamosh/VHS: bass tears rows, RGB split, tracking bar |
+| `audio-scope.frag` | Shadertoy `iChannel0` reference: FFT bars + waveform scope |
 
 ## Control window
 
 - **BPM** readout + drag, **±0.1%** nudge.
-- **TAP** (or spacebar) sets the downbeat — phase only, tempo unchanged.
+- **DOWNBEAT** (or spacebar) snaps the downbeat to now — phase only (nearest
+  bar), tempo unchanged.
+- **RESET** hard-resets the grid to bar 1, beat 1 (phrase 1); tempo unchanged.
 - **TEMPO** (or `b`) is a traditional tap tempo: tap it 2+ times and the BPM is
   set from the average interval (taps more than 2 s apart start fresh).
 - **Next every** *(bars)*: how often the sequencer advances to the next cue,
@@ -126,9 +140,10 @@ clip with its own **in/out** trim points and preserve-playhead override.
   pool shader instead of the live one. Trim and preserve apply the next time the
   cue is triggered; the shader override applies immediately while it plays.
 - **Shader…** / **Folder…** pickers; audio input device selector (mic, line-in,
-  BlackHole loopback); 21-band spectrum.
+  BlackHole loopback); spectrum meter with a **21·log / 512·lin** toggle (the
+  perceptual `fftBand` view vs. the linear `iChannel0` view).
 
-Output-window hotkeys: `t` tap downbeat · `b` tap tempo · `+`/`-` bpm ±1 ·
+Output-window hotkeys: `t` snap downbeat · `b` tap tempo · `+`/`-` bpm ±1 ·
 `[`/`]` nudge ∓/±0.1% · digits then `Enter` set BPM · `f` fullscreen · `Cmd+Q`
 quit.
 
