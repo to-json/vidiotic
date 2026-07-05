@@ -4,7 +4,12 @@
 
 use std::path::PathBuf;
 
+use crate::bank::CueId;
+
 pub type ClipId = u32;
+
+/// A compiled shader pinned into the pool. A cue can reference one as an override.
+pub type ShaderId = u32;
 
 /// Resolution of the musical re-loop grid: 32 ticks per beat (quarter note), so
 /// an eighth note is 16 ticks and a 4/4 bar is 128. Lets `SetLoopLen` stay an
@@ -27,7 +32,27 @@ pub enum Command {
     SetSyncSource(SyncKind),
     SetPhraseLen(u32),          // beats between auto-transitions to the next clip
     SetLoopLen(Option<u32>),    // forced video re-loop grid, in 1/32-beat ticks (LOOP_TICKS_PER_BEAT); None = loop on EOF only
+    SetPreservePlayhead(bool),  // on cut, carry the playhead over (true) or restart the incoming clip from its start (false)
     ToggleClipActive(ClipId),
+    // Cue/bank editing. Cue mutations target the *edit* bank; `AddCue` also
+    // selects the new cue. Trim/preserve edits take effect the next time the
+    // cue's decoder spawns (re-trigger, or when its bank goes live).
+    AddCue(ClipId),                    // add a full-length cue for this clip to the edit bank
+    RemoveCue(CueId),
+    SelectCue(Option<CueId>),
+    SetCueIn(CueId, f64),              // in-point, seconds
+    SetCueOut(CueId, Option<f64>),     // out-point, seconds; None = clip end
+    SetCueInToPlayhead(CueId),         // snap in-point to the displayed playhead
+    SetCueOutToPlayhead(CueId),        // snap out-point to the displayed playhead
+    SetCuePreserve(CueId, Option<bool>), // per-cue preserve override; None = inherit global
+    SetCueShader(CueId, Option<ShaderId>), // per-cue shader override; None = the live shader
+    AddBank,
+    SetLiveBank(usize),                // which bank the sequencer plays
+    SetEditBank(usize),                // which bank the UI edits
+    // Shader pool: pin the current live shader's last-good compile so a cue can
+    // use it while you keep livecoding the main shader.
+    CaptureShader,                     // pin the current live shader into the pool
+    RemoveShader(ShaderId),            // drop a pinned shader (cues fall back to the live shader)
     SetClipDir(PathBuf),
     SetShaderPath(PathBuf),
     SetAudioDevice(Option<String>), // id key; None = default
@@ -51,6 +76,34 @@ pub struct ClipEntry {
     pub has_thumb: bool, // texture cached in the UI's thumbnail map
 }
 
+/// One cue of the edit bank, as shown in the sequencer section / editor.
+#[derive(Clone, Debug)]
+pub struct CueView {
+    pub id: CueId,
+    pub clip: ClipId,
+    pub name: String,
+    pub in_sec: f64,
+    pub out_sec: Option<f64>,
+    pub preserve: Option<bool>,
+    pub shader: Option<ShaderId>, // per-cue shader override; None = the live shader
+    pub role: ClipRole, // Playing/Armed if this cue is the live bank's current/next
+    pub has_thumb: bool,
+}
+
+/// A bank's identity for the bank bar.
+#[derive(Clone, Debug)]
+pub struct BankView {
+    pub name: String,
+    pub cue_count: usize,
+}
+
+/// A pinned shader in the pool, as shown in the shader picker / cue editor.
+#[derive(Clone, Debug)]
+pub struct ShaderPoolView {
+    pub id: ShaderId,
+    pub name: String,
+}
+
 /// Read-only display state the engine republishes each tick for the control UI.
 #[derive(Clone, Debug, Default)]
 pub struct UiMirror {
@@ -62,6 +115,7 @@ pub struct UiMirror {
     pub bars_per_phrase: u32,
     pub phrase_len: u32,
     pub loop_len: Option<u32>, // forced re-loop grid in 1/32-beat ticks; None = EOF-only
+    pub preserve_playhead: bool, // carry the playhead over on a cut vs. restart the incoming clip
     pub sync: Option<SyncKind>,
     pub peers: u64,
     pub audio_devices: Vec<(String, String)>, // (id key, name)
@@ -71,6 +125,14 @@ pub struct UiMirror {
     pub shader_error: Option<String>,
     pub clip_dir: Option<String>,
     pub clips: Vec<ClipEntry>,
+    // Cue banks.
+    pub banks: Vec<BankView>,
+    pub live_bank: usize,
+    pub edit_bank: usize,
+    pub cues: Vec<CueView>, // the edit bank's cues, in order
+    pub selected_cue: Option<CueId>,
+    pub shader_pool: Vec<ShaderPoolView>, // pinned shaders a cue can override with
+    pub playhead_sec: f64, // position of the currently displayed clip
     pub levels: [f32; 21],
     pub level: f32,
     pub fullscreen: bool,

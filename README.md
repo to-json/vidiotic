@@ -35,7 +35,7 @@ recommended, especially at 4K).
 # single clip, looping
 vidiotic run --clip clip.mov --shader shaders/demo.frag
 
-# a directory of clips to sequence (toggle them active in the control window)
+# a directory of clips (double-click them into a cue bank in the control window)
 vidiotic run --clip-dir ./clips --shader shaders/demo.frag --bpm 128
 
 # start in Ableton Link mode (follows rekordbox Performance mode, Ableton, etc.)
@@ -70,22 +70,61 @@ Uniforms in scope:
 The shader file is watched — save it and the output updates live. A compile
 error keeps the last good shader and shows the error in the control window.
 
+**Pin** (control window) freezes the current shader's last good compile into a
+pool. A cue can then render with a pinned shader as an override (see below), so
+you can keep livecoding the main shader while a specific clip runs a fixed look.
+
+### Bundled demo shaders
+
+Point `--shader` at any of these (in `shaders/`), or load them live from the
+control window. All react to the beat clock even in silence, and harder with a
+loud input.
+
+| shader | vibe |
+|---|---|
+| `demo.frag` | reference: bass zoom, downbeat flash, spectrum ribbon |
+| `chroma-punch.frag` | bass zoom-punch, chromatic aberration, beat shake, scanlines |
+| `kaleido.frag` | rotating kaleidoscope; segments step up each phrase |
+| `tunnel.frag` | infinite tunnel; depth scrolls on the beat, treble sparkle rings |
+| `spectrum-warp.frag` | the FFT spectrum ripples and rainbow-stains each row |
+| `glitch-vhs.frag` | datamosh/VHS: bass tears rows, RGB split, tracking bar |
+
 ## Control window
 
 - **BPM** readout + drag, **±0.1%** nudge.
 - **TAP** (or spacebar) sets the downbeat — phase only, tempo unchanged.
 - **TEMPO** (or `b`) is a traditional tap tempo: tap it 2+ times and the BPM is
   set from the average interval (taps more than 2 s apart start fresh).
-- **Next every** *(bars)*: how often the sequencer advances to the next active
-  clip, quantized to the beat grid.
-- **Loop every** *(bars, or off)*: force the current clip back to its start on
+- **Next every** *(bars)*: how often the sequencer advances to the next cue,
+  quantized to the beat grid.
+- **Loop every** *(bars, or off)*: force the current clip back to its in-point on
   that beat grid, so the video re-loops on a musical boundary regardless of its
   own length. `off` = let the clip play through and loop on its own EOF.
+- **preserve playhead**: on a cut, carry the playhead into the next clip (it
+  comes in already running, phase-locked to the outgoing clip). Off = the next
+  clip restarts from its in-point on the cut. A cue can override this per-cue.
 - **Sync**: Internal or **Link** (peer count shown).
-- **Clips** grid: click to toggle a clip in/out of the loop rotation. With two or
-  more active, the sequencer cuts between them on the **Next every** boundary,
-  pre-arming the next clip a bar early. Markers: gold = active, ▶ = playing,
+
+### Clips, cues, and banks
+
+The sequencer plays **cues**, not raw clips. A cue is a placement of a source
+clip with its own **in/out** trim points and preserve-playhead override.
+
+- **Clips** grid (the source pool): double-click a clip to add it as a cue to the
+  **edit bank**. Markers: gold = has a cue in the live bank, ▶ = playing,
   ○ = armed.
+- **Banks** bar: cues live in banks. `●` marks the **live** bank (what plays);
+  click a bank tab to make it the **edit** bank shown below; `▶` sends a bank
+  live (it takes over at the next phrase). `＋` adds a bank. Because live and edit
+  are independent, you can build/tweak one bank while another plays.
+- **Cue list** (the edit bank): click a cue to edit it in the side panel; `✕`
+  removes it. With two or more cues in the live bank, the sequencer round-robins
+  them on the **Next every** boundary, pre-arming the next a bar early.
+- **Cue editor** (side panel): set **In**/**Out** points (in seconds, or `⏺` to
+  snap to the current playhead), the per-cue **preserve** override
+  (Inherit / On / Off), and a **Shader** override — render this cue with a pinned
+  pool shader instead of the live one. Trim and preserve apply the next time the
+  cue is triggered; the shader override applies immediately while it plays.
 - **Shader…** / **Folder…** pickers; audio input device selector (mic, line-in,
   BlackHole loopback); 21-band spectrum.
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use winit::window::Window;
 
-use crate::commands::{ClipId, ClipRole, Command, SyncKind, UiMirror};
+use crate::commands::{ClipEntry, ClipId, ClipRole, Command, CueView, SyncKind, UiMirror};
 use crate::gfx::WindowSurface;
 
 pub struct EguiCtl {
@@ -289,6 +289,18 @@ fn control_ui(
                     let _ = tx.send(Command::SetLoopLen(Some(beats)));
                 }
             }
+            ui.separator();
+            let mut preserve = m.preserve_playhead;
+            if ui
+                .checkbox(&mut preserve, "preserve playhead")
+                .on_hover_text(
+                    "On a cut, carry the playhead into the next clip (it comes in \
+                     already running). Off: the next clip restarts from its start.",
+                )
+                .changed()
+            {
+                let _ = tx.send(Command::SetPreservePlayhead(preserve));
+            }
         });
         ui.add_space(4.0);
     });
@@ -300,6 +312,16 @@ fn control_ui(
                 pick_file(tx.clone(), PickKind::Shader);
             }
             ui.monospace(m.shader_name.as_deref().unwrap_or("<none>"));
+            if ui
+                .button("📌 Pin")
+                .on_hover_text(
+                    "Pin the current shader's last good compile into the pool so a \
+                     cue can use it while you keep livecoding this one.",
+                )
+                .clicked()
+            {
+                let _ = tx.send(Command::CaptureShader);
+            }
             ui.separator();
             egui::ComboBox::from_id_salt("audio")
                 .selected_text(m.current_device.as_deref().unwrap_or("default"))
@@ -314,6 +336,22 @@ fn control_ui(
                     }
                 });
         });
+        if !m.shader_pool.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Pinned:");
+                for s in &m.shader_pool {
+                    ui.label(egui::RichText::new(&s.name).small());
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("remove this pinned shader")
+                        .clicked()
+                    {
+                        let _ = tx.send(Command::RemoveShader(s.id));
+                    }
+                    ui.separator();
+                }
+            });
+        }
         spectrum(ui, &m.levels);
         if let Some(err) = &m.shader_error {
             egui::ScrollArea::vertical()
@@ -330,7 +368,31 @@ fn control_ui(
         ui.add_space(4.0);
     });
 
+    // Cue editor: edits the selected cue of the edit bank.
+    egui::Panel::right(egui::Id::new("cue_editor"))
+        .resizable(true)
+        .default_size(272.0)
+        .min_size(210.0)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("Cue");
+                ui.weak(format!("⏱ {}", fmt_time(m.playhead_sec)));
+            });
+            ui.separator();
+            match m.selected_cue.and_then(|id| m.cues.iter().find(|c| c.id == id)) {
+                Some(cue) => cue_editor(ui, m, cue, tx),
+                None => {
+                    ui.add_space(8.0);
+                    ui.weak("No cue selected.");
+                    ui.add_space(4.0);
+                    ui.weak("Double-click a clip to add a cue to the edit bank, then click the cue to edit it here.");
+                }
+            }
+        });
+
     egui::CentralPanel::default().show(ui, |ui| {
+        // Source clip pool.
         ui.horizontal(|ui| {
             ui.heading("Clips");
             if ui.button("Folder…").clicked() {
@@ -339,48 +401,305 @@ fn control_ui(
             if let Some(d) = &m.clip_dir {
                 ui.weak(d);
             }
-            ui.weak("— click to toggle in/out of the loop");
         });
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for clip in &m.clips {
-                    ui.allocate_ui(egui::vec2(128.0, 104.0), |ui| {
-                        ui.vertical(|ui| {
-                            let resp = if let Some(tex) = thumbs.get(&clip.id) {
-                                let img = egui::Image::new((tex.id(), egui::vec2(120.0, 68.0)));
-                                ui.add(egui::Button::image(img).selected(clip.active))
-                            } else {
-                                ui.add_sized(
-                                    egui::vec2(120.0, 68.0),
-                                    egui::Button::new("…").selected(clip.active),
-                                )
-                            };
-                            let marker = match clip.role {
-                                ClipRole::Playing => "▶ ",
-                                ClipRole::Armed => "○ ",
-                                ClipRole::None => "",
-                            };
-                            let name = if clip.name.len() > 16 {
-                                format!("{}…", &clip.name[..15])
-                            } else {
-                                clip.name.clone()
-                            };
-                            let color = match clip.role {
-                                ClipRole::Playing => egui::Color32::LIGHT_GREEN,
-                                ClipRole::Armed => egui::Color32::YELLOW,
-                                ClipRole::None if clip.active => egui::Color32::GOLD,
-                                ClipRole::None => egui::Color32::GRAY,
-                            };
-                            ui.colored_label(color, format!("{marker}{name}"));
-                            if resp.clicked() {
-                                let _ = tx.send(Command::ToggleClipActive(clip.id));
-                            }
-                        });
-                    });
+        ui.weak("double-click a clip to add it as a cue to the edit bank");
+        egui::ScrollArea::vertical()
+            .id_salt("clip_pool")
+            .max_height(190.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for clip in &m.clips {
+                        clip_tile(ui, clip, thumbs, tx);
+                    }
+                });
+            });
+
+        ui.separator();
+        bank_bar(ui, m, tx);
+        egui::ScrollArea::vertical()
+            .id_salt("cue_list")
+            .show(ui, |ui| {
+                if m.cues.is_empty() {
+                    ui.add_space(6.0);
+                    ui.weak("Empty bank — double-click a clip above to add a cue.");
                 }
+                ui.horizontal_wrapped(|ui| {
+                    for cue in &m.cues {
+                        cue_chip(ui, m, cue, thumbs, tx);
+                    }
+                });
+            });
+    });
+}
+
+/// A source-clip tile in the pool. Double-click adds a cue to the edit bank.
+fn clip_tile(
+    ui: &mut egui::Ui,
+    clip: &ClipEntry,
+    thumbs: &HashMap<ClipId, egui::TextureHandle>,
+    tx: &Sender<Command>,
+) {
+    ui.allocate_ui(egui::vec2(128.0, 104.0), |ui| {
+        ui.vertical(|ui| {
+            let resp = if let Some(tex) = thumbs.get(&clip.id) {
+                let img = egui::Image::new((tex.id(), egui::vec2(120.0, 68.0)));
+                ui.add(egui::Button::image(img).selected(clip.active))
+            } else {
+                ui.add_sized(
+                    egui::vec2(120.0, 68.0),
+                    egui::Button::new("…").selected(clip.active),
+                )
+            };
+            let resp = resp.on_hover_text("double-click: add a cue to the edit bank");
+            let marker = match clip.role {
+                ClipRole::Playing => "▶ ",
+                ClipRole::Armed => "○ ",
+                ClipRole::None => "",
+            };
+            let color = match clip.role {
+                ClipRole::Playing => egui::Color32::LIGHT_GREEN,
+                ClipRole::Armed => egui::Color32::YELLOW,
+                ClipRole::None if clip.active => egui::Color32::GOLD,
+                ClipRole::None => egui::Color32::GRAY,
+            };
+            ui.colored_label(color, format!("{marker}{}", ellipsize(&clip.name, 16)));
+            if resp.double_clicked() {
+                let _ = tx.send(Command::AddCue(clip.id));
+            }
+        });
+    });
+}
+
+/// The bank bar: pick which bank to edit, send one live, add a bank. `●` marks
+/// the live bank; the selected tab is the edit bank shown in the list below.
+fn bank_bar(ui: &mut egui::Ui, m: &UiMirror, tx: &Sender<Command>) {
+    ui.horizontal(|ui| {
+        ui.strong("Banks");
+        for (i, b) in m.banks.iter().enumerate() {
+            let live = i == m.live_bank;
+            let label = format!("{}{} ({})", if live { "● " } else { "" }, b.name, b.cue_count);
+            if ui
+                .selectable_label(i == m.edit_bank, label)
+                .on_hover_text("edit this bank (shown below)")
+                .clicked()
+            {
+                let _ = tx.send(Command::SetEditBank(i));
+            }
+            if !live
+                && ui
+                    .small_button("▶")
+                    .on_hover_text("play this bank (it takes over at the next phrase)")
+                    .clicked()
+            {
+                let _ = tx.send(Command::SetLiveBank(i));
+            }
+        }
+        if ui.button("＋").on_hover_text("add a bank").clicked() {
+            let _ = tx.send(Command::AddBank);
+        }
+    });
+}
+
+/// A cue tile in the edit bank's list. Click selects it for the editor.
+fn cue_chip(
+    ui: &mut egui::Ui,
+    m: &UiMirror,
+    cue: &CueView,
+    thumbs: &HashMap<ClipId, egui::TextureHandle>,
+    tx: &Sender<Command>,
+) {
+    let selected = m.selected_cue == Some(cue.id);
+    ui.allocate_ui(egui::vec2(146.0, 116.0), |ui| {
+        let stroke = if selected {
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 255))
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+        };
+        egui::Frame::group(ui.style()).stroke(stroke).show(ui, |ui| {
+            ui.vertical(|ui| {
+                let resp = if let Some(tex) = thumbs.get(&cue.clip) {
+                    let img = egui::Image::new((tex.id(), egui::vec2(120.0, 56.0)));
+                    ui.add(egui::Button::image(img).selected(selected))
+                } else {
+                    ui.add_sized(
+                        egui::vec2(120.0, 56.0),
+                        egui::Button::new(ellipsize(&cue.name, 10)).selected(selected),
+                    )
+                };
+                if resp.clicked() {
+                    let _ = tx.send(Command::SelectCue(Some(cue.id)));
+                }
+                ui.horizontal(|ui| {
+                    let (marker, color) = match cue.role {
+                        ClipRole::Playing => ("▶", egui::Color32::LIGHT_GREEN),
+                        ClipRole::Armed => ("○", egui::Color32::YELLOW),
+                        ClipRole::None => (" ", egui::Color32::GRAY),
+                    };
+                    ui.colored_label(color, marker);
+                    ui.label(ellipsize(&cue.name, 12));
+                });
+                ui.horizontal(|ui| {
+                    ui.small(trim_label(cue));
+                    if cue.preserve.is_some() {
+                        ui.small(if cue.preserve == Some(true) { "·keep" } else { "·cut" });
+                    }
+                    if cue.shader.is_some() {
+                        ui.small("·fx").on_hover_text("has a shader override");
+                    }
+                    if ui.small_button("✕").on_hover_text("remove cue").clicked() {
+                        let _ = tx.send(Command::RemoveCue(cue.id));
+                    }
+                });
             });
         });
     });
+}
+
+/// The side-panel editor for one cue: in/out trim, per-cue preserve, shader override.
+fn cue_editor(ui: &mut egui::Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    ui.add_space(4.0);
+    ui.strong(&cue.name);
+    let role = match cue.role {
+        ClipRole::Playing => "playing",
+        ClipRole::Armed => "armed",
+        ClipRole::None => "idle",
+    };
+    ui.weak(format!("cue #{} · {role}", cue.id));
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        ui.label("In ");
+        let mut v = cue.in_sec;
+        if ui
+            .add(
+                egui::DragValue::new(&mut v)
+                    .speed(0.05)
+                    .range(0.0..=f64::MAX)
+                    .suffix(" s")
+                    .fixed_decimals(2),
+            )
+            .changed()
+        {
+            let _ = tx.send(Command::SetCueIn(cue.id, v));
+        }
+        if ui
+            .button("⏺")
+            .on_hover_text("set in-point to the current playhead")
+            .clicked()
+        {
+            let _ = tx.send(Command::SetCueInToPlayhead(cue.id));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Out");
+        let mut trimmed = cue.out_sec.is_some();
+        if ui
+            .checkbox(&mut trimmed, "")
+            .on_hover_text("trim the end (off = play to the clip's natural end)")
+            .changed()
+        {
+            let out = trimmed.then_some(cue.in_sec + 1.0);
+            let _ = tx.send(Command::SetCueOut(cue.id, out));
+        }
+        match cue.out_sec {
+            Some(out) => {
+                let mut v = out;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .speed(0.05)
+                            .range(0.0..=f64::MAX)
+                            .suffix(" s")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    let _ = tx.send(Command::SetCueOut(cue.id, Some(v)));
+                }
+                if ui
+                    .button("⏺")
+                    .on_hover_text("set out-point to the current playhead")
+                    .clicked()
+                {
+                    let _ = tx.send(Command::SetCueOutToPlayhead(cue.id));
+                }
+            }
+            None => {
+                ui.weak("clip end");
+            }
+        }
+    });
+
+    ui.add_space(10.0);
+    ui.label("Preserve playhead")
+        .on_hover_text("On a cut, carry the playhead into this cue. Inherit follows the global toggle.");
+    ui.horizontal(|ui| {
+        if ui.selectable_label(cue.preserve.is_none(), "Inherit").clicked() {
+            let _ = tx.send(Command::SetCuePreserve(cue.id, None));
+        }
+        if ui.selectable_label(cue.preserve == Some(true), "On").clicked() {
+            let _ = tx.send(Command::SetCuePreserve(cue.id, Some(true)));
+        }
+        if ui.selectable_label(cue.preserve == Some(false), "Off").clicked() {
+            let _ = tx.send(Command::SetCuePreserve(cue.id, Some(false)));
+        }
+    });
+
+    ui.add_space(10.0);
+    ui.label("Shader")
+        .on_hover_text("Render this cue with a pinned shader instead of the live one. Applies immediately while the cue plays.");
+    let selected_name = cue
+        .shader
+        .and_then(|id| m.shader_pool.iter().find(|s| s.id == id))
+        .map(|s| s.name.as_str())
+        .unwrap_or("Live shader");
+    egui::ComboBox::from_id_salt("cue_shader")
+        .selected_text(selected_name)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(cue.shader.is_none(), "Live shader").clicked() {
+                let _ = tx.send(Command::SetCueShader(cue.id, None));
+            }
+            for s in &m.shader_pool {
+                if ui
+                    .selectable_label(cue.shader == Some(s.id), &s.name)
+                    .clicked()
+                {
+                    let _ = tx.send(Command::SetCueShader(cue.id, Some(s.id)));
+                }
+            }
+        });
+    if m.shader_pool.is_empty() {
+        ui.weak("No pinned shaders yet — “📌 Pin” the current shader below.");
+    }
+
+    ui.add_space(10.0);
+    ui.weak("Trim & preserve apply the next time this cue is triggered.");
+    ui.add_space(4.0);
+    if ui.button("Remove cue").clicked() {
+        let _ = tx.send(Command::RemoveCue(cue.id));
+    }
+}
+
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+fn fmt_time(secs: f64) -> String {
+    let secs = secs.max(0.0);
+    let mins = (secs / 60.0).floor() as u64;
+    let rem = secs - mins as f64 * 60.0;
+    format!("{mins}:{rem:05.2}")
+}
+
+fn trim_label(cue: &CueView) -> String {
+    let out = cue.out_sec.map(fmt_time).unwrap_or_else(|| "end".to_string());
+    format!("{}–{}", fmt_time(cue.in_sec), out)
 }
 
 fn spectrum(ui: &mut egui::Ui, bands: &[f32; 21]) {

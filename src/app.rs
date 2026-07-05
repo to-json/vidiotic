@@ -18,9 +18,12 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::analysis::AudioFrame;
 use crate::audio::{self, AudioCapture};
+use crate::bank::{Bank, Cue, CueId};
 use crate::clippool::{self, Clip, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
-use crate::commands::{ClipEntry, ClipId, ClipRole, Command, SyncKind, UiMirror};
+use crate::commands::{
+    BankView, ClipEntry, ClipId, ClipRole, Command, CueView, ShaderPoolView, SyncKind, UiMirror,
+};
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
 use crate::sequencer::{Sequencer, SequencerEvent};
@@ -73,14 +76,27 @@ pub struct App {
     clips: Vec<Clip>,
     clip_dir: Option<PathBuf>,
     thumb_rx: Option<Receiver<Thumbnail>>,
-    decoders: HashMap<ClipId, DecodeHandle>,
-    current: Option<ClipId>,
+    // Cue banks: the sequencer plays `live_bank`; the UI edits `edit_bank` (they
+    // can differ so you play one set while modifying another). Decoders and
+    // `current` are keyed by cue, not clip.
+    banks: Vec<Bank>,
+    live_bank: usize,
+    edit_bank: usize,
+    selected_cue: Option<CueId>,
+    next_cue_id: CueId,
+    decoders: HashMap<CueId, DecodeHandle>,
+    current: Option<CueId>,
+    current_pts: f64, // playhead of the displayed clip, for set-in/out-to-playhead
     video_mode: i32,
     last_beat: f64,
     // musical re-loop: force the current clip back to its start on a beat grid,
     // measured in 1/32-beat ticks. None = let the clip loop on EOF only.
     loop_len: Option<u32>,
     loop_tracker: BoundaryTracker,
+    // on a cut, carry the outgoing playhead into the incoming clip (true, the
+    // default — the armed decoder has been running since arm time so it cuts in
+    // already advanced) or restart the incoming clip from its start (false).
+    preserve_playhead: bool,
     // traditional tap-tempo: recent tap instants, averaged into a BPM.
     tap_times: Vec<Instant>,
 
@@ -96,6 +112,8 @@ pub struct App {
     shader_path: PathBuf,
     watcher: Option<ShaderWatcher>,
     dirty_at: Option<Instant>,
+    // count of shaders pinned into the pool, for naming ("<stem> #N")
+    shader_pin_count: u32,
 
     // ui plumbing
     cmd_tx: Sender<Command>,
@@ -128,12 +146,19 @@ impl App {
             clips: boot.clips,
             clip_dir: boot.clip_dir,
             thumb_rx: boot.thumb_rx,
+            banks: vec![Bank::new("A")],
+            live_bank: 0,
+            edit_bank: 0,
+            selected_cue: None,
+            next_cue_id: 1,
             decoders: HashMap::new(),
             current: None,
+            current_pts: 0.0,
             video_mode: 0,
             last_beat: 0.0,
             loop_len: None,
             loop_tracker: BoundaryTracker::new(),
+            preserve_playhead: true,
             tap_times: Vec::new(),
             audio_out: boot.audio_out,
             audio_capture: boot.audio_capture,
@@ -144,6 +169,7 @@ impl App {
             shader_path: boot.shader_path,
             watcher: None,
             dirty_at: None,
+            shader_pin_count: 0,
             cmd_tx: boot.cmd_tx,
             cmd_rx: boot.cmd_rx,
             mirror: UiMirror::default(),
@@ -158,10 +184,10 @@ impl App {
             output_id: None,
             control_id: None,
         };
-        // Activate any clips requested at startup (e.g. from --clip).
+        // Activate any clips requested at startup (e.g. from --clip): each becomes
+        // a default full-length cue in the live bank.
         for id in boot.auto_active {
-            let ev = app.sequencer.toggle_active(id, 0.0);
-            app.apply_seq_events(ev);
+            app.toggle_clip_active(id, 0.0);
         }
         if boot.initial_sync == SyncKind::Link {
             app.set_sync_source(SyncKind::Link);
@@ -173,16 +199,69 @@ impl App {
         self.clips.iter().find(|c| c.id == id).map(|c| c.path.clone())
     }
 
-    fn ensure_decoder(&mut self, id: ClipId) {
+    fn clip_name(&self, id: ClipId) -> String {
+        self.clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The cue with `id`, looked up in the live bank.
+    fn live_cue(&self, id: CueId) -> Option<&Cue> {
+        self.banks.get(self.live_bank).and_then(|b| b.cue(id))
+    }
+
+    fn alloc_cue_id(&mut self) -> CueId {
+        let id = self.next_cue_id;
+        self.next_cue_id += 1;
+        id
+    }
+
+    fn ensure_decoder(&mut self, id: CueId) {
         if self.decoders.contains_key(&id) {
             return;
         }
-        if let Some(path) = self.clip_path(id) {
-            match decoder::spawn(path) {
+        let Some(cue) = self.live_cue(id) else { return };
+        let clip = cue.clip;
+        let in_sec = cue.in_sec.max(0.0);
+        let out_sec = cue.out_sec.filter(|&o| o > in_sec);
+        if let Some(path) = self.clip_path(clip) {
+            match decoder::spawn(path, in_sec, out_sec) {
                 Ok(h) => {
                     self.decoders.insert(id, h);
                 }
-                Err(e) => log::error!("decode spawn for clip {id}: {e:#}"),
+                Err(e) => log::error!("decode spawn for cue {id} (clip {clip}): {e:#}"),
+            }
+        }
+    }
+
+    /// Add a full-length cue for `clip` to the live bank if none exists there,
+    /// else remove it. Keeps the sequencer's active set in step. (The quick pool
+    /// path; finer control comes from the bank editor.)
+    fn toggle_clip_active(&mut self, clip: ClipId, beat: f64) {
+        let existing = self.banks[self.live_bank]
+            .cues
+            .iter()
+            .position(|c| c.clip == clip);
+        match existing {
+            Some(pos) => {
+                let cue_id = self.banks[self.live_bank].cues[pos].id;
+                let ev = self.sequencer.toggle_active(cue_id, beat);
+                self.banks[self.live_bank].cues.remove(pos);
+                if self.selected_cue == Some(cue_id) {
+                    self.selected_cue = None;
+                }
+                self.apply_seq_events(ev);
+            }
+            None => {
+                let cue_id = self.alloc_cue_id();
+                let name = self.clip_name(clip);
+                self.banks[self.live_bank]
+                    .cues
+                    .push(Cue::new(cue_id, clip, name));
+                let ev = self.sequencer.toggle_active(cue_id, beat);
+                self.apply_seq_events(ev);
             }
         }
     }
@@ -204,6 +283,18 @@ impl App {
                     self.ensure_decoder(c);
                     self.current = Some(c);
                     self.retain_decoders();
+                    // With preserve off, the incoming clip should cut in from its
+                    // in-point rather than the position it drifted to since arming.
+                    // A cue's own `preserve` overrides the global default.
+                    let preserve = self
+                        .live_cue(c)
+                        .and_then(|cue| cue.preserve)
+                        .unwrap_or(self.preserve_playhead);
+                    if !preserve {
+                        if let Some(h) = self.decoders.get(&c) {
+                            h.request_restart();
+                        }
+                    }
                     // A freshly swapped clip starts from the top; re-anchor the
                     // re-loop grid so it doesn't restart mid-clip immediately.
                     self.loop_tracker.reset();
@@ -211,6 +302,72 @@ impl App {
                 SequencerEvent::DisarmDecoder => self.retain_decoders(),
             }
         }
+    }
+
+    /// If the edit bank is also live, rebuild the sequencer's active set from it
+    /// (call after adding/removing a cue in the edit bank).
+    fn resync_live_if_editing(&mut self) {
+        if self.edit_bank == self.live_bank {
+            let ids = self.banks[self.live_bank].ids();
+            let ev = self.sequencer.set_active_set(ids);
+            self.apply_seq_events(ev);
+        }
+    }
+
+    fn add_cue(&mut self, clip: ClipId) {
+        let cue_id = self.alloc_cue_id();
+        let name = self.clip_name(clip);
+        self.banks[self.edit_bank]
+            .cues
+            .push(Cue::new(cue_id, clip, name));
+        self.selected_cue = Some(cue_id);
+        self.resync_live_if_editing();
+    }
+
+    fn remove_cue(&mut self, id: CueId) {
+        let Some(pos) = self.banks[self.edit_bank].cues.iter().position(|c| c.id == id) else {
+            return;
+        };
+        self.banks[self.edit_bank].cues.remove(pos);
+        if self.selected_cue == Some(id) {
+            self.selected_cue = None;
+        }
+        self.resync_live_if_editing();
+    }
+
+    /// Mutate a cue in the edit bank. Trim/preserve changes take effect on the
+    /// cue's next decoder spawn (they are read at spawn / swap time).
+    fn edit_cue(&mut self, id: CueId, f: impl FnOnce(&mut Cue)) {
+        if let Some(cue) = self.banks[self.edit_bank].cue_mut(id) {
+            f(cue);
+        }
+    }
+
+    fn set_live_bank(&mut self, i: usize) {
+        if i >= self.banks.len() || i == self.live_bank {
+            return;
+        }
+        self.live_bank = i;
+        // The new bank takes over: keep playing the current cue if it happens to
+        // still resolve, otherwise the sequencer advances into the new set at the
+        // next arm window.
+        let ids = self.banks[self.live_bank].ids();
+        let ev = self.sequencer.set_active_set(ids);
+        self.apply_seq_events(ev);
+    }
+
+    fn set_edit_bank(&mut self, i: usize) {
+        if i >= self.banks.len() {
+            return;
+        }
+        self.edit_bank = i;
+        self.selected_cue = None;
+    }
+
+    fn add_bank(&mut self) {
+        // Name banks A, B, C, … by count.
+        let name = (b'A' + (self.banks.len() as u8 % 26)) as char;
+        self.banks.push(Bank::new(name.to_string()));
     }
 
     fn load_shader(&mut self) {
@@ -229,6 +386,44 @@ impl App {
         }
     }
 
+    /// Pin the current live shader's last-good compile into the renderer's pool,
+    /// named after the shader file plus a running count.
+    fn capture_shader(&mut self) {
+        let Some(g) = self.graphics.as_ref() else { return };
+        let stem = self
+            .shader_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("shader")
+            .to_string();
+        self.shader_pin_count += 1;
+        let name = format!("{stem} #{}", self.shader_pin_count);
+        if let Some(r) = self.renderer.as_mut() {
+            match r.capture_current(&g.device, name) {
+                Some(id) => log::info!("pinned shader {id}"),
+                None => {
+                    self.shader_pin_count -= 1;
+                    log::warn!("no compiled shader to pin");
+                }
+            }
+        }
+    }
+
+    /// Drop a pinned shader and clear any cue references to it (they fall back to
+    /// the live shader).
+    fn remove_shader(&mut self, id: crate::commands::ShaderId) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.remove_pool_shader(id);
+        }
+        for bank in &mut self.banks {
+            for cue in &mut bank.cues {
+                if cue.shader == Some(id) {
+                    cue.shader = None;
+                }
+            }
+        }
+    }
+
     fn set_clip_dir(&mut self, dir: PathBuf) {
         let clips = clippool::scan(&dir);
         log::info!("clip pool: {} clips in {}", clips.len(), dir.display());
@@ -237,6 +432,12 @@ impl App {
         self.clip_dir = Some(dir);
         self.decoders.clear();
         self.current = None;
+        // Cues referenced clips from the old pool; start fresh.
+        self.banks = vec![Bank::new("A")];
+        self.live_bank = 0;
+        self.edit_bank = 0;
+        self.selected_cue = None;
+        self.next_cue_id = 1;
         self.sequencer = Sequencer::new(self.sequencer.phrase_len());
         if let Some(egui) = self.egui.as_mut() {
             egui.clear_thumbnails();
@@ -324,10 +525,28 @@ impl App {
                 self.apply_seq_events(ev);
             }
             Command::SetLoopLen(beats) => self.set_loop_len(beats),
-            Command::ToggleClipActive(id) => {
-                let ev = self.sequencer.toggle_active(id, self.last_beat);
-                self.apply_seq_events(ev);
+            Command::SetPreservePlayhead(on) => self.preserve_playhead = on,
+            Command::ToggleClipActive(id) => self.toggle_clip_active(id, self.last_beat),
+            Command::AddCue(clip) => self.add_cue(clip),
+            Command::RemoveCue(id) => self.remove_cue(id),
+            Command::SelectCue(id) => self.selected_cue = id,
+            Command::SetCueIn(id, s) => self.edit_cue(id, |c| c.in_sec = s.max(0.0)),
+            Command::SetCueOut(id, s) => self.edit_cue(id, |c| c.out_sec = s),
+            Command::SetCueInToPlayhead(id) => {
+                let p = self.current_pts;
+                self.edit_cue(id, |c| c.in_sec = p.max(0.0));
             }
+            Command::SetCueOutToPlayhead(id) => {
+                let p = self.current_pts;
+                self.edit_cue(id, |c| c.out_sec = Some(p.max(0.0)));
+            }
+            Command::SetCuePreserve(id, v) => self.edit_cue(id, |c| c.preserve = v),
+            Command::SetCueShader(id, s) => self.edit_cue(id, |c| c.shader = s),
+            Command::CaptureShader => self.capture_shader(),
+            Command::RemoveShader(id) => self.remove_shader(id),
+            Command::AddBank => self.add_bank(),
+            Command::SetLiveBank(i) => self.set_live_bank(i),
+            Command::SetEditBank(i) => self.set_edit_bank(i),
             Command::SetClipDir(dir) => self.set_clip_dir(dir),
             Command::SetShaderPath(p) => {
                 self.shader_path = p;
@@ -402,9 +621,20 @@ impl App {
             if let (Some(frame), Some(g), Some(r)) =
                 (newest, self.graphics.as_ref(), self.renderer.as_mut())
             {
+                self.current_pts = frame.pts_sec;
                 self.video_mode = frame.pixels.video_mode();
                 r.upload_frame(&g.device, &g.queue, &frame);
             }
+        }
+
+        // 6b. Point the renderer at the playing cue's shader override (a pinned
+        // pool shader), or back to the live shader when the cue has none.
+        let override_shader = self
+            .current
+            .and_then(|c| self.live_cue(c))
+            .and_then(|cue| cue.shader);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_active_shader(override_shader);
         }
 
         // 7. Uniforms.
@@ -451,8 +681,14 @@ impl App {
 
     fn build_mirror(&mut self, snap: &crate::clock::ClockSnapshot, audio: &AudioFrame) {
         let phrase = self.sequencer.phrase_len();
-        let playing = self.sequencer.playing();
+        // Resolve the playing/armed cues to their source clips so the pool grid
+        // can mark them. `active` = the clip has a cue in the live bank.
         let armed = self.sequencer.armed();
+        let live = &self.banks[self.live_bank];
+        let active_clips: std::collections::HashSet<ClipId> =
+            live.cues.iter().map(|c| c.clip).collect();
+        let playing_clip = self.current.and_then(|cid| live.cue(cid)).map(|c| c.clip);
+        let armed_clip = armed.and_then(|cid| live.cue(cid)).map(|c| c.clip);
         let has_thumb = |id: ClipId| self.egui.as_ref().is_some_and(|e| e.has_thumb(id));
 
         self.mirror.bpm = snap.bpm;
@@ -461,6 +697,7 @@ impl App {
         self.mirror.quantum = snap.quantum;
         self.mirror.phrase_len = phrase as u32;
         self.mirror.loop_len = self.loop_len;
+        self.mirror.preserve_playhead = self.preserve_playhead;
         self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
         self.mirror.sync = Some(self.sync);
@@ -491,10 +728,10 @@ impl App {
             .map(|c| ClipEntry {
                 id: c.id,
                 name: c.name.clone(),
-                active: self.sequencer.is_active(c.id),
-                role: if playing == Some(c.id) {
+                active: active_clips.contains(&c.id),
+                role: if playing_clip == Some(c.id) {
                     ClipRole::Playing
-                } else if armed == Some(c.id) {
+                } else if armed_clip == Some(c.id) {
                     ClipRole::Armed
                 } else {
                     ClipRole::None
@@ -502,6 +739,53 @@ impl App {
                 has_thumb: has_thumb(c.id),
             })
             .collect();
+        // Cue banks: the bank bar, and the edit bank's cues (with live roles).
+        let armed_cue = self.sequencer.armed();
+        let playing_cue = self.current;
+        self.mirror.banks = self
+            .banks
+            .iter()
+            .map(|b| BankView {
+                name: b.name.clone(),
+                cue_count: b.cues.len(),
+            })
+            .collect();
+        self.mirror.live_bank = self.live_bank;
+        self.mirror.edit_bank = self.edit_bank;
+        self.mirror.selected_cue = self.selected_cue;
+        self.mirror.shader_pool = self
+            .renderer
+            .as_ref()
+            .map(|r| {
+                r.pool_view()
+                    .into_iter()
+                    .map(|(id, name)| ShaderPoolView { id, name })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.mirror.playhead_sec = self.current_pts;
+        self.mirror.cues = self.banks[self.edit_bank]
+            .cues
+            .iter()
+            .map(|c| CueView {
+                id: c.id,
+                clip: c.clip,
+                name: c.name.clone(),
+                in_sec: c.in_sec,
+                out_sec: c.out_sec,
+                preserve: c.preserve,
+                shader: c.shader,
+                role: if playing_cue == Some(c.id) {
+                    ClipRole::Playing
+                } else if armed_cue == Some(c.id) {
+                    ClipRole::Armed
+                } else {
+                    ClipRole::None
+                },
+                has_thumb: has_thumb(c.clip),
+            })
+            .collect();
+
         self.mirror.levels = audio.bands;
         self.mirror.level = audio.level;
         self.mirror.fullscreen = self.fullscreen;

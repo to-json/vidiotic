@@ -40,13 +40,16 @@ impl Drop for DecodeHandle {
     }
 }
 
-pub fn spawn(path: PathBuf) -> anyhow::Result<DecodeHandle> {
+/// Spawn a decode worker for one cue. `in_sec`/`out_sec` trim the loop: playback
+/// (and every restart) begins at `in_sec` and loops back once it reaches
+/// `out_sec` (or the clip's natural end when `out_sec` is `None`).
+pub fn spawn(path: PathBuf, in_sec: f64, out_sec: Option<f64>) -> anyhow::Result<DecodeHandle> {
     ff::init()?;
     let (frame_tx, frames) = bounded::<DecodedFrame>(3);
     let (close_tx, close_rx) = bounded::<()>(1);
     let (restart_tx, restart_rx) = bounded::<()>(1);
     let join = std::thread::spawn(move || {
-        if let Err(e) = run(&path, &frame_tx, &close_rx, &restart_rx) {
+        if let Err(e) = run(&path, &frame_tx, &close_rx, &restart_rx, in_sec, out_sec) {
             log::error!("decode worker for {}: {e:#}", path.display());
         }
     });
@@ -101,11 +104,20 @@ fn pace(base: Instant, first_pts: &mut Option<f64>, pts: f64) {
     }
 }
 
+/// Seek the demuxer to `secs` (clamped at 0), in the container's own timeline.
+fn seek_secs(ictx: &mut ff::format::context::Input, secs: f64) -> anyhow::Result<()> {
+    let ts = (secs.max(0.0) * 1_000_000.0) as i64; // AV_TIME_BASE microseconds
+    ictx.seek(ts, ..)?;
+    Ok(())
+}
+
 fn run(
     path: &PathBuf,
     tx: &Sender<DecodedFrame>,
     close_rx: &Receiver<()>,
     restart_rx: &Receiver<()>,
+    in_sec: f64,
+    out_sec: Option<f64>,
 ) -> anyhow::Result<()> {
     let mut ictx = ff::format::input(path)?;
 
@@ -136,6 +148,7 @@ fn run(
         );
         run_hap(
             &mut ictx, tx, close_rx, restart_rx, vid_idx, tb, width, height, texture_count,
+            in_sec, out_sec,
         )
     } else {
         log::info!(
@@ -143,7 +156,17 @@ fn run(
             path.display(),
             params.id()
         );
-        run_software(&mut ictx, tx, close_rx, restart_rx, vid_idx, params, tb)
+        run_software(
+            &mut ictx, tx, close_rx, restart_rx, vid_idx, params, tb, in_sec, out_sec,
+        )
+    }
+}
+
+/// Avoid a hot seek-loop when a trim yields no frames (e.g. an in-point past the
+/// clip's end): pause briefly before retrying the empty playthrough.
+fn guard_empty_playthrough(sent_any: bool) {
+    if !sent_any {
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -158,21 +181,36 @@ fn run_hap(
     width: u32,
     height: u32,
     texture_count: u8,
+    in_sec: f64,
+    out_sec: Option<f64>,
 ) -> anyhow::Result<()> {
     loop {
+        // Position at the cue's in-point for this playthrough (also the target
+        // of an EOF loop, out-point loop, or musical re-loop restart).
+        let _ = seek_secs(ictx, in_sec);
         let base = Instant::now();
         let mut first_pts = None;
-        // Prime the restart signal at the start of each playthrough so a request
-        // that arrived during the seek doesn't immediately re-fire.
+        let mut sent_any = false;
+        // Prime the restart signal so a request that arrived during the seek
+        // doesn't immediately re-fire.
         take_restart(restart_rx);
         for (stream, packet) in ictx.packets() {
             if should_stop(close_rx) {
                 return Ok(());
             }
             if take_restart(restart_rx) {
-                break; // musical re-loop: seek to start (handled after the loop)
+                break; // musical re-loop: reseek at the top of the loop
             }
             if stream.index() != vid_idx {
+                continue;
+            }
+            let pts = packet.pts().unwrap_or(0) as f64 * tb;
+            // Loop back once we reach the out-point.
+            if out_sec.is_some_and(|o| pts >= o) {
+                break;
+            }
+            // Skip anything the seek landed before the in-point.
+            if pts + 1e-6 < in_sec {
                 continue;
             }
             let Some(bytes) = packet.data() else { continue };
@@ -186,7 +224,6 @@ fn run_hap(
                     continue;
                 }
             };
-            let pts = packet.pts().unwrap_or(0) as f64 * tb;
             pace(base, &mut first_pts, pts);
 
             let frame = DecodedFrame {
@@ -200,18 +237,13 @@ fn run_hap(
                 h: height,
                 pts_sec: pts,
             };
+            sent_any = true;
             if send_or_stop(tx, close_rx, frame) {
                 return Ok(());
             }
         }
-        // EOF -> loop back to the start.
-        let _ = hap_seek_start(ictx);
+        guard_empty_playthrough(sent_any);
     }
-}
-
-fn hap_seek_start(ictx: &mut ff::format::context::Input) -> anyhow::Result<()> {
-    ictx.seek(0, ..)?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,6 +255,8 @@ fn run_software(
     vid_idx: usize,
     params: ff::codec::Parameters,
     tb: f64,
+    in_sec: f64,
+    out_sec: Option<f64>,
 ) -> anyhow::Result<()> {
     use ff::format::Pixel;
     use ff::software::scaling;
@@ -241,11 +275,41 @@ fn run_software(
         scaling::Flags::BILINEAR,
     )?;
 
+    let send_rgba = |decoded: &ff::frame::Video,
+                         scaler: &mut scaling::Context,
+                         base: Instant,
+                         first_pts: &mut Option<f64>,
+                         pts: f64,
+                         pace_it: bool|
+     -> anyhow::Result<bool> {
+        if pace_it {
+            pace(base, first_pts, pts);
+        }
+        let mut rgba = ff::frame::Video::empty();
+        scaler.run(decoded, &mut rgba)?;
+        let stride = rgba.stride(0) as u32;
+        let frame = DecodedFrame {
+            pixels: PixelData::Rgba {
+                data: rgba.data(0).to_vec(),
+                stride,
+            },
+            w,
+            h,
+            pts_sec: pts,
+        };
+        Ok(send_or_stop(tx, close_rx, frame))
+    };
+
     loop {
+        // Seek+flush to the in-point for this playthrough.
+        let _ = seek_secs(ictx, in_sec);
+        decoder.flush();
         let base = Instant::now();
         let mut first_pts = None;
         let mut decoded = ff::frame::Video::empty();
         let mut restarted = false;
+        let mut hit_out = false;
+        let mut sent_any = false;
         take_restart(restart_rx);
 
         for (stream, packet) in ictx.packets() {
@@ -254,7 +318,7 @@ fn run_software(
             }
             if take_restart(restart_rx) {
                 restarted = true;
-                break; // musical re-loop: seek to start without draining the decoder
+                break; // musical re-loop: reseek at the top of the loop
             }
             if stream.index() != vid_idx {
                 continue;
@@ -262,48 +326,40 @@ fn run_software(
             decoder.send_packet(&packet)?;
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(0) as f64 * tb;
-                pace(base, &mut first_pts, pts);
-                let mut rgba = ff::frame::Video::empty();
-                scaler.run(&decoded, &mut rgba)?;
-                let stride = rgba.stride(0) as u32;
-                let frame = DecodedFrame {
-                    pixels: PixelData::Rgba {
-                        data: rgba.data(0).to_vec(),
-                        stride,
-                    },
-                    w,
-                    h,
-                    pts_sec: pts,
-                };
-                if send_or_stop(tx, close_rx, frame) {
+                if out_sec.is_some_and(|o| pts >= o) {
+                    hit_out = true;
+                    break;
+                }
+                if pts + 1e-6 < in_sec {
+                    continue; // seek landed before the in-point; drop
+                }
+                sent_any = true;
+                if send_rgba(&decoded, &mut scaler, base, &mut first_pts, pts, true)? {
                     return Ok(());
                 }
             }
+            if hit_out {
+                break;
+            }
         }
-        // On natural EOF, flush the decoder's buffered frames before looping.
-        // On a musical re-loop we skip the flush and cut straight to the start.
-        if !restarted {
+        // Natural EOF (not a restart or out-point cut): drain buffered frames.
+        if !restarted && !hit_out {
             decoder.send_eof()?;
             while decoder.receive_frame(&mut decoded).is_ok() {
-                let mut rgba = ff::frame::Video::empty();
-                scaler.run(&decoded, &mut rgba)?;
-                let stride = rgba.stride(0) as u32;
-                let frame = DecodedFrame {
-                    pixels: PixelData::Rgba {
-                        data: rgba.data(0).to_vec(),
-                        stride,
-                    },
-                    w,
-                    h,
-                    pts_sec: decoded.pts().unwrap_or(0) as f64 * tb,
-                };
-                if send_or_stop(tx, close_rx, frame) {
+                let pts = decoded.pts().unwrap_or(0) as f64 * tb;
+                if out_sec.is_some_and(|o| pts >= o) {
+                    break;
+                }
+                if pts + 1e-6 < in_sec {
+                    continue;
+                }
+                sent_any = true;
+                if send_rgba(&decoded, &mut scaler, base, &mut first_pts, pts, true)? {
                     return Ok(());
                 }
             }
         }
-        ictx.seek(0, ..)?;
-        decoder.flush();
+        guard_empty_playthrough(sent_any);
     }
 }
 

@@ -62,6 +62,7 @@ impl std::fmt::Display for ShaderError {
 
 impl std::error::Error for ShaderError {}
 
+#[derive(Clone, Copy)]
 pub enum ShaderLang {
     Glsl,
     Wgsl,
@@ -404,6 +405,29 @@ mod tests {
         assert_eq!(rewrite_freqs1("freqs1[clamp(i,0,20)]"), "fftBand((clamp(i,0,20)))");
         // not a false match on a longer identifier
         assert_eq!(rewrite_freqs1("freqs1x[0]"), "freqs1x[0]");
+    }
+
+    #[test]
+    fn bundled_frag_shaders_compile() {
+        // Every shipped .frag must survive preamble injection, preprocessing,
+        // naga parse, and validation — so a broken demo shader can't ship.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("shaders dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("frag") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("preamble.frag") {
+                continue; // the preamble is a fragment, not a standalone user shader
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            if let Err(e) = compile_glsl_to_module(&src) {
+                panic!("shader {} failed to compile:\n{e}", path.display());
+            }
+            checked += 1;
+        }
+        assert!(checked >= 1, "expected at least one bundled .frag");
     }
 
     #[test]

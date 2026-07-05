@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use crate::commands::ShaderId;
 use crate::shader::{self, ShaderError, ShaderLang};
 use crate::video::frame::{DecodedFrame, PixelData};
 use crate::video::hap::HapTextureFormat;
@@ -79,6 +80,13 @@ struct VideoTexture {
     bind_group: wgpu::BindGroup,
 }
 
+/// A shader pinned into the pool: a frozen compile a cue can render with.
+struct PooledShader {
+    id: ShaderId,
+    name: String,
+    pipeline: wgpu::RenderPipeline,
+}
+
 pub struct Renderer {
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
@@ -94,6 +102,15 @@ pub struct Renderer {
     pipeline: Option<wgpu::RenderPipeline>,
     passthrough: wgpu::RenderPipeline,
     shader_error: Option<String>,
+    // Source of the current last-good live compile, so it can be re-compiled into
+    // a frozen pool entry on `capture_current`.
+    last_good: Option<(String, ShaderLang)>,
+    // Pinned shaders and the id of the one currently overriding the live shader
+    // (set by the app from the playing cue). Falls back to the live shader when
+    // the id no longer resolves.
+    pool: Vec<PooledShader>,
+    next_pool_id: ShaderId,
+    active_override: Option<ShaderId>,
 }
 
 impl Renderer {
@@ -227,6 +244,10 @@ impl Renderer {
             pipeline: None,
             passthrough,
             shader_error: None,
+            last_good: None,
+            pool: Vec::new(),
+            next_pool_id: 1,
+            active_override: None,
         }
     }
 
@@ -242,12 +263,49 @@ impl Renderer {
             Ok(p) => {
                 self.pipeline = Some(p);
                 self.shader_error = None;
+                self.last_good = Some((src.to_string(), lang));
             }
             Err(e) => {
                 self.shader_error = Some(e.to_string());
                 log::warn!("shader compile failed (keeping last-good): {e}");
             }
         }
+    }
+
+    /// Pin the current last-good live shader into the pool as a frozen compile.
+    /// Returns the new id, or `None` if there is no compiled shader to pin.
+    pub fn capture_current(&mut self, device: &wgpu::Device, name: String) -> Option<ShaderId> {
+        let (src, lang) = self.last_good.clone()?;
+        match self.compile(device, &src, lang) {
+            Ok(pipeline) => {
+                let id = self.next_pool_id;
+                self.next_pool_id += 1;
+                self.pool.push(PooledShader { id, name, pipeline });
+                Some(id)
+            }
+            Err(e) => {
+                // last_good compiled once, so this is unexpected; don't pin a broken entry.
+                log::warn!("pin shader failed: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn remove_pool_shader(&mut self, id: ShaderId) {
+        self.pool.retain(|p| p.id != id);
+        if self.active_override == Some(id) {
+            self.active_override = None;
+        }
+    }
+
+    /// Select which pinned shader overrides the live one this frame (`None` = live).
+    pub fn set_active_shader(&mut self, id: Option<ShaderId>) {
+        self.active_override = id;
+    }
+
+    /// (id, name) of each pinned shader, in pin order.
+    pub fn pool_view(&self) -> Vec<(ShaderId, String)> {
+        self.pool.iter().map(|p| (p.id, p.name.clone())).collect()
     }
 
     fn compile(
@@ -415,7 +473,13 @@ impl Renderer {
     /// Draw the composite into `view`. Uses the active user pipeline, or the
     /// built-in passthrough if none has been set yet.
     pub fn render(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
-        let pipeline = self.pipeline.as_ref().unwrap_or(&self.passthrough);
+        // A playing cue's pinned override wins, else the live shader, else passthrough.
+        let pipeline = self
+            .active_override
+            .and_then(|id| self.pool.iter().find(|p| p.id == id))
+            .map(|p| &p.pipeline)
+            .or(self.pipeline.as_ref())
+            .unwrap_or(&self.passthrough);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("output-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {

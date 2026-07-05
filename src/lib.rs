@@ -4,6 +4,7 @@
 pub mod analysis;
 pub mod app;
 pub mod audio;
+pub mod bank;
 pub mod clippool;
 pub mod clock;
 pub mod commands;
