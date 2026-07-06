@@ -11,10 +11,11 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use ffmpeg_next as ff;
 
 use crate::video::frame::{DecodedFrame, PixelData};
-use crate::video::hap::{self, HapTextureFormat};
+use crate::video::hap;
 
 /// Handle to a running decode worker. Dropping it stops and joins the thread.
 pub struct DecodeHandle {
+    /// Decoded frames, paced to the clip's timeline (bounded; drain for newest).
     pub frames: Receiver<DecodedFrame>,
     restart_tx: Sender<()>,
     close_tx: Option<Sender<()>>,
@@ -364,9 +365,4 @@ fn run_software(
         }
         guard_empty_playthrough(sent_any);
     }
-}
-
-/// True if the format's decoded frames use the BC alpha texture (HapM only).
-pub fn is_bc4(format: HapTextureFormat) -> bool {
-    matches!(format, HapTextureFormat::Bc4)
 }

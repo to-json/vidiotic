@@ -3,8 +3,6 @@
 //! clip thumbnails. `control_ui` reads a `UiMirror` and emits `Command`s.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use winit::window::Window;
@@ -12,15 +10,17 @@ use winit::window::Window;
 use crate::commands::{ClipEntry, ClipId, ClipRole, Command, CueView, SyncKind, UiMirror};
 use crate::gfx::WindowSurface;
 
+/// The control window's egui stack: context, winit input translation, wgpu
+/// paint renderer, and the cached clip thumbnails.
 pub struct EguiCtl {
     ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
     thumbs: HashMap<ClipId, egui::TextureHandle>,
-    pub repaint_at: Option<Instant>,
 }
 
 impl EguiCtl {
+    /// Set up egui for the control window, painting to surfaces of `format`.
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let ctx = egui::Context::default();
         let state = egui_winit::State::new(
@@ -44,14 +44,15 @@ impl EguiCtl {
             state,
             renderer,
             thumbs: HashMap::new(),
-            repaint_at: None,
         }
     }
 
+    /// Whether a thumbnail texture is cached for this clip.
     pub fn has_thumb(&self, id: ClipId) -> bool {
         self.thumbs.contains_key(&id)
     }
 
+    /// Drop all cached thumbnails (the clip pool was replaced).
     pub fn clear_thumbnails(&mut self) {
         self.thumbs.clear();
     }
@@ -71,6 +72,7 @@ impl EguiCtl {
         self.thumbs.insert(id, handle);
     }
 
+    /// Run `control_ui` for one frame and paint it into the control surface.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -133,17 +135,8 @@ impl EguiCtl {
         for id in &full.textures_delta.free {
             self.renderer.free_texture(id);
         }
-
-        let delay = full
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|v| v.repaint_delay)
-            .unwrap_or(Duration::MAX);
-        if delay.is_zero() {
-            ws.window.request_redraw();
-        } else if delay < Duration::from_secs(3600) {
-            self.repaint_at = Some(Instant::now() + delay);
-        }
+        // No repaint scheduling: the engine requests a control redraw every
+        // tick anyway (see `App::update`), which outpaces egui's repaint_delay.
     }
 }
 
@@ -807,6 +800,3 @@ fn pick_file(tx: Sender<Command>, kind: PickKind) {
         }
     }
 }
-
-/// Wrap an Arc<Window> for reuse elsewhere (kept for symmetry with output side).
-pub type SharedWindow = Arc<Window>;

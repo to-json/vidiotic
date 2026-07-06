@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use vidiotic::analysis::{self, AudioCtl, AudioFrame};
 use vidiotic::app::{self, Boot};
@@ -53,9 +53,9 @@ struct RunArgs {
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     phrase_len: u32,
 
-    /// Clock sync source at startup: internal or link (Ableton Link).
-    #[arg(long, default_value = "internal")]
-    sync: String,
+    /// Clock sync source at startup.
+    #[arg(long, value_enum, default_value = "internal")]
+    sync: SyncArg,
 
     /// Output monitor index for fullscreen (default: first non-primary).
     #[arg(long)]
@@ -68,6 +68,14 @@ struct RunArgs {
     /// Input device name substring to capture from (default: system default input).
     #[arg(long)]
     audio_device: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SyncArg {
+    /// App-owned host-time clock.
+    Internal,
+    /// Follow an Ableton Link session.
+    Link,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -136,10 +144,9 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         bpm: cli.bpm,
         quantum: QUANTUM,
         phrase_len: cli.phrase_len,
-        initial_sync: if cli.sync.eq_ignore_ascii_case("link") {
-            SyncKind::Link
-        } else {
-            SyncKind::Internal
+        initial_sync: match cli.sync {
+            SyncArg::Internal => SyncKind::Internal,
+            SyncArg::Link => SyncKind::Link,
         },
         clip_dir,
         clips,

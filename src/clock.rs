@@ -1,10 +1,12 @@
 //! Beat clock. Everything the app quantizes to comes from a `ClockSource`:
-//! the internal host-time clock now, Ableton Link (M3) and Pro DJ Link (later)
-//! behind the same small trait. All timing is derived from host time, never
-//! frame counts, so it survives frame-rate variation and can be quantized.
+//! the internal host-time clock and Ableton Link behind the same small trait
+//! (kept small so Pro DJ Link can slot in beside them). All timing is derived
+//! from host time, never frame counts, so it survives frame-rate variation and
+//! can be quantized.
 
 use std::time::Instant;
 
+/// One coherent reading of a clock, taken once per engine tick.
 #[derive(Clone, Copy, Debug)]
 pub struct ClockSnapshot {
     pub bpm: f64,
@@ -17,28 +19,38 @@ pub struct ClockSnapshot {
     pub is_playing: bool,
 }
 
+/// What a clock source allows, so the UI can grey out unsupported controls
+/// (a MIDI-clock follower, say, could not set tempo).
 #[derive(Clone, Copy, Debug)]
 pub struct ClockCaps {
     pub can_set_tempo: bool,
     pub can_set_phase: bool,
+    /// Connected Link peers (0 for non-networked sources).
     pub peers: u64,
 }
 
+/// A tempo/phase source the engine can quantize to. All methods may mutate
+/// because sources like Link capture session state on read.
 pub trait ClockSource {
+    /// Read the current tempo/beat/phase.
     fn snapshot(&mut self) -> ClockSnapshot;
+    /// Set an absolute tempo, clamped to the source's supported range.
     fn set_bpm(&mut self, bpm: f64);
     /// Multiply tempo by `1 + ratio`; `ratio = ±0.001` for the ±0.1% controls.
     fn nudge_bpm(&mut self, ratio: f64);
     /// Make "now" an exact quantum (bar) boundary — sets the downbeat anchor.
     fn tap_downbeat(&mut self);
-    /// Reset the grid to its origin: `beat = 0` — note one of bar one, phrase one.
+    /// Reset the grid to its origin: `beat = 0` — beat one of bar one, phrase one.
     fn reset(&mut self);
+    /// What this source supports (see `ClockCaps`).
     fn caps(&self) -> ClockCaps;
 }
 
 const BPM_MIN: f64 = 20.0;
 const BPM_MAX: f64 = 999.0;
 
+/// App-owned clock: beats accrue from host time at the current tempo, anchored
+/// so tempo changes and taps never re-price already-elapsed time.
 pub struct InternalClock {
     anchor: Instant,
     bpm: f64,

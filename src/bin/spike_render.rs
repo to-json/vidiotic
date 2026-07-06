@@ -1,4 +1,4 @@
-//! M1 headless render spike: prove the real composite pipeline without a window.
+//! Headless render spike: prove the real composite pipeline without a window.
 //! Renders the user shader over a synthetic video frame into an offscreen target
 //! and reads back the center pixel. Covers: wgpu device w/ BC feature, GLSL
 //! compile -> pipeline, RGBA upload, BC1 upload + Metal block decode, and a

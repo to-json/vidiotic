@@ -14,6 +14,7 @@ use crate::video::hap;
 const HAP1_TAG: u32 = u32::from_le_bytes(*b"Hap1");
 const OUT_TIMESCALE: i32 = 1000; // millisecond output time base pre-header
 
+/// Transcode `input` (any decodable video) to a HAP1 `.mov` at `output`.
 pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
     ff::init()?;
 
@@ -73,8 +74,7 @@ pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
     let mut packed = vec![0u8; (w * h * 4) as usize];
 
     let mut decoded = ff::frame::Video::empty();
-    let mut idx: i64 = 0;
-    let mut count: u64 = 0;
+    let mut idx: i64 = 0; // output frame index, also the frame count for the log
 
     let mut process = |decoder: &mut ff::decoder::Video,
                        scaler: &mut ff::software::scaling::Context,
@@ -105,7 +105,6 @@ pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
             pkt.set_flags(ff::codec::packet::Flags::KEY); // HAP is all-intra
             pkt.write_interleaved(octx)?;
             idx += 1;
-            count += 1;
         }
         Ok(())
     };
@@ -123,7 +122,7 @@ pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
     octx.write_trailer()?;
     log::info!(
         "transcoded {} frames -> {} (Hap1, {w}x{h}, {fps:.2} fps)",
-        count,
+        idx,
         output.display()
     );
     Ok(())

@@ -9,6 +9,7 @@ use crate::commands::{ClipId, ShaderId};
 /// several cues (different trim / options), so decoders are keyed by cue.
 pub type CueId = u32;
 
+/// A placement of a source clip: trim points plus per-cue playback overrides.
 #[derive(Clone, Debug)]
 pub struct Cue {
     pub id: CueId,
@@ -27,6 +28,7 @@ pub struct Cue {
 }
 
 impl Cue {
+    /// A full-length cue: no trim, all overrides inherited.
     pub fn new(id: CueId, clip: ClipId, name: String) -> Self {
         Cue {
             id,
@@ -40,6 +42,7 @@ impl Cue {
     }
 }
 
+/// An ordered, named set of cues; the play order is the vec order.
 #[derive(Clone, Debug)]
 pub struct Bank {
     pub name: String,
@@ -47,6 +50,7 @@ pub struct Bank {
 }
 
 impl Bank {
+    /// An empty bank.
     pub fn new(name: impl Into<String>) -> Self {
         Bank {
             name: name.into(),
@@ -54,10 +58,12 @@ impl Bank {
         }
     }
 
+    /// The cue with `id`, if it lives in this bank.
     pub fn cue(&self, id: CueId) -> Option<&Cue> {
         self.cues.iter().find(|c| c.id == id)
     }
 
+    /// Mutable variant of [`Bank::cue`].
     pub fn cue_mut(&mut self, id: CueId) -> Option<&mut Cue> {
         self.cues.iter_mut().find(|c| c.id == id)
     }

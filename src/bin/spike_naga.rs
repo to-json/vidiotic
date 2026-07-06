@@ -1,8 +1,7 @@
-//! M0 spike: verify naga's GLSL frontend accepts the app preamble + preprocessed
-//! throw-shade reference shaders, and that a deliberate error is reported with a
-//! sensible user-file line number. Run: `cargo run --bin spike_naga`.
+//! Shader-compile spike: verify naga's GLSL frontend accepts the app preamble +
+//! preprocessed reference shaders, and that a deliberate error is reported with
+//! a sensible user-file line number. Run: `cargo run --bin spike_naga`.
 
-use std::path::Path;
 use vidiotic::shader::{compile_glsl_to_module, compile_wgsl_to_module, ShaderError};
 
 fn try_glsl(label: &str, path: &str) -> bool {
@@ -30,8 +29,6 @@ fn try_glsl(label: &str, path: &str) -> bool {
 }
 
 fn main() {
-    let _ = Path::new("."); // silence unused import if refactored
-
     let mut ok = true;
 
     // The two real user shaders from the reference project.
@@ -101,9 +98,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>) -> @lo
         }
         Err(ShaderError::Parse { line, .. }) | Err(ShaderError::Validation { line, .. }) => {
             println!("[ OK ] broken shader rejected; reported user line = {line:?} (expected ~3)");
-        }
-        Err(e) => {
-            println!("[WARN] broken shader rejected but with unexpected error kind: {e}");
         }
     }
 

@@ -1,11 +1,13 @@
 //! The UI↔engine contract: `Command`s flow from the control UI (and async file
 //! pickers) to the engine; the engine publishes a `UiMirror` snapshot the UI
-//! reads. Keeping these in one place lets MIDI (M4) map onto the same commands.
+//! reads. Keeping these in one place lets other input sources (keys today,
+//! MIDI eventually) map onto the same commands.
 
 use std::path::PathBuf;
 
 use crate::bank::CueId;
 
+/// Identifies a source clip in the pool (its scan index).
 pub type ClipId = u32;
 
 /// A compiled shader pinned into the pool. A cue can reference one as an override.
@@ -16,6 +18,7 @@ pub type ShaderId = u32;
 /// integer while still expressing sub-beat divisions.
 pub const LOOP_TICKS_PER_BEAT: u32 = 32;
 
+/// Which `ClockSource` drives the beat grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SyncKind {
     #[default]
@@ -23,6 +26,7 @@ pub enum SyncKind {
     Link,
 }
 
+/// Everything an input surface (UI, keys, pickers) can ask the engine to do.
 #[derive(Clone, Debug)]
 pub enum Command {
     SetBpm(f64),
@@ -62,6 +66,7 @@ pub enum Command {
     Quit,
 }
 
+/// A clip/cue's live-playback role, for UI markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipRole {
     None,
@@ -69,6 +74,7 @@ pub enum ClipRole {
     Armed,
 }
 
+/// One source clip as shown in the pool grid.
 #[derive(Clone, Debug)]
 pub struct ClipEntry {
     pub id: ClipId,

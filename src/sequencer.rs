@@ -9,27 +9,32 @@ use crate::bank::CueId;
 use crate::clock::{BoundaryTracker, ClockSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SeqState {
+enum SeqState {
     Idle,
     Playing {
-        clip: CueId,
+        cue: CueId,
     },
     PlayingArmed {
-        clip: CueId,
+        cue: CueId,
         next: CueId,
         fire_at_beat: f64,
     },
 }
 
+/// Actions the engine must take in response to a sequencer state change.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SequencerEvent {
+    /// Spawn the cue's decoder ahead of the swap so its first frame is ready.
     ArmDecoder(CueId),
+    /// Cut the output to this cue now.
     SwapTo(CueId),
+    /// The armed cue was cancelled; unused decoders can be dropped.
     DisarmDecoder,
 }
 
+/// Phrase-quantized round-robin over the active cue set. See the module doc.
 pub struct Sequencer {
-    pub state: SeqState,
+    state: SeqState,
     active: Vec<CueId>, // insertion order == round-robin order
     phrase_len: f64,     // 16 or 32 beats
     bar: f64,            // 4 beats — arm lead time
@@ -37,6 +42,7 @@ pub struct Sequencer {
 }
 
 impl Sequencer {
+    /// An idle sequencer with an empty active set.
     pub fn new(phrase_len: f64) -> Self {
         Sequencer {
             state: SeqState::Idle,
@@ -47,20 +53,13 @@ impl Sequencer {
         }
     }
 
-    pub fn active(&self) -> &[CueId] {
-        &self.active
-    }
-
+    /// Beats between auto-transitions.
     pub fn phrase_len(&self) -> f64 {
         self.phrase_len
     }
 
-    pub fn is_active(&self, id: CueId) -> bool {
-        self.active.contains(&id)
-    }
-
     /// Round-robin successor of `cur`, skipping it unless it's the only member.
-    /// If `cur` is no longer active, fall back to the first active clip.
+    /// If `cur` is no longer active, fall back to the first active cue.
     fn pick_next(&self, cur: CueId) -> Option<CueId> {
         if self.active.is_empty() {
             return None;
@@ -71,6 +70,8 @@ impl Sequencer {
         }
     }
 
+    /// Advance the state machine one frame: start playing when idle, arm the
+    /// next cue a bar before the phrase boundary, and swap on the boundary.
     pub fn tick(&mut self, snap: &ClockSnapshot) -> Vec<SequencerEvent> {
         let mut ev = Vec::new();
         if !snap.is_playing {
@@ -83,18 +84,18 @@ impl Sequencer {
             SeqState::Idle => {
                 if let Some(&first) = self.active.first() {
                     ev.push(SequencerEvent::SwapTo(first));
-                    self.state = SeqState::Playing { clip: first };
+                    self.state = SeqState::Playing { cue: first };
                 }
             }
-            SeqState::Playing { clip } => {
+            SeqState::Playing { cue } => {
                 let fire_at =
                     ((snap.beat / self.phrase_len).floor() + 1.0) * self.phrase_len;
                 if snap.beat >= fire_at - self.bar {
-                    if let Some(next) = self.pick_next(clip) {
-                        if next != clip {
+                    if let Some(next) = self.pick_next(cue) {
+                        if next != cue {
                             ev.push(SequencerEvent::ArmDecoder(next));
                             self.state = SeqState::PlayingArmed {
-                                clip,
+                                cue,
                                 next,
                                 fire_at_beat: fire_at,
                             };
@@ -103,7 +104,7 @@ impl Sequencer {
                 }
             }
             SeqState::PlayingArmed {
-                clip,
+                cue,
                 next,
                 fire_at_beat,
             } => {
@@ -112,54 +113,54 @@ impl Sequencer {
                     let fire_at =
                         ((snap.beat / self.phrase_len).floor() + 1.0) * self.phrase_len;
                     self.state = SeqState::PlayingArmed {
-                        clip,
+                        cue,
                         next,
                         fire_at_beat: fire_at,
                     };
                 } else if boundary.is_some() || snap.beat >= fire_at_beat {
                     ev.push(SequencerEvent::SwapTo(next));
-                    self.state = SeqState::Playing { clip: next };
+                    self.state = SeqState::Playing { cue: next };
                 }
             }
         }
         ev
     }
 
-    /// Toggle a clip's active-set membership. `beat` is the current beat, used to
-    /// decide whether a removed armed clip can still be re-armed.
+    /// Toggle a cue's active-set membership. `beat` is the current beat, used to
+    /// decide whether a removed armed cue can still be re-armed.
     pub fn toggle_active(&mut self, id: CueId, beat: f64) -> Vec<SequencerEvent> {
         let mut ev = Vec::new();
         if let Some(i) = self.active.iter().position(|&c| c == id) {
             self.active.remove(i);
             if let SeqState::PlayingArmed {
-                clip,
+                cue,
                 next,
                 fire_at_beat,
             } = self.state
             {
                 if next == id && fire_at_beat - beat >= self.bar {
                     ev.push(SequencerEvent::DisarmDecoder);
-                    match self.pick_next(clip) {
-                        Some(n2) if n2 != clip => {
+                    match self.pick_next(cue) {
+                        Some(n2) if n2 != cue => {
                             ev.push(SequencerEvent::ArmDecoder(n2));
                             self.state = SeqState::PlayingArmed {
-                                clip,
+                                cue,
                                 next: n2,
                                 fire_at_beat,
                             };
                         }
-                        _ => self.state = SeqState::Playing { clip },
+                        _ => self.state = SeqState::Playing { cue },
                     }
                 }
                 // else <1 bar left: let it fire; resequences next phrase
             }
-            // removing the playing clip: finish the phrase; pick_next falls back
-            // to active[0] at the next arm point. Empty set: last clip loops.
+            // removing the playing cue: finish the phrase; pick_next falls back
+            // to active[0] at the next arm point. Empty set: last cue loops.
         } else {
             self.active.push(id);
             if matches!(self.state, SeqState::Idle) {
                 ev.push(SequencerEvent::SwapTo(id));
-                self.state = SeqState::Playing { clip: id };
+                self.state = SeqState::Playing { cue: id };
             }
         }
         ev
@@ -176,14 +177,14 @@ impl Sequencer {
             SeqState::Idle => {
                 if let Some(&first) = self.active.first() {
                     ev.push(SequencerEvent::SwapTo(first));
-                    self.state = SeqState::Playing { clip: first };
+                    self.state = SeqState::Playing { cue: first };
                 }
             }
             SeqState::Playing { .. } => {}
-            SeqState::PlayingArmed { clip, next, .. } => {
+            SeqState::PlayingArmed { cue, next, .. } => {
                 if !self.active.contains(&next) {
                     ev.push(SequencerEvent::DisarmDecoder);
-                    self.state = SeqState::Playing { clip };
+                    self.state = SeqState::Playing { cue };
                 }
             }
         }
@@ -191,11 +192,13 @@ impl Sequencer {
         ev
     }
 
+    /// Change the phrase length. Any armed cue is disarmed (its fire beat was
+    /// computed against the old grid); it re-arms at the new grid's arm window.
     pub fn set_phrase_len(&mut self, beats: u32) -> Vec<SequencerEvent> {
         self.phrase_len = beats.max(1) as f64;
         self.tracker.reset();
-        if let SeqState::PlayingArmed { clip, .. } = self.state {
-            self.state = SeqState::Playing { clip };
+        if let SeqState::PlayingArmed { cue, .. } = self.state {
+            self.state = SeqState::Playing { cue };
             return vec![SequencerEvent::DisarmDecoder];
         }
         vec![]
@@ -207,15 +210,15 @@ impl Sequencer {
         self.tracker.reset();
     }
 
-    /// Currently displayed clip, if any.
+    /// Currently displayed cue, if any.
     pub fn playing(&self) -> Option<CueId> {
         match self.state {
-            SeqState::Playing { clip } | SeqState::PlayingArmed { clip, .. } => Some(clip),
+            SeqState::Playing { cue } | SeqState::PlayingArmed { cue, .. } => Some(cue),
             SeqState::Idle => None,
         }
     }
 
-    /// Pre-armed next clip, if any.
+    /// Pre-armed next cue, if any.
     pub fn armed(&self) -> Option<CueId> {
         match self.state {
             SeqState::PlayingArmed { next, .. } => Some(next),

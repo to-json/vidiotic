@@ -1,4 +1,4 @@
-//! Application shell (M2): two windows (fullscreen output + egui control) on one
+//! Application shell: two windows (fullscreen output + egui control) on one
 //! shared Device/Queue, an engine tick that drains UI commands, runs the
 //! sequencer, manages per-clip decoders, and feeds audio/beat uniforms to the
 //! output shader.
@@ -40,6 +40,8 @@ const SHADER_DEBOUNCE: Duration = Duration::from_millis(75);
 const TAP_TIMEOUT: Duration = Duration::from_millis(2000);
 const TAP_MAX: usize = 8;
 
+/// Everything assembled at startup (CLI args, clip pool, audio plumbing) that
+/// `App::new` takes ownership of.
 pub struct Boot {
     pub shader_path: PathBuf,
     pub windowed: bool,
@@ -62,6 +64,8 @@ pub struct Boot {
     pub cmd_rx: Receiver<Command>,
 }
 
+/// The engine: owns the clock, sequencer, banks, decoders, renderer, and both
+/// windows, and advances them all from one `update()` tick per event-loop pass.
 pub struct App {
     // GPU / windows
     graphics: Option<Graphics>,
@@ -135,8 +139,8 @@ pub struct App {
     // compositor never hands back a drawable, so `get_current_texture()`
     // returns instantly instead of blocking on vsync. Poll-driving redraw
     // requests in that state spins the render loop at native CPU speed and
-    // leaks GPU-side surface resources (see memcheck-* repro). Skip drawing
-    // entirely while occluded instead.
+    // leaks GPU-side surface resources. Skip drawing entirely while occluded
+    // instead.
     output_occluded: bool,
     control_occluded: bool,
 }
@@ -533,7 +537,7 @@ impl App {
         self.sequencer.reset_boundary();
     }
 
-    fn apply_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
+    fn apply_command(&mut self, cmd: Command) {
         match cmd {
             Command::SetBpm(b) => self.clock.set_bpm(b),
             Command::BpmDelta(d) => {
@@ -587,7 +591,7 @@ impl App {
                 self.load_shader();
             }
             Command::SetAudioDevice(name) => self.switch_audio_device(name),
-            Command::ToggleFullscreen => self.toggle_fullscreen(event_loop),
+            Command::ToggleFullscreen => self.toggle_fullscreen(),
             Command::Quit => self.should_quit = true,
         }
     }
@@ -596,7 +600,7 @@ impl App {
         // 1. Commands (from UI + async pickers + keys).
         let cmds: Vec<Command> = self.cmd_rx.try_iter().collect();
         for c in cmds {
-            self.apply_command(c, event_loop);
+            self.apply_command(c);
         }
 
         // 2. Thumbnails.
@@ -677,9 +681,8 @@ impl App {
 
         // 7. Uniforms. Skipped while occluded: these are two GPU queue writes
         // (globals buffer + audio texture) that would otherwise fire on every
-        // Poll-loop tick with no frame ever submitted to reclaim them — the
-        // actual leak mechanism (see memcheck-* repro), independent of the
-        // acquire-spin fixed above.
+        // Poll-loop tick with no frame ever submitted to reclaim them, leaking
+        // GPU-side staging memory.
         let audio: AudioFrame = *self.audio_out.read();
         if !self.output_occluded {
             if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_ref()) {
@@ -715,16 +718,10 @@ impl App {
             if !self.output_occluded {
                 g.output.window.request_redraw();
             }
-            let repaint_due = self
-                .egui
-                .as_ref()
-                .and_then(|e| e.repaint_at)
-                .is_some_and(|t| Instant::now() >= t);
             // control repaints ~each tick while shown (cheap; it clears on occlusion)
             if !self.control_occluded {
                 g.control.window.request_redraw();
             }
-            let _ = repaint_due;
         }
 
         if self.should_quit {
@@ -906,7 +903,7 @@ impl App {
         }
     }
 
-    fn toggle_fullscreen(&mut self, _event_loop: &ActiveEventLoop) {
+    fn toggle_fullscreen(&mut self) {
         if let Some(g) = self.graphics.as_ref() {
             if g.output.window.fullscreen().is_some() {
                 g.output.window.set_fullscreen(None);
@@ -1082,6 +1079,7 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Run the player until quit: builds the `App` and drives the winit event loop.
 pub fn run(boot: Boot) -> anyhow::Result<()> {
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

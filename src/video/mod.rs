@@ -1,5 +1,6 @@
-//! Video subsystem: HAP frame parsing (`hap`), clip decoding workers, and the
-//! clip pool. Only `hap` exists at M0; the rest lands in M1.
+//! Video subsystem: HAP frame parsing (`hap`), per-clip decode workers
+//! (`decoder`), and the plain-data frame types they hand to the renderer
+//! (`frame`).
 
 pub mod decoder;
 pub mod frame;

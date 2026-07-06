@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+/// One window and its configured swapchain surface.
 pub struct WindowSurface {
     pub window: Arc<Window>,
     pub surface: wgpu::Surface<'static>,
@@ -46,6 +47,7 @@ impl WindowSurface {
         }
     }
 
+    /// Reconfigure the surface for a new window size (zero sizes are ignored).
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         if w > 0 && h > 0 {
             self.config.width = w;
@@ -54,6 +56,8 @@ impl WindowSurface {
         }
     }
 
+    /// Get the next drawable, reconfiguring on Outdated/Lost. `None` means
+    /// skip this frame (no drawable, or the surface was just rebuilt).
     pub fn acquire(&self, device: &wgpu::Device) -> Option<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -72,6 +76,7 @@ impl WindowSurface {
     }
 }
 
+/// The shared GPU context: one Device/Queue driving both window surfaces.
 pub struct Graphics {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -80,6 +85,9 @@ pub struct Graphics {
 }
 
 impl Graphics {
+    /// Pick an adapter (must support BC textures, required for HAP), create the
+    /// device, and configure both surfaces — output on Fifo (vsync paces the
+    /// render loop), control on AutoVsync.
     pub fn new(output_win: Arc<Window>, control_win: Arc<Window>) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
         let out_surface = instance.create_surface(output_win.clone())?;

@@ -1,4 +1,4 @@
-//! M1 decode spike: open a clip, pull a handful of frames, report the path
+//! Decode spike: open a clip, pull a handful of frames, report the path
 //! (HAP or software), dimensions, and a center pixel so the RGBA fallback is
 //! visibly working. Run: `cargo run --bin spike_decode -- <clip>`
 

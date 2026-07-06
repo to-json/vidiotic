@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+/// The GLSL prelude injected ahead of every user fragment shader: the `Globals`
+/// uniform block, `video()`, `fftBand()`, and the Shadertoy compatibility aliases.
 pub const PREAMBLE: &str = include_str!("../shaders/preamble.frag");
 
 /// Uniform names the preamble already provides — user redeclarations are stripped.
@@ -37,22 +39,18 @@ const KNOWN_SAMPLERS: &[&str] = &["iChannel0", "iChannel1", "iChannel2", "iChann
 /// Varyings the built-in vertex shader / preamble provide.
 const KNOWN_IN_VARYINGS: &[&str] = &["fragTexCoord", "fragColor"];
 
+/// A user-shader compile failure, kept displayable for the control window.
 #[derive(Debug)]
 pub enum ShaderError {
-    /// Read error (file vanished / mid-write). Caller keeps last-good pipeline.
-    Io(String),
     /// naga GLSL/WGSL parse failure. `line` is 1-based in the *user* file when known.
     Parse { msg: String, line: Option<u32> },
     /// naga validation failure.
     Validation { msg: String, line: Option<u32> },
-    /// wgpu pipeline-creation validation (interface mismatch).
-    Pipeline(String),
 }
 
 impl std::fmt::Display for ShaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShaderError::Io(s) => write!(f, "read error: {s}"),
             ShaderError::Parse { msg, line } => match line {
                 Some(l) => write!(f, "parse error (line {l}):\n{msg}"),
                 None => write!(f, "parse error:\n{msg}"),
@@ -61,19 +59,21 @@ impl std::fmt::Display for ShaderError {
                 Some(l) => write!(f, "validation error (line {l}):\n{msg}"),
                 None => write!(f, "validation error:\n{msg}"),
             },
-            ShaderError::Pipeline(s) => write!(f, "pipeline error:\n{s}"),
         }
     }
 }
 
 impl std::error::Error for ShaderError {}
 
+/// Which frontend a user shader file goes through.
 #[derive(Clone, Copy)]
 pub enum ShaderLang {
     Glsl,
     Wgsl,
 }
 
+/// Infer the shader language from the file extension (`.wgsl` = WGSL,
+/// everything else = GLSL).
 pub fn lang_of(path: &Path) -> ShaderLang {
     match path.extension().and_then(|e| e.to_str()) {
         Some("wgsl") => ShaderLang::Wgsl,

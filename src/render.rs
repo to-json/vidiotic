@@ -60,7 +60,9 @@ impl Globals {
 }
 
 fn wgpu_format(f: HapTextureFormat) -> wgpu::TextureFormat {
-    // Gamma-space pipeline: all non-sRGB (see plan reconciliation #1).
+    // All non-sRGB: the whole pipeline works in gamma space, matching the
+    // non-sRGB surface format gfx.rs picks and what Shadertoy-style user
+    // shaders expect.
     match f {
         HapTextureFormat::Bc1 => wgpu::TextureFormat::Bc1RgbaUnorm,
         HapTextureFormat::Bc3 | HapTextureFormat::Bc3YCoCg => wgpu::TextureFormat::Bc3RgbaUnorm,
@@ -69,15 +71,15 @@ fn wgpu_format(f: HapTextureFormat) -> wgpu::TextureFormat {
     }
 }
 
+/// The current clip's GPU texture(s) and their bind group. `alpha` is `Some`
+/// only for a real alpha plane (HapM); the bind group keeps the views alive.
 struct VideoTexture {
     format: wgpu::TextureFormat,
     w: u32,
     h: u32,
     has_alpha: bool,
-    _main: wgpu::Texture,
-    _main_view: wgpu::TextureView,
-    _alpha: Option<wgpu::Texture>,
-    _alpha_view: Option<wgpu::TextureView>, // Some for a real alpha plane (HapM)
+    main: wgpu::Texture,
+    alpha: Option<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -88,6 +90,8 @@ struct PooledShader {
     pipeline: wgpu::RenderPipeline,
 }
 
+/// Owns the composite pass: the compiled user shader (plus pinned pool shaders
+/// and the built-in passthrough), the video texture(s), and the uniform state.
 pub struct Renderer {
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
@@ -120,6 +124,8 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Build the fixed GPU state (layouts, samplers, audio texture, built-in
+    /// passthrough pipeline) targeting `color_format`.
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -297,6 +303,7 @@ impl Renderer {
         }
     }
 
+    /// The last live-shader compile error, if the most recent `set_shader` failed.
     pub fn shader_error(&self) -> Option<&str> {
         self.shader_error.as_deref()
     }
@@ -337,6 +344,7 @@ impl Renderer {
         }
     }
 
+    /// Drop a pinned shader from the pool, clearing the override if it was active.
     pub fn remove_pool_shader(&mut self, id: ShaderId) {
         self.pool.retain(|p| p.id != id);
         if self.active_override == Some(id) {
@@ -400,15 +408,15 @@ impl Renderer {
                 alpha,
                 ..
             } => {
-                upload_bc(queue, &v._main, *format, v.w, v.h, data);
-                if let (Some(a), Some(atex)) = (alpha, &v._alpha) {
+                upload_bc(queue, &v.main, *format, v.w, v.h, data);
+                if let (Some(a), Some(atex)) = (alpha, &v.alpha) {
                     upload_bc(queue, atex, HapTextureFormat::Bc4, v.w, v.h, a);
                 }
             }
             PixelData::Rgba { data, stride } => {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &v._main,
+                        texture: &v.main,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -512,14 +520,13 @@ impl Renderer {
             w: pw,
             h: ph,
             has_alpha,
-            _main: main,
-            _main_view: main_view,
-            _alpha: alpha_tex,
-            _alpha_view: alpha_view,
+            main,
+            alpha: alpha_tex,
             bind_group,
         }
     }
 
+    /// Write the per-frame `Globals` uniform block.
     pub fn update_globals(&self, queue: &wgpu::Queue, g: &Globals) {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(g));
     }
@@ -580,10 +587,6 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
         // No video yet → nothing to composite; the clear (black) stands.
-    }
-
-    pub fn has_video(&self) -> bool {
-        self.video.is_some()
     }
 }
 

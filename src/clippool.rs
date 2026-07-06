@@ -12,6 +12,7 @@ const VIDEO_EXTS: &[&str] = &["mov", "mp4", "mkv", "m4v", "avi", "webm", "hap"];
 const THUMB_W: u32 = 192;
 const THUMB_H: u32 = 108;
 
+/// One source video in the pool.
 #[derive(Clone, Debug)]
 pub struct Clip {
     pub id: ClipId,
@@ -19,6 +20,7 @@ pub struct Clip {
     pub name: String,
 }
 
+/// A decoded first-frame preview, delivered from the thumbnailer thread.
 pub struct Thumbnail {
     pub id: ClipId,
     pub w: usize,

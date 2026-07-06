@@ -1,17 +1,20 @@
 //! Audio analysis thread: pull mono samples from the capture ring, window +
 //! FFT them, bin into 21 log-spaced perceptual bands with fast-attack/slow-decay
-//! smoothing, and publish to the render thread wait-free. The band math is
-//! ported from throw-shade/src/audio.rs, with the sample rate parameterized so
-//! band bin edges follow the actual capture device.
+//! smoothing, and publish to the render thread wait-free. Band bin edges are
+//! recomputed from the capture device's actual sample rate on every source swap.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
+/// FFT length in samples; also the length of the sliding analysis window.
 pub const FFT_SIZE: usize = 2048;
+/// Number of log-spaced perceptual bands exposed to shaders via `fftBand`.
 pub const NUM_BANDS: usize = 21;
-const ATTACK: f32 = 0.7; // throw-shade values, unchanged
+// Smoothing per ~60 Hz hop: high attack so bars jump on a transient, decay
+// multiplier so they fall visibly slower. Tuned by eye against real music.
+const ATTACK: f32 = 0.7;
 const DECAY: f32 = 0.88;
 
 /// Shadertoy-style audio texture geometry: 512 texels wide, 2 rows.
@@ -58,8 +61,8 @@ pub enum AudioCtl {
     Shutdown,
 }
 
-/// Log-spaced band boundaries (FFT bin ranges), 20 Hz..20 kHz. Ported verbatim
-/// from throw-shade with the sample rate as a parameter.
+/// Log-spaced band boundaries (FFT bin ranges), 20 Hz..20 kHz, clamped to the
+/// usable DC..Nyquist bin range for the given sample rate.
 fn log_bands(sample_rate: f32) -> [(usize, usize); NUM_BANDS] {
     let mut bounds = [(0usize, 0usize); NUM_BANDS];
     let (log_min, log_max) = (20.0f32.ln(), 20000.0f32.ln());
@@ -76,6 +79,8 @@ fn log_bands(sample_rate: f32) -> [(usize, usize); NUM_BANDS] {
     bounds
 }
 
+/// Analysis thread body: FFT the ring's newest samples at ~60 Hz and publish
+/// `AudioFrame`s until shutdown (or every control sender is dropped).
 pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buffer::Input<AudioFrame>) {
     let mut planner = FftPlanner::<f32>::new();
     let fft: Arc<dyn Fft<f32>> = planner.plan_fft_forward(FFT_SIZE);

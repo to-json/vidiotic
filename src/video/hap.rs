@@ -6,7 +6,7 @@
 //! and unit-tests without a GPU; `render.rs` maps `HapTextureFormat` to a wgpu
 //! `TextureFormat`.
 //!
-//! Reference: https://github.com/Vidvox/hap/blob/master/documentation/HapVideoDRAFT.md
+//! Reference: <https://github.com/Vidvox/hap/blob/master/documentation/HapVideoDRAFT.md>
 
 /// Second-stage compressor (high nibble of the section type byte).
 const COMP_NONE: u8 = 0xA0;
