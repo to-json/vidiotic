@@ -77,6 +77,8 @@ pub enum HapErr {
     UnknownCompressor(u8),
     BadChunkTables,
     Snappy,
+    /// HapM second texture wasn't the expected BC4 alpha plane.
+    UnexpectedAlpha,
 }
 
 impl std::fmt::Display for HapErr {
@@ -87,6 +89,7 @@ impl std::fmt::Display for HapErr {
             HapErr::UnknownCompressor(b) => write!(f, "unknown HAP compressor {b:#04x}"),
             HapErr::BadChunkTables => write!(f, "malformed HAP chunk tables"),
             HapErr::Snappy => write!(f, "snappy decompression failed"),
+            HapErr::UnexpectedAlpha => write!(f, "HapM alpha plane was not BC4"),
         }
     }
 }
@@ -211,11 +214,11 @@ fn decode_chunked(body: &[u8], out: &mut Vec<u8>) -> Result<(), HapErr> {
     };
 
     out.clear();
-    for i in 0..chunk_count {
+    for (i, &comp) in compressors.iter().enumerate() {
         let start = chunk_offset(i);
         let end = start + chunk_size(i);
         let chunk = frame_data.get(start..end).ok_or(HapErr::Truncated)?;
-        match compressors[i] {
+        match comp {
             CHUNK_COMP_NONE => out.extend_from_slice(chunk),
             CHUNK_COMP_SNAPPY => {
                 let n = snap::raw::decompress_len(chunk).map_err(|_| HapErr::Snappy)?;
@@ -248,7 +251,9 @@ pub fn decode_frame(
         let rest = packet.get(hdr0 + len0..).ok_or(HapErr::Truncated)?;
         let alpha_fmt = decode_texture_section(rest, alpha)?;
         // HapM: main is YCoCg BC3, alpha is BC4 → composite mode 2.
-        debug_assert_eq!(alpha_fmt, HapTextureFormat::Bc4);
+        if alpha_fmt != HapTextureFormat::Bc4 {
+            return Err(HapErr::UnexpectedAlpha);
+        }
         Ok(HapMeta {
             format,
             has_alpha: true,

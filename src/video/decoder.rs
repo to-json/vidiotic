@@ -323,7 +323,10 @@ fn run_software(
             if stream.index() != vid_idx {
                 continue;
             }
-            decoder.send_packet(&packet)?;
+            if let Err(e) = decoder.send_packet(&packet) {
+                log::warn!("decode send_packet failed, skipping packet: {e}");
+                continue;
+            }
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(0) as f64 * tb;
                 if out_sec.is_some_and(|o| pts >= o) {

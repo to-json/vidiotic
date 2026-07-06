@@ -16,8 +16,9 @@ pub type ShaderId = u32;
 /// integer while still expressing sub-beat divisions.
 pub const LOOP_TICKS_PER_BEAT: u32 = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SyncKind {
+    #[default]
     Internal,
     Link,
 }
@@ -140,8 +141,3 @@ pub struct UiMirror {
     pub fullscreen: bool,
 }
 
-impl Default for SyncKind {
-    fn default() -> Self {
-        SyncKind::Internal
-    }
-}

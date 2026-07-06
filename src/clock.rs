@@ -224,10 +224,8 @@ impl BoundaryTracker {
 
     /// Returns `Some(phrase_index)` exactly once when a phrase boundary is crossed.
     pub fn crossed(&mut self, cur_beat: f64, phrase_len: f64) -> Option<u64> {
-        let prev = match self.prev_beat.replace(cur_beat) {
-            None => return None, // first frame: prime only, never fire
-            Some(p) => p,
-        };
+        // first frame: prime only, never fire
+        let prev = self.prev_beat.replace(cur_beat)?;
         if cur_beat < prev - BACKWARD_EPS {
             // tap round-down / phase renegotiation / rewind: resync silently
             return None;

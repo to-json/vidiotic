@@ -50,7 +50,7 @@ struct RunArgs {
     bpm: f64,
 
     /// Phrase length in beats for auto-transitions (16 or 32).
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     phrase_len: u32,
 
     /// Clock sync source at startup: internal or link (Ableton Link).

@@ -60,7 +60,7 @@ fn render_center_pixel(gpu: &Gpu, renderer: &Renderer) -> [u8; 4] {
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let bytes_per_row = ((W * 4 + 255) / 256) * 256;
+    let bytes_per_row = (W * 4).div_ceil(256) * 256;
     let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: (bytes_per_row * H) as u64,

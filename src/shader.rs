@@ -377,12 +377,13 @@ pub fn compile_wgsl_to_module(user_src: &str) -> Result<naga::Module, ShaderErro
 
 fn validate(
     module: &naga::Module,
-) -> Result<naga::valid::ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+) -> Result<naga::valid::ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
     )
     .validate(module)
+    .map_err(Box::new)
 }
 
 fn remap_line(combined_line: u32, preamble_lines: u32) -> u32 {

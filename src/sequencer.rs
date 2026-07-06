@@ -41,7 +41,7 @@ impl Sequencer {
         Sequencer {
             state: SeqState::Idle,
             active: Vec::new(),
-            phrase_len,
+            phrase_len: phrase_len.max(1.0),
             bar: 4.0,
             tracker: BoundaryTracker::new(),
         }
@@ -137,23 +137,21 @@ impl Sequencer {
                 fire_at_beat,
             } = self.state
             {
-                if next == id {
-                    if fire_at_beat - beat >= self.bar {
-                        ev.push(SequencerEvent::DisarmDecoder);
-                        match self.pick_next(clip) {
-                            Some(n2) if n2 != clip => {
-                                ev.push(SequencerEvent::ArmDecoder(n2));
-                                self.state = SeqState::PlayingArmed {
-                                    clip,
-                                    next: n2,
-                                    fire_at_beat,
-                                };
-                            }
-                            _ => self.state = SeqState::Playing { clip },
+                if next == id && fire_at_beat - beat >= self.bar {
+                    ev.push(SequencerEvent::DisarmDecoder);
+                    match self.pick_next(clip) {
+                        Some(n2) if n2 != clip => {
+                            ev.push(SequencerEvent::ArmDecoder(n2));
+                            self.state = SeqState::PlayingArmed {
+                                clip,
+                                next: n2,
+                                fire_at_beat,
+                            };
                         }
+                        _ => self.state = SeqState::Playing { clip },
                     }
-                    // else <1 bar left: let it fire; resequences next phrase
                 }
+                // else <1 bar left: let it fire; resequences next phrase
             }
             // removing the playing clip: finish the phrase; pick_next falls back
             // to active[0] at the next arm point. Empty set: last clip loops.
@@ -194,7 +192,7 @@ impl Sequencer {
     }
 
     pub fn set_phrase_len(&mut self, beats: u32) -> Vec<SequencerEvent> {
-        self.phrase_len = beats as f64;
+        self.phrase_len = beats.max(1) as f64;
         self.tracker.reset();
         if let SeqState::PlayingArmed { clip, .. } = self.state {
             self.state = SeqState::Playing { clip };

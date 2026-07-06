@@ -63,12 +63,15 @@ pub enum AudioCtl {
 fn log_bands(sample_rate: f32) -> [(usize, usize); NUM_BANDS] {
     let mut bounds = [(0usize, 0usize); NUM_BANDS];
     let (log_min, log_max) = (20.0f32.ln(), 20000.0f32.ln());
-    for i in 0..NUM_BANDS {
+    for (i, bound) in bounds.iter_mut().enumerate() {
         let f_lo = (log_min + (log_max - log_min) * i as f32 / NUM_BANDS as f32).exp();
         let f_hi = (log_min + (log_max - log_min) * (i + 1) as f32 / NUM_BANDS as f32).exp();
         let b_lo = (f_lo * FFT_SIZE as f32 / sample_rate).round() as usize;
         let b_hi = (f_hi * FFT_SIZE as f32 / sample_rate).round() as usize;
-        bounds[i] = (b_lo.max(1), b_hi.max(b_lo + 1).min(FFT_SIZE / 2));
+        let half = FFT_SIZE / 2; // usable bins DC..Nyquist
+        let b_lo = b_lo.clamp(1, half - 1);
+        let b_hi = b_hi.clamp(b_lo + 1, half);
+        *bound = (b_lo, b_hi);
     }
     bounds
 }
@@ -139,9 +142,8 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
         let mut band_mag = [0.0f32; NUM_BANDS];
         for (i, &(lo, hi)) in bands.iter().enumerate() {
             let mut sum = 0.0f32;
-            let count = (hi - lo).max(1) as f32;
-            for bin in lo..hi {
-                let c = buf[bin];
+            let count = hi.saturating_sub(lo).max(1) as f32;
+            for c in &buf[lo..hi] {
                 sum += (c.re * c.re + c.im * c.im).sqrt();
             }
             band_mag[i] = sum / count;
@@ -184,5 +186,21 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
             level: smoothed[0] + smoothed[1] + smoothed[2],
             audio_tex,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_bands_valid_across_sample_rates() {
+        for sr in [8000.0, 16000.0, 22050.0, 24000.0, 32000.0, 44100.0, 48000.0, 96000.0] {
+            for (lo, hi) in log_bands(sr) {
+                assert!(hi > lo, "sr {sr}: band {lo}..{hi} inverted");
+                assert!((1..=FFT_SIZE / 2).contains(&lo));
+                assert!(hi <= FFT_SIZE / 2);
+            }
+        }
     }
 }

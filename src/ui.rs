@@ -216,7 +216,8 @@ fn control_ui(
                 )
                 .on_hover_text("Snap the downbeat to now (phase only, nearest bar). Key: t / Space")
                 .clicked()
-                || ui.input(|i| i.key_pressed(egui::Key::Space))
+                || (!ui.ctx().egui_wants_keyboard_input()
+                    && ui.input(|i| i.key_pressed(egui::Key::Space)))
             {
                 let _ = tx.send(Command::TapDownbeat);
             }
@@ -336,6 +337,13 @@ fn control_ui(
             egui::ComboBox::from_id_salt("audio")
                 .selected_text(m.current_device.as_deref().unwrap_or("default"))
                 .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(false, "Default")
+                        .on_hover_text("system default input")
+                        .clicked()
+                    {
+                        let _ = tx.send(Command::SetAudioDevice(None));
+                    }
                     for (id, name) in &m.audio_devices {
                         if ui
                             .selectable_label(m.current_device.as_deref() == Some(id), name)

@@ -278,7 +278,7 @@ impl App {
 
     /// Drop decoders that are neither playing nor armed.
     fn retain_decoders(&mut self) {
-        let keep: Vec<ClipId> = [self.current, self.sequencer.armed()]
+        let keep: Vec<CueId> = [self.current, self.sequencer.armed()]
             .into_iter()
             .flatten()
             .collect();
@@ -375,9 +375,14 @@ impl App {
     }
 
     fn add_bank(&mut self) {
-        // Name banks A, B, C, … by count.
-        let name = (b'A' + (self.banks.len() as u8 % 26)) as char;
-        self.banks.push(Bank::new(name.to_string()));
+        // Name banks A, B, C, … by count; past Z, suffix a number (A1, B1, …).
+        let n = self.banks.len();
+        let name = if n < 26 {
+            ((b'A' + n as u8) as char).to_string()
+        } else {
+            format!("{}{}", (b'A' + (n % 26) as u8) as char, n / 26)
+        };
+        self.banks.push(Bank::new(name));
     }
 
     fn load_shader(&mut self) {
@@ -550,15 +555,23 @@ impl App {
             Command::AddCue(clip) => self.add_cue(clip),
             Command::RemoveCue(id) => self.remove_cue(id),
             Command::SelectCue(id) => self.selected_cue = id,
-            Command::SetCueIn(id, s) => self.edit_cue(id, |c| c.in_sec = s.max(0.0)),
-            Command::SetCueOut(id, s) => self.edit_cue(id, |c| c.out_sec = s),
+            Command::SetCueIn(id, s) => {
+                self.edit_cue(id, |c| { c.in_sec = s.max(0.0); normalize_cue_trim(c); })
+            }
+            Command::SetCueOut(id, s) => {
+                self.edit_cue(id, |c| { c.out_sec = s; normalize_cue_trim(c); })
+            }
             Command::SetCueInToPlayhead(id) => {
-                let p = self.current_pts;
-                self.edit_cue(id, |c| c.in_sec = p.max(0.0));
+                if self.current == Some(id) {
+                    let p = self.current_pts.max(0.0);
+                    self.edit_cue(id, |c| { c.in_sec = p; normalize_cue_trim(c); });
+                }
             }
             Command::SetCueOutToPlayhead(id) => {
-                let p = self.current_pts;
-                self.edit_cue(id, |c| c.out_sec = Some(p.max(0.0)));
+                if self.current == Some(id) {
+                    let p = self.current_pts.max(0.0);
+                    self.edit_cue(id, |c| { c.out_sec = Some(p); normalize_cue_trim(c); });
+                }
             }
             Command::SetCuePreserve(id, v) => self.edit_cue(id, |c| c.preserve = v),
             Command::SetCueShader(id, s) => self.edit_cue(id, |c| c.shader = s),
@@ -959,6 +972,15 @@ impl App {
             Key::Named(NamedKey::Escape) => self.bpm_entry = None,
             _ => {}
         }
+    }
+}
+
+/// Keep stored trim consistent with the decoder's rule (`ensure_decoder` only
+/// honors an out-point strictly after the in-point): collapse an out ≤ in to
+/// "untrimmed" so the editor never shows a trim that playback ignores.
+fn normalize_cue_trim(cue: &mut Cue) {
+    if cue.out_sec.is_some_and(|o| o <= cue.in_sec) {
+        cue.out_sec = None;
     }
 }
 

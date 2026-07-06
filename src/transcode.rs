@@ -11,7 +11,7 @@ use texpresso::{Format, Params};
 
 use crate::video::hap;
 
-const HAP1_TAG: u32 = u32::from_le_bytes([b'H', b'a', b'p', b'1']);
+const HAP1_TAG: u32 = u32::from_le_bytes(*b"Hap1");
 const OUT_TIMESCALE: i32 = 1000; // millisecond output time base pre-header
 
 pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
