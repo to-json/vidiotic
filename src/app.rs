@@ -528,13 +528,27 @@ impl App {
         self.loop_tracker.reset();
     }
 
-    /// Hard-reset the beat grid to its origin (bar 1, beat 1, phrase 1) and
-    /// re-prime the phrase/loop boundary trackers so nothing misfires on the
-    /// backward jump.
-    fn reset_clock(&mut self) {
+    /// Reset the beat grid to its origin (bar 1, beat 1, phrase 1) and re-prime
+    /// the phrase/loop boundary trackers so nothing misfires on the backward
+    /// jump. Playlist position and playhead are untouched.
+    fn soft_reset(&mut self) {
         self.clock.reset();
         self.loop_tracker.reset();
         self.sequencer.reset_boundary();
+    }
+
+    /// Soft reset, plus jump the playlist back to its first cue and restart
+    /// that cue's playhead from its in-point — regardless of the preserve-
+    /// playhead setting, since a hard reset means "start over".
+    fn hard_reset(&mut self) {
+        self.soft_reset();
+        let ev = self.sequencer.reset_to_first();
+        self.apply_seq_events(ev);
+        if let Some(cur) = self.current {
+            if let Some(h) = self.decoders.get(&cur) {
+                h.request_restart();
+            }
+        }
     }
 
     fn apply_command(&mut self, cmd: Command) {
@@ -547,7 +561,8 @@ impl App {
             Command::NudgeBpm(r) => self.clock.nudge_bpm(r),
             Command::TapDownbeat => self.clock.tap_downbeat(),
             Command::TapTempo => self.tap_tempo(),
-            Command::ResetClock => self.reset_clock(),
+            Command::SoftReset => self.soft_reset(),
+            Command::HardReset => self.hard_reset(),
             Command::SetSyncSource(kind) => self.set_sync_source(kind),
             Command::SetPhraseLen(n) => {
                 let ev = self.sequencer.set_phrase_len(n);

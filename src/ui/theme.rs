@@ -53,6 +53,15 @@ pub const SP_SM: f32 = 4.0;
 pub const SP_MD: f32 = 8.0;
 pub const SP_LG: f32 = 16.0;
 
+/// A palette (or `Color32::BLACK`/`WHITE`) color at a different alpha, for
+/// derived translucent overlays — hover brighten, tile scrims, beat-pulse
+/// fades — that aren't a new color, just an existing one made partly
+/// transparent.
+#[allow(dead_code)]
+pub fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
 /// Convert a palette color to a wgpu clear color. The render targets in this
 /// app are non-sRGB (see `gfx::WindowSurface::configure`), so a `LoadOp::Clear`
 /// writes each channel's `0..1` fraction straight into the framebuffer with no

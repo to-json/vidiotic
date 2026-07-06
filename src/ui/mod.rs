@@ -12,6 +12,7 @@ mod library;
 mod status;
 mod theme;
 mod transport;
+mod widgets;
 
 use std::collections::HashMap;
 

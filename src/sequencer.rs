@@ -210,6 +210,25 @@ impl Sequencer {
         self.tracker.reset();
     }
 
+    /// Force the round-robin back to the first cue in the active set — a hard
+    /// reset's "playlist position". Disarms any pending swap. A no-op if the
+    /// active set is empty.
+    pub fn reset_to_first(&mut self) -> Vec<SequencerEvent> {
+        let mut ev = Vec::new();
+        let Some(&first) = self.active.first() else {
+            return ev;
+        };
+        if matches!(self.state, SeqState::PlayingArmed { .. }) {
+            ev.push(SequencerEvent::DisarmDecoder);
+        }
+        if self.playing() != Some(first) {
+            ev.push(SequencerEvent::SwapTo(first));
+        }
+        self.state = SeqState::Playing { cue: first };
+        self.tracker.reset();
+        ev
+    }
+
     /// Currently displayed cue, if any.
     pub fn playing(&self) -> Option<CueId> {
         match self.state {
@@ -271,6 +290,55 @@ mod tests {
         assert!(s.tick(&snap(12.0)).is_empty()); // nothing to arm
         assert!(s.tick(&snap(16.1)).is_empty());
         assert_eq!(s.playing(), Some(1));
+    }
+
+    #[test]
+    fn reset_to_first_disarms_a_pending_swap() {
+        let mut s = Sequencer::new(16.0);
+        for c in [1, 2, 3] {
+            s.toggle_active(c, 0.0);
+        }
+        s.tick(&snap(1.0));
+        assert_eq!(s.tick(&snap(12.0)), vec![SequencerEvent::ArmDecoder(2)]);
+        assert_eq!(s.armed(), Some(2));
+
+        // Cue 1 (first) is already displaying; disarm the pending swap to 2
+        // and cancel the round-robin advance, but no re-swap is needed.
+        let ev = s.reset_to_first();
+        assert_eq!(ev, vec![SequencerEvent::DisarmDecoder]);
+        assert_eq!(s.playing(), Some(1));
+        assert_eq!(s.armed(), None);
+    }
+
+    #[test]
+    fn reset_to_first_swaps_back_from_a_later_cue() {
+        let mut s = Sequencer::new(16.0);
+        for c in [1, 2, 3] {
+            s.toggle_active(c, 0.0);
+        }
+        s.tick(&snap(1.0));
+        s.tick(&snap(12.0));
+        assert_eq!(s.tick(&snap(16.1)), vec![SequencerEvent::SwapTo(2)]);
+        assert_eq!(s.playing(), Some(2));
+
+        let ev = s.reset_to_first();
+        assert_eq!(ev, vec![SequencerEvent::SwapTo(1)]);
+        assert_eq!(s.playing(), Some(1));
+    }
+
+    #[test]
+    fn reset_to_first_on_first_cue_is_a_no_op() {
+        let mut s = Sequencer::new(16.0);
+        s.toggle_active(1, 0.0);
+        assert_eq!(s.reset_to_first(), vec![]);
+        assert_eq!(s.playing(), Some(1));
+    }
+
+    #[test]
+    fn reset_to_first_with_no_active_cues_is_a_no_op() {
+        let mut s = Sequencer::new(16.0);
+        assert_eq!(s.reset_to_first(), vec![]);
+        assert_eq!(s.playing(), None);
     }
 
     #[test]

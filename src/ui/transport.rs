@@ -5,7 +5,11 @@ use crossbeam_channel::Sender;
 use egui::Ui;
 
 use super::theme::{PALETTE, SP_MD, SP_SM};
+use super::widgets;
 use crate::commands::{Command, SyncKind, UiMirror};
+
+/// Uniform square size for the downbeat/reset/tempo tap buttons.
+const TAP_BUTTON_SIZE: egui::Vec2 = egui::Vec2::splat(46.0);
 
 /// Bar-based cadence choices for the "Next every" (sequencer) grid.
 const CADENCE_BARS: [u32; 5] = [1, 2, 4, 8, 16];
@@ -66,11 +70,8 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 });
             });
             if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("DOWNBEAT").size(17.0))
-                        .min_size(egui::vec2(80.0, 46.0)),
-                )
-                .on_hover_text("Snap the downbeat to now (phase only, nearest bar). Key: t / Space")
+                .add(egui::Button::new(egui::RichText::new("1").size(24.0)).min_size(TAP_BUTTON_SIZE))
+                .on_hover_text("Downbeat: snap to now (phase only, nearest bar). Key: t / Space")
                 .clicked()
                 || (!ui.ctx().egui_wants_keyboard_input()
                     && ui.input(|i| i.key_pressed(egui::Key::Space)))
@@ -78,21 +79,28 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 let _ = tx.send(Command::TapDownbeat);
             }
             if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("RESET").size(18.0))
-                        .min_size(egui::vec2(64.0, 46.0)),
-                )
-                .on_hover_text("Reset the clock to bar 1, beat 1 (phrase 1). Tempo unchanged.")
+                .add(egui::Button::new(egui::RichText::new("↺").size(24.0)).min_size(TAP_BUTTON_SIZE))
+                .on_hover_text("Soft reset: clock to bar 1, beat 1. Playlist position and playhead unchanged.")
                 .clicked()
             {
-                let _ = tx.send(Command::ResetClock);
+                let _ = tx.send(Command::SoftReset);
             }
             if ui
                 .add(
-                    egui::Button::new(egui::RichText::new("TEMPO").size(20.0))
-                        .min_size(egui::vec2(72.0, 46.0)),
+                    egui::Button::new(egui::RichText::new("⏮").size(24.0).color(PALETTE.error))
+                        .min_size(TAP_BUTTON_SIZE),
                 )
-                .on_hover_text("Tap 2+ times to set BPM from the interval. Key: b")
+                .on_hover_text(
+                    "Hard reset: soft reset, AND jump the playlist back to its first cue \
+                     and restart its playhead from the in-point.",
+                )
+                .clicked()
+            {
+                let _ = tx.send(Command::HardReset);
+            }
+            if ui
+                .add(egui::Button::new(egui::RichText::new("♩").size(24.0)).min_size(TAP_BUTTON_SIZE))
+                .on_hover_text("Tap tempo: tap 2+ times to set BPM from the interval. Key: b")
                 .clicked()
             {
                 let _ = tx.send(Command::TapTempo);
@@ -148,16 +156,14 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             ui.add_space(SP_MD);
             ui.label("Loop every:")
                 .on_hover_text("Force the current clip back to its start on this beat grid");
-            if ui.selectable_label(m.loop_len.is_none(), "off").clicked() {
-                let _ = tx.send(Command::SetLoopLen(None));
-            }
-            for (label, beats) in LOOP_CADENCE {
-                if ui
-                    .selectable_label(m.loop_len == Some(beats), label)
-                    .clicked()
-                {
-                    let _ = tx.send(Command::SetLoopLen(Some(beats)));
-                }
+            let loop_labels: Vec<&str> =
+                std::iter::once("off").chain(LOOP_CADENCE.iter().map(|(l, _)| *l)).collect();
+            let loop_selected = m.loop_len.map_or(0, |beats| {
+                LOOP_CADENCE.iter().position(|(_, b)| *b == beats).map_or(0, |i| i + 1)
+            });
+            if let Some(i) = widgets::segmented(ui, "loop_cadence", &loop_labels, Some(loop_selected)) {
+                let beats = if i == 0 { None } else { Some(LOOP_CADENCE[i - 1].1) };
+                let _ = tx.send(Command::SetLoopLen(beats));
             }
             ui.add_space(SP_MD);
             let mut preserve = m.preserve_playhead;

@@ -285,7 +285,9 @@ no peer available — code-review the path instead).
   `media_tile`'s hover state? No — keep `media_tile` generic; overlay a small
   ✕ button positioned via `ui.put` over the tile rect when
   `TileResponse::hovered`). Selection = accent ring via `spec.selected`.
-- `ui.push_id(clip.id)` / `ui.push_id(cue.id)` around each tile.
+- Do not scope each tile in its own `Ui`/id (see the ground rules' scrolling
+  warning); if `media_tile` needs a stable per-item id, thread it in as an
+  explicit id salt argument instead.
 - **Empty states.** No clips loaded: center of the scroll area, `fg_muted`
   two-line prompt ("No clips loaded" / "Pick a folder to fill the pool") with
   a real "Folder…" button — not a bare weak label. Empty bank: same

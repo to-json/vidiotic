@@ -34,7 +34,8 @@ pub enum Command {
     NudgeBpm(f64),   // ratio ±0.001 for the ±0.1% controls
     TapDownbeat,     // snap the downbeat phase to now (does not change tempo)
     TapTempo,        // derive BPM from the interval between successive taps
-    ResetClock,      // hard-reset the grid to bar 1 / beat 1 / phrase 1
+    SoftReset,       // reset the beat grid to bar 1 / beat 1 / phrase 1; playlist position and playhead untouched
+    HardReset,       // soft reset, plus jump the playlist back to its first cue and restart its playhead
     SetSyncSource(SyncKind),
     SetPhraseLen(u32),          // beats between auto-transitions to the next clip
     SetLoopLen(Option<u32>),    // forced video re-loop grid, in 1/32-beat ticks (LOOP_TICKS_PER_BEAT); None = loop on EOF only
