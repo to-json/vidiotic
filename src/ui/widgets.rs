@@ -2,10 +2,6 @@
 //! All colors come from [`super::theme::PALETTE`], so the look stays coherent
 //! as new panels adopt these.
 
-// A shared widget library naturally has some entries with no caller yet —
-// each panel adopts them on its own schedule as it moves to custom painting.
-#![allow(dead_code)]
-
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Ui, Vec2};
 
@@ -65,19 +61,12 @@ pub fn segmented(
 }
 
 /// Small uppercase muted label for grouping controls, e.g. "NEXT EVERY".
-pub fn section_label(ui: &mut Ui, text: &str) {
-    ui.label(egui::RichText::new(text.to_uppercase()).small().color(PALETTE.fg_muted));
+pub fn section_label(ui: &mut Ui, text: &str) -> Response {
+    ui.label(egui::RichText::new(text.to_uppercase()).small().color(PALETTE.fg_muted))
 }
 
-/// What happened to a [`chip`] this frame.
-pub struct ChipResponse {
-    pub clicked: bool,
-    pub removed: bool,
-}
-
-/// Small rounded pill, optionally removable — pinned shaders, cue metadata
-/// badges, the audio-error badge.
-pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> ChipResponse {
+/// Small rounded pill badge — cue metadata, the peers marker, error tags.
+pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>) {
     let p = &PALETTE;
     let font = TextStyle::Small.resolve(ui.style());
     let (fill, text_color) = match tint {
@@ -86,10 +75,9 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> 
     };
 
     let height = 18.0;
-    let cross_w = if removable { 14.0 } else { 0.0 };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), text_color);
-    let size = egui::vec2(galley.size().x + SP_SM * 2.0 + cross_w, height);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let size = egui::vec2(galley.size().x + SP_SM * 2.0, height);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
 
     let radius = CornerRadius::same((height / 2.0) as u8);
     ui.painter().rect_filled(rect, radius, fill);
@@ -97,24 +85,9 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> 
         egui::pos2(rect.min.x + SP_SM, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
-        font.clone(),
+        font,
         text_color,
     );
-
-    let mut removed = false;
-    if removable && resp.hovered() {
-        let cross_rect = Rect::from_min_size(
-            egui::pos2(rect.max.x - cross_w, rect.min.y),
-            egui::vec2(cross_w, height),
-        );
-        let cross_resp = ui.interact(cross_rect, resp.id.with("remove"), Sense::click());
-        let cross_color = if cross_resp.hovered() { p.error } else { p.fg_muted };
-        ui.painter()
-            .text(cross_rect.center(), egui::Align2::CENTER_CENTER, "✕", font, cross_color);
-        removed = cross_resp.clicked();
-    }
-
-    ChipResponse { clicked: resp.clicked() && !removed, removed }
 }
 
 /// What a [`media_tile`] needs painted: a clip pool tile or a cue chip.
@@ -136,6 +109,7 @@ pub struct TileResponse {
     pub clicked: bool,
     pub double_clicked: bool,
     pub hovered: bool,
+    pub rect: Rect,
 }
 
 /// Paint a clip/cue tile: thumbnail, bottom-scrim name, role badge, and a
@@ -200,19 +174,17 @@ pub fn media_tile(ui: &mut Ui, spec: &TileSpec) -> TileResponse {
         let painter = ui.painter();
         painter.circle_filled(center, 7.0, theme::with_alpha(Color32::BLACK, 170));
         painter.text(center, egui::Align2::CENTER_CENTER, glyph, FontId::proportional(10.0), color);
-    } else if spec.active {
-        let center = rect.min + Vec2::splat(10.0);
-        let painter = ui.painter();
-        painter.circle_filled(center, 7.0, theme::with_alpha(Color32::BLACK, 170));
-        painter.circle_filled(center, 3.0, p.armed);
     }
 
-    // Outline: selection ring beats hover border; a playing tile also gets a
-    // beat-synced pulse stroke on top of whichever of those it has.
+    // Outline: selection ring beats the in-pool "active" ring, which beats
+    // hover border; a playing tile also gets a beat-synced pulse stroke on
+    // top of whichever of those it has.
     {
         let painter = ui.painter();
         if spec.selected {
             painter.rect_stroke(rect, radius, Stroke::new(2.0, p.accent), StrokeKind::Inside);
+        } else if spec.active {
+            painter.rect_stroke(rect, radius, Stroke::new(1.0, p.armed), StrokeKind::Inside);
         } else if resp.hovered() {
             painter.rect_stroke(rect, radius, Stroke::new(1.0, p.border), StrokeKind::Inside);
         }
@@ -227,12 +199,26 @@ pub fn media_tile(ui: &mut Ui, spec: &TileSpec) -> TileResponse {
         }
     }
 
-    TileResponse { clicked: resp.clicked(), double_clicked: resp.double_clicked(), hovered: resp.hovered() }
+    TileResponse {
+        clicked: resp.clicked(),
+        double_clicked: resp.double_clicked(),
+        hovered: resp.hovered(),
+        rect,
+    }
 }
 
-/// Uniform big button for the transport row (DOWNBEAT/RESET/TEMPO). `flash`
-/// (0..1, decaying) overlays an accent tint so taps read as hits.
-pub fn transport_button(ui: &mut Ui, label: &str, size: Vec2, flash: f32) -> Response {
+/// Uniform big button for the transport row (downbeat/reset/tempo taps).
+/// `text_size`/`text_color` let a glyph run larger than body text and, for a
+/// destructive action like hard reset, tint independent of hover/press state.
+/// `flash` (0..1, decaying) overlays an accent tint so taps read as hits.
+pub fn transport_button(
+    ui: &mut Ui,
+    label: &str,
+    size: Vec2,
+    text_size: f32,
+    text_color: Color32,
+    flash: f32,
+) -> Response {
     let p = &PALETTE;
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
 
@@ -243,7 +229,7 @@ pub fn transport_button(ui: &mut Ui, label: &str, size: Vec2, flash: f32) -> Res
     } else {
         p.bg_elevated
     };
-    let font = TextStyle::Button.resolve(ui.style());
+    let font = FontId::proportional(text_size);
     let radius = CornerRadius::same(4);
     let painter = ui.painter();
     painter.rect_filled(rect, radius, fill);
@@ -251,7 +237,7 @@ pub fn transport_button(ui: &mut Ui, label: &str, size: Vec2, flash: f32) -> Res
         let alpha = (flash * 120.0) as u8;
         painter.rect_filled(rect, radius, theme::with_alpha(p.accent, alpha));
     }
-    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, p.fg_primary);
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text_color);
 
     resp
 }

@@ -38,12 +38,12 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                     {
                         let _ = tx.send(Command::SetAudioDevice(None));
                     }
-                    for (id, name) in &m.audio_devices {
+                    for name in &m.audio_devices {
                         if ui
-                            .selectable_label(m.current_device.as_deref() == Some(id), name)
+                            .selectable_label(m.current_device.as_ref() == Some(name), name.as_ref())
                             .clicked()
                         {
-                            let _ = tx.send(Command::SetAudioDevice(Some(id.clone())));
+                            let _ = tx.send(Command::SetAudioDevice(Some(name.to_string())));
                         }
                     }
                 });
@@ -52,7 +52,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             ui.horizontal_wrapped(|ui| {
                 ui.weak("Pinned:");
                 for s in &m.shader_pool {
-                    ui.label(egui::RichText::new(&s.name).small());
+                    ui.label(egui::RichText::new(s.name.as_ref()).small());
                     if ui
                         .small_button("✕")
                         .on_hover_text("remove this pinned shader")
@@ -73,7 +73,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 .id_salt("shader_err")
                 .max_height(96.0)
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(err).monospace().color(PALETTE.error));
+                    ui.label(egui::RichText::new(err.as_ref()).monospace().color(PALETTE.error));
                 });
         }
         ui.add_space(SP_SM);

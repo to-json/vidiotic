@@ -1,7 +1,9 @@
 //! Live audio capture via cpal. Captures from a selectable input device (mic,
-//! line-in, or a loopback device like BlackHole), downmixes to mono in the
+//! line-in, or a loopback device like `BlackHole`), downmixes to mono in the
 //! realtime callback with no allocation, and hands samples to the analysis
 //! thread through an rtrb ring. The app plays no audio itself — it only listens.
+
+use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -13,7 +15,7 @@ pub struct AudioCapture {
     pub stream: cpal::Stream,
     pub sample_rate: u32,
     pub device_id: Option<cpal::DeviceId>,
-    pub device_name: String,
+    pub device_name: Arc<str>,
 }
 
 /// Enumerate input devices as (stringified id, human name) for the UI/CLI.
@@ -65,6 +67,11 @@ fn resolve_device(
 
 /// Build and start a capture stream. Sends the analysis thread a `SwapSource`
 /// with the fresh ring consumer before returning.
+///
+/// # Errors
+/// Returns an error if no device resolves, the device offers no default input
+/// config or an unsupported sample format, the analysis thread has exited, or
+/// cpal fails to build or start the stream.
 pub fn build_capture(
     host: &cpal::Host,
     id: Option<&cpal::DeviceId>,
@@ -73,11 +80,11 @@ pub fn build_capture(
     err_tx: crossbeam_channel::Sender<cpal::Error>,
 ) -> anyhow::Result<AudioCapture> {
     let device = resolve_device(host, id, name_match)?;
-    let device_name = device
+    let device_name: Arc<str> = device
         .description()
         .ok()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map(|d| Arc::from(d.name()))
+        .unwrap_or_else(|| Arc::from("unknown"));
     let supported = device.default_input_config()?;
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.config();

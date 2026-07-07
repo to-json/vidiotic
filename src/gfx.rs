@@ -40,7 +40,7 @@ impl WindowSurface {
             view_formats: vec![],
         };
         surface.configure(device, &config);
-        WindowSurface {
+        Self {
             window,
             surface,
             config,
@@ -87,7 +87,11 @@ pub struct Graphics {
 impl Graphics {
     /// Pick an adapter (must support BC textures, required for HAP), create the
     /// device, and configure both surfaces — output on Fifo (vsync paces the
-    /// render loop), control on AutoVsync.
+    /// render loop), control on `AutoVsync`.
+    ///
+    /// # Errors
+    /// Returns an error if surface creation fails, no BC-capable adapter is
+    /// available, or the device request fails.
     pub fn new(output_win: Arc<Window>, control_win: Arc<Window>) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
         let out_surface = instance.create_surface(output_win.clone())?;
@@ -125,7 +129,7 @@ impl Graphics {
             ctl_surface,
             wgpu::PresentMode::AutoVsync,
         );
-        Ok(Graphics {
+        Ok(Self {
             device,
             queue,
             output,

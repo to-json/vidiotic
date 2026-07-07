@@ -3,7 +3,7 @@
 //! RGBA fallback for other codecs, loop at EOF, and hand frames to the render
 //! thread over a small bounded channel, paced to the clip's own timeline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,10 @@ impl Drop for DecodeHandle {
 /// Spawn a decode worker for one cue. `in_sec`/`out_sec` trim the loop: playback
 /// (and every restart) begins at `in_sec` and loops back once it reaches
 /// `out_sec` (or the clip's natural end when `out_sec` is `None`).
+///
+/// # Errors
+/// Returns an error if ffmpeg initialization fails. Per-clip decode failures
+/// are logged on the worker thread, not returned here.
 pub fn spawn(path: PathBuf, in_sec: f64, out_sec: Option<f64>) -> anyhow::Result<DecodeHandle> {
     ff::init()?;
     let (frame_tx, frames) = bounded::<DecodedFrame>(3);
@@ -113,7 +117,7 @@ fn seek_secs(ictx: &mut ff::format::context::Input, secs: f64) -> anyhow::Result
 }
 
 fn run(
-    path: &PathBuf,
+    path: &Path,
     tx: &Sender<DecodedFrame>,
     close_rx: &Receiver<()>,
     restart_rx: &Receiver<()>,
@@ -130,6 +134,9 @@ fn run(
         (st.index(), st.parameters(), st.time_base())
     };
     let is_hap = params.id() == ff::codec::Id::HAP;
+    // SAFETY: `params` (a live `Parameters` from the stream's `best()` lookup)
+    // owns the `AVCodecParameters` and outlives this read; its fields are
+    // populated by ffmpeg during demuxer open.
     let (fourcc, width, height) = unsafe {
         let p = params.as_ptr();
         (

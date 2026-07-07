@@ -22,14 +22,11 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 ui.weak(format!("⏱ {}", fmt_time(m.playhead_sec)));
             });
             ui.add_space(SP_MD);
-            match m.selected_cue.and_then(|id| m.cues.iter().find(|c| c.id == id)) {
-                Some(cue) => cue_editor(ui, m, cue, tx),
-                None => {
-                    ui.add_space(SP_MD);
-                    ui.weak("No cue selected.");
-                    ui.add_space(SP_SM);
-                    ui.weak("Double-click a clip to add a cue to the edit bank, then click the cue to edit it here.");
-                }
+            if let Some(cue) = m.selected_cue.and_then(|id| m.cues.iter().find(|c| c.id == id)) { cue_editor(ui, m, cue, tx) } else {
+                ui.add_space(SP_MD);
+                ui.weak("No cue selected.");
+                ui.add_space(SP_SM);
+                ui.weak("Double-click a clip to add a cue to the edit bank, then click the cue to edit it here.");
             }
         });
 }
@@ -37,7 +34,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
 /// The fields for one cue: in/out trim, per-cue preserve, shader override.
 fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     ui.add_space(SP_SM);
-    ui.strong(&cue.name);
+    ui.strong(cue.name.as_ref());
     let role = match cue.role {
         ClipRole::Playing => "playing",
         ClipRole::Armed => "armed",
@@ -131,7 +128,7 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     let selected_name = cue
         .shader
         .and_then(|id| m.shader_pool.iter().find(|s| s.id == id))
-        .map(|s| s.name.as_str())
+        .map(|s| &*s.name)
         .unwrap_or("Live shader");
     egui::ComboBox::from_id_salt("cue_shader")
         .selected_text(selected_name)
@@ -141,7 +138,7 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             }
             for s in &m.shader_pool {
                 if ui
-                    .selectable_label(cue.shader == Some(s.id), &s.name)
+                    .selectable_label(cue.shader == Some(s.id), s.name.as_ref())
                     .clicked()
                 {
                     let _ = tx.send(Command::SetCueShader(cue.id, Some(s.id)));

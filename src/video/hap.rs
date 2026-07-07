@@ -43,28 +43,28 @@ impl HapTextureFormat {
     /// Bytes per 4x4 block for the compressed format.
     pub fn block_bytes(self) -> u32 {
         match self {
-            HapTextureFormat::Bc1 | HapTextureFormat::Bc4 => 8,
-            HapTextureFormat::Bc3 | HapTextureFormat::Bc3YCoCg | HapTextureFormat::Bc7 => 16,
+            Self::Bc1 | Self::Bc4 => 8,
+            Self::Bc3 | Self::Bc3YCoCg | Self::Bc7 => 16,
         }
     }
 
     /// `videoMode` uniform value for the composite shader's `video()` helper.
-    /// Overridden to 2 by the caller when a HapM alpha plane accompanies it.
+    /// Overridden to 2 by the caller when a `HapM` alpha plane accompanies it.
     pub fn video_mode(self) -> i32 {
         match self {
-            HapTextureFormat::Bc3YCoCg => 1,
-            HapTextureFormat::Bc4 => 3,
+            Self::Bc3YCoCg => 1,
+            Self::Bc4 => 3,
             _ => 0,
         }
     }
 
     fn from_nibble(low: u8) -> Result<Self, HapErr> {
         match low {
-            FMT_RGB_DXT1 => Ok(HapTextureFormat::Bc1),
-            FMT_RGBA_DXT5 => Ok(HapTextureFormat::Bc3),
-            FMT_YCOCG_DXT5 => Ok(HapTextureFormat::Bc3YCoCg),
-            FMT_RGTC1 => Ok(HapTextureFormat::Bc4),
-            FMT_BC7 => Ok(HapTextureFormat::Bc7),
+            FMT_RGB_DXT1 => Ok(Self::Bc1),
+            FMT_RGBA_DXT5 => Ok(Self::Bc3),
+            FMT_YCOCG_DXT5 => Ok(Self::Bc3YCoCg),
+            FMT_RGTC1 => Ok(Self::Bc4),
+            FMT_BC7 => Ok(Self::Bc7),
             other => Err(HapErr::UnknownFormat(other)),
         }
     }
@@ -77,19 +77,19 @@ pub enum HapErr {
     UnknownCompressor(u8),
     BadChunkTables,
     Snappy,
-    /// HapM second texture wasn't the expected BC4 alpha plane.
+    /// `HapM` second texture wasn't the expected BC4 alpha plane.
     UnexpectedAlpha,
 }
 
 impl std::fmt::Display for HapErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HapErr::Truncated => write!(f, "HAP frame truncated"),
-            HapErr::UnknownFormat(b) => write!(f, "unknown HAP texture format nibble {b:#04x}"),
-            HapErr::UnknownCompressor(b) => write!(f, "unknown HAP compressor {b:#04x}"),
-            HapErr::BadChunkTables => write!(f, "malformed HAP chunk tables"),
-            HapErr::Snappy => write!(f, "snappy decompression failed"),
-            HapErr::UnexpectedAlpha => write!(f, "HapM alpha plane was not BC4"),
+            Self::Truncated => write!(f, "HAP frame truncated"),
+            Self::UnknownFormat(b) => write!(f, "unknown HAP texture format nibble {b:#04x}"),
+            Self::UnknownCompressor(b) => write!(f, "unknown HAP compressor {b:#04x}"),
+            Self::BadChunkTables => write!(f, "malformed HAP chunk tables"),
+            Self::Snappy => write!(f, "snappy decompression failed"),
+            Self::UnexpectedAlpha => write!(f, "HapM alpha plane was not BC4"),
         }
     }
 }
@@ -99,14 +99,14 @@ impl std::error::Error for HapErr {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HapMeta {
     pub format: HapTextureFormat,
-    /// True when an alpha plane (BC4) was decoded into the alpha buffer (HapM).
+    /// True when an alpha plane (BC4) was decoded into the alpha buffer (`HapM`).
     pub has_alpha: bool,
     /// The `videoMode` to feed the shader (accounts for the alpha plane).
     pub video_mode: i32,
 }
 
 /// Parse a section header at the start of `b`.
-/// Returns (payload_len, type_byte, header_len).
+/// Returns (`payload_len`, `type_byte`, `header_len`).
 fn read_section(b: &[u8]) -> Result<(usize, u8, usize), HapErr> {
     if b.len() < 4 {
         return Err(HapErr::Truncated);
@@ -150,7 +150,7 @@ fn snappy_into(input: &[u8], out: &mut Vec<u8>) -> Result<(), HapErr> {
     Ok(())
 }
 
-/// Decode a chunked (COMP_COMPLEX) section body: a Decode Instructions Container
+/// Decode a chunked (`COMP_COMPLEX`) section body: a Decode Instructions Container
 /// followed by the frame data. Reassembles chunks (each raw or Snappy) into `out`.
 fn decode_chunked(body: &[u8], out: &mut Vec<u8>) -> Result<(), HapErr> {
     // First child section must be the Decode Instructions Container.
@@ -235,9 +235,13 @@ fn decode_chunked(body: &[u8], out: &mut Vec<u8>) -> Result<(), HapErr> {
     Ok(())
 }
 
-/// Decode a full HAP frame packet. `texture_count` comes from the codec FourCC
-/// (1 for Hap/HapA/HapY/HapAOnly, 2 for HapM). For 2 textures the second is the
+/// Decode a full HAP frame packet. `texture_count` comes from the codec `FourCC`
+/// (1 for Hap/HapA/HapY/HapAOnly, 2 for `HapM`). For 2 textures the second is the
 /// BC4 alpha plane, decoded into `alpha`.
+///
+/// # Errors
+/// Returns [`HapErr`] if the packet is truncated or malformed, or if a two-plane
+/// frame's alpha section is not the expected BC4 format.
 pub fn decode_frame(
     packet: &[u8],
     texture_count: u8,
@@ -271,6 +275,9 @@ pub fn decode_frame(
 /// Encode BC1 (DXT1) texture bytes as a single-section Snappy-compressed HAP1
 /// frame (the inverse of `decode_frame` for the Hap1 path). Used by the
 /// transcode helper to produce `.mov` clips this app can play back.
+///
+/// # Panics
+/// Panics if Snappy compression fails, which cannot happen for valid input.
 pub fn encode_hap1_frame(bc1: &[u8]) -> Vec<u8> {
     let compressed = snap::raw::Encoder::new()
         .compress_vec(bc1)

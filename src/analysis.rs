@@ -42,7 +42,7 @@ impl Default for AudioFrame {
         for w in &mut audio_tex[AUDIO_TEX_W..] {
             *w = 128;
         }
-        AudioFrame {
+        Self {
             bands: [0.0; NUM_BANDS],
             level: 0.0,
             audio_tex,
@@ -136,11 +136,8 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
             chunk.commit_all();
         }
 
-        for i in 0..FFT_SIZE {
-            buf[i] = Complex {
-                re: samples[i] * window[i],
-                im: 0.0,
-            };
+        for (b, (&s, &w)) in buf.iter_mut().zip(samples.iter().zip(&window)) {
+            *b = Complex { re: s * w, im: 0.0 };
         }
         fft.process_with_scratch(&mut buf, &mut scratch);
 
@@ -153,11 +150,11 @@ pub fn run(ctl_rx: crossbeam_channel::Receiver<AudioCtl>, mut tri_in: triple_buf
             }
             band_mag[i] = sum / count;
         }
-        for i in 0..NUM_BANDS {
-            if band_mag[i] > smoothed[i] {
-                smoothed[i] = smoothed[i] * (1.0 - ATTACK) + band_mag[i] * ATTACK;
+        for (&mag, s) in band_mag.iter().zip(smoothed.iter_mut()) {
+            if mag > *s {
+                *s = *s * (1.0 - ATTACK) + mag * ATTACK;
             } else {
-                smoothed[i] *= DECAY;
+                *s *= DECAY;
             }
         }
 

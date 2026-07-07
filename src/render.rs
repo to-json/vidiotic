@@ -6,6 +6,7 @@
 //! pipeline is built, so a bad live-reload keeps the last-good pipeline.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::analysis::{AUDIO_TEX_LEN, AUDIO_TEX_W};
 use crate::commands::ShaderId;
@@ -34,7 +35,7 @@ const _: () = assert!(std::mem::size_of::<Globals>() == 144);
 
 impl Default for Globals {
     fn default() -> Self {
-        Globals {
+        Self {
             resolution: [1.0, 1.0],
             mouse: [0.0, 0.0],
             time: 0.0,
@@ -72,7 +73,7 @@ fn wgpu_format(f: HapTextureFormat) -> wgpu::TextureFormat {
 }
 
 /// The current clip's GPU texture(s) and their bind group. `alpha` is `Some`
-/// only for a real alpha plane (HapM); the bind group keeps the views alive.
+/// only for a real alpha plane (`HapM`); the bind group keeps the views alive.
 struct VideoTexture {
     format: wgpu::TextureFormat,
     w: u32,
@@ -86,7 +87,7 @@ struct VideoTexture {
 /// A shader pinned into the pool: a frozen compile a cue can render with.
 struct PooledShader {
     id: ShaderId,
-    name: String,
+    name: Arc<str>,
     pipeline: wgpu::RenderPipeline,
 }
 
@@ -111,7 +112,7 @@ pub struct Renderer {
     video: Option<VideoTexture>,
     pipeline: Option<wgpu::RenderPipeline>,
     passthrough: wgpu::RenderPipeline,
-    shader_error: Option<String>,
+    shader_error: Option<Arc<str>>,
     // Source of the current last-good live compile, so it can be re-compiled into
     // a frozen pool entry on `capture_current`.
     last_good: Option<(String, ShaderLang)>,
@@ -126,6 +127,10 @@ pub struct Renderer {
 impl Renderer {
     /// Build the fixed GPU state (layouts, samplers, audio texture, built-in
     /// passthrough pipeline) targeting `color_format`.
+    ///
+    /// # Panics
+    /// Panics if a built-in shader (the GLSL fullscreen vertex shader or the
+    /// passthrough fragment shader) fails to compile — a compile-time invariant.
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -279,7 +284,7 @@ impl Renderer {
             build_pipeline(device, &pipeline_layout, &vs_glsl, &fs, color_format)
         };
 
-        Renderer {
+        Self {
             globals_buf,
             globals_bg,
             bgl_video,
@@ -304,8 +309,8 @@ impl Renderer {
     }
 
     /// The last live-shader compile error, if the most recent `set_shader` failed.
-    pub fn shader_error(&self) -> Option<&str> {
-        self.shader_error.as_deref()
+    pub fn shader_error(&self) -> Option<&Arc<str>> {
+        self.shader_error.as_ref()
     }
 
     /// Compile a user shader source. On success installs it as the active
@@ -319,7 +324,7 @@ impl Renderer {
                 self.last_good = Some((src.to_string(), lang));
             }
             Err(e) => {
-                self.shader_error = Some(e.to_string());
+                self.shader_error = Some(e.to_string().into());
                 log::warn!("shader compile failed (keeping last-good): {e}");
             }
         }
@@ -327,13 +332,21 @@ impl Renderer {
 
     /// Pin the current last-good live shader into the pool as a frozen compile.
     /// Returns the new id, or `None` if there is no compiled shader to pin.
-    pub fn capture_current(&mut self, device: &wgpu::Device, name: String) -> Option<ShaderId> {
+    pub fn capture_current(
+        &mut self,
+        device: &wgpu::Device,
+        name: impl Into<Arc<str>>,
+    ) -> Option<ShaderId> {
         let (src, lang) = self.last_good.clone()?;
         match self.compile(device, &src, lang) {
             Ok(pipeline) => {
                 let id = self.next_pool_id;
                 self.next_pool_id += 1;
-                self.pool.push(PooledShader { id, name, pipeline });
+                self.pool.push(PooledShader {
+                    id,
+                    name: name.into(),
+                    pipeline,
+                });
                 Some(id)
             }
             Err(e) => {
@@ -358,7 +371,7 @@ impl Renderer {
     }
 
     /// (id, name) of each pinned shader, in pin order.
-    pub fn pool_view(&self) -> Vec<(ShaderId, String)> {
+    pub fn pool_view(&self) -> Vec<(ShaderId, Arc<str>)> {
         self.pool.iter().map(|p| (p.id, p.name.clone())).collect()
     }
 
@@ -386,6 +399,10 @@ impl Renderer {
     }
 
     /// Upload a decoded frame, recreating the GPU texture(s) if format/size changed.
+    ///
+    /// # Panics
+    /// Panics if the video texture is absent after the create-if-changed step
+    /// above — an internal invariant that always holds.
     pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &DecodedFrame) {
         let (format, has_alpha) = match &frame.pixels {
             PixelData::Bc { format, alpha, .. } => (wgpu_format(*format), alpha.is_some()),
@@ -399,7 +416,7 @@ impl Renderer {
         if needs_new {
             self.video = Some(self.create_video_texture(device, format, frame.w, frame.h, has_alpha));
         }
-        let v = self.video.as_ref().unwrap();
+        let v = self.video.as_ref().expect("video texture created above when missing or mismatched");
 
         match &frame.pixels {
             PixelData::Bc {

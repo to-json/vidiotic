@@ -3,6 +3,8 @@
 //! `Bank` is an ordered set of cues. The sequencer advances through the *live*
 //! bank's cues; other banks can be edited while one plays.
 
+use std::sync::Arc;
+
 use crate::commands::{ClipId, ShaderId};
 
 /// Identifies a cue. Distinct from `ClipId`: the same source clip can appear as
@@ -14,7 +16,7 @@ pub type CueId = u32;
 pub struct Cue {
     pub id: CueId,
     pub clip: ClipId,
-    pub name: String,
+    pub name: Arc<str>,
     /// In-point, seconds from the clip start: where playback and loop restarts
     /// seek to.
     pub in_sec: f64,
@@ -29,11 +31,11 @@ pub struct Cue {
 
 impl Cue {
     /// A full-length cue: no trim, all overrides inherited.
-    pub fn new(id: CueId, clip: ClipId, name: String) -> Self {
-        Cue {
+    pub fn new(id: CueId, clip: ClipId, name: impl Into<Arc<str>>) -> Self {
+        Self {
             id,
             clip,
-            name,
+            name: name.into(),
             in_sec: 0.0,
             out_sec: None,
             preserve: None,
@@ -45,14 +47,14 @@ impl Cue {
 /// An ordered, named set of cues; the play order is the vec order.
 #[derive(Clone, Debug)]
 pub struct Bank {
-    pub name: String,
+    pub name: Arc<str>,
     pub cues: Vec<Cue>,
 }
 
 impl Bank {
     /// An empty bank.
-    pub fn new(name: impl Into<String>) -> Self {
-        Bank {
+    pub fn new(name: impl Into<Arc<str>>) -> Self {
+        Self {
             name: name.into(),
             cues: Vec::new(),
         }

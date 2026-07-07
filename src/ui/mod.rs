@@ -52,7 +52,7 @@ impl EguiCtl {
                 ..Default::default()
             },
         );
-        EguiCtl {
+        Self {
             ctx,
             state,
             renderer,
@@ -174,7 +174,7 @@ enum PickKind {
 }
 
 /// Open a native picker on a worker thread and deliver the choice as a Command.
-/// (NSOpenPanel is main-thread-only for blocking dialogs, so use the async API.)
+/// (`NSOpenPanel` is main-thread-only for blocking dialogs, so use the async API.)
 fn pick_file(tx: Sender<Command>, kind: PickKind) {
     match kind {
         PickKind::ClipDir => {

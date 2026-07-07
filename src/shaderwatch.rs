@@ -13,6 +13,11 @@ pub struct ShaderWatcher {
 }
 
 impl ShaderWatcher {
+    /// Watch `path`'s parent directory, signalling on writes to that file.
+    ///
+    /// # Errors
+    /// Returns an error if `path` has no file name or the filesystem watcher
+    /// cannot be created or cannot watch the parent directory.
     pub fn new(path: &Path) -> anyhow::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let target = path
@@ -35,7 +40,7 @@ impl ShaderWatcher {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
         let dir = parent.unwrap_or_else(|| Path::new("."));
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
-        Ok(ShaderWatcher {
+        Ok(Self {
             _watcher: watcher,
             rx,
         })

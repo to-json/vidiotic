@@ -51,11 +51,11 @@ pub enum ShaderError {
 impl std::fmt::Display for ShaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShaderError::Parse { msg, line } => match line {
+            Self::Parse { msg, line } => match line {
                 Some(l) => write!(f, "parse error (line {l}):\n{msg}"),
                 None => write!(f, "parse error:\n{msg}"),
             },
-            ShaderError::Validation { msg, line } => match line {
+            Self::Validation { msg, line } => match line {
                 Some(l) => write!(f, "validation error (line {l}):\n{msg}"),
                 None => write!(f, "validation error:\n{msg}"),
             },
@@ -301,6 +301,9 @@ pub fn preprocess_glsl(user_src: &str) -> Preprocessed {
 
 /// Parse + validate a GLSL user shader, returning a validated naga module ready
 /// to hand to wgpu via `ShaderSource::Naga`.
+///
+/// # Errors
+/// Returns [`ShaderError`] if the source fails to parse or validate.
 pub fn compile_glsl_to_module(user_src: &str) -> Result<naga::Module, ShaderError> {
     let pre = preprocess_glsl(user_src);
     parse_and_validate_glsl(&pre)
@@ -339,6 +342,9 @@ fn parse_and_validate_glsl(pre: &Preprocessed) -> Result<naga::Module, ShaderErr
 /// Parse + validate a fixed built-in GLSL vertex shader (the fullscreen triangle).
 /// No preamble/preprocessing; used so GLSL fragment shaders get a stage whose
 /// varying interpolation matches naga's GLSL convention.
+///
+/// # Errors
+/// Returns [`ShaderError`] if the source fails to parse or validate.
 pub fn compile_glsl_vertex_module(src: &str) -> Result<naga::Module, ShaderError> {
     let mut frontend = naga::front::glsl::Frontend::default();
     let options = naga::front::glsl::Options::from(naga::ShaderStage::Vertex);
@@ -354,6 +360,9 @@ pub fn compile_glsl_vertex_module(src: &str) -> Result<naga::Module, ShaderError
 }
 
 /// Parse + validate a WGSL user shader (no preamble; documented binding contract).
+///
+/// # Errors
+/// Returns [`ShaderError`] if the source fails to parse or validate.
 pub fn compile_wgsl_to_module(user_src: &str) -> Result<naga::Module, ShaderError> {
     let module = naga::front::wgsl::parse_str(user_src).map_err(|e| {
         let loc = e.location(user_src);

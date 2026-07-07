@@ -45,9 +45,6 @@ pub const PALETTE: Palette = Palette {
     border: Color32::from_rgb(45, 45, 56),
 };
 
-// Part of the spacing scale for custom-painted widgets' tight internal
-// padding; no built-in egui widget needs a gap this small.
-#[allow(dead_code)]
 pub const SP_XS: f32 = 2.0;
 pub const SP_SM: f32 = 4.0;
 pub const SP_MD: f32 = 8.0;
@@ -57,7 +54,6 @@ pub const SP_LG: f32 = 16.0;
 /// derived translucent overlays — hover brighten, tile scrims, beat-pulse
 /// fades — that aren't a new color, just an existing one made partly
 /// transparent.
-#[allow(dead_code)]
 pub fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }

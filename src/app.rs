@@ -59,7 +59,7 @@ pub struct Boot {
     pub audio_err_rx: Receiver<cpal::Error>,
     pub audio_ctl_tx: Sender<crate::analysis::AudioCtl>,
     pub host: cpal::Host,
-    pub audio_devices: Vec<String>,
+    pub audio_devices: Vec<Arc<str>>,
     pub cmd_tx: Sender<Command>,
     pub cmd_rx: Receiver<Command>,
 }
@@ -110,7 +110,7 @@ pub struct App {
     audio_err_rx: Receiver<cpal::Error>,
     audio_ctl_tx: Sender<crate::analysis::AudioCtl>,
     host: cpal::Host,
-    audio_devices: Vec<String>,
+    audio_devices: Vec<Arc<str>>,
 
     // shader
     shader_path: PathBuf,
@@ -128,7 +128,6 @@ pub struct App {
     windowed: bool,
     monitor: Option<usize>,
     fullscreen_applied: bool,
-    fullscreen: bool,
     start: Instant,
     modifiers: Modifiers,
     bpm_entry: Option<String>,
@@ -147,7 +146,7 @@ pub struct App {
 
 impl App {
     pub fn new(boot: Boot) -> Self {
-        let mut app = App {
+        let mut app = Self {
             graphics: None,
             renderer: None,
             egui: None,
@@ -188,7 +187,6 @@ impl App {
             windowed: boot.windowed,
             monitor: boot.monitor,
             fullscreen_applied: false,
-            fullscreen: false,
             start: Instant::now(),
             modifiers: Modifiers::default(),
             bpm_entry: None,
@@ -213,7 +211,7 @@ impl App {
         self.clips.iter().find(|c| c.id == id).map(|c| c.path.clone())
     }
 
-    fn clip_name(&self, id: ClipId) -> String {
+    fn clip_name(&self, id: ClipId) -> Arc<str> {
         self.clips
             .iter()
             .find(|c| c.id == id)
@@ -258,25 +256,22 @@ impl App {
             .cues
             .iter()
             .position(|c| c.clip == clip);
-        match existing {
-            Some(pos) => {
-                let cue_id = self.banks[self.live_bank].cues[pos].id;
-                let ev = self.sequencer.toggle_active(cue_id, beat);
-                self.banks[self.live_bank].cues.remove(pos);
-                if self.selected_cue == Some(cue_id) {
-                    self.selected_cue = None;
-                }
-                self.apply_seq_events(ev);
+        if let Some(pos) = existing {
+            let cue_id = self.banks[self.live_bank].cues[pos].id;
+            let ev = self.sequencer.toggle_active(cue_id, beat);
+            self.banks[self.live_bank].cues.remove(pos);
+            if self.selected_cue == Some(cue_id) {
+                self.selected_cue = None;
             }
-            None => {
-                let cue_id = self.alloc_cue_id();
-                let name = self.clip_name(clip);
-                self.banks[self.live_bank]
-                    .cues
-                    .push(Cue::new(cue_id, clip, name));
-                let ev = self.sequencer.toggle_active(cue_id, beat);
-                self.apply_seq_events(ev);
-            }
+            self.apply_seq_events(ev);
+        } else {
+            let cue_id = self.alloc_cue_id();
+            let name = self.clip_name(clip);
+            self.banks[self.live_bank]
+                .cues
+                .push(Cue::new(cue_id, clip, name));
+            let ev = self.sequencer.toggle_active(cue_id, beat);
+            self.apply_seq_events(ev);
         }
     }
 
@@ -418,12 +413,9 @@ impl App {
         self.shader_pin_count += 1;
         let name = format!("{stem} #{}", self.shader_pin_count);
         if let Some(r) = self.renderer.as_mut() {
-            match r.capture_current(&g.device, name) {
-                Some(id) => log::info!("pinned shader {id}"),
-                None => {
-                    self.shader_pin_count -= 1;
-                    log::warn!("no compiled shader to pin");
-                }
+            if let Some(id) = r.capture_current(&g.device, name) { log::info!("pinned shader {id}") } else {
+                self.shader_pin_count -= 1;
+                log::warn!("no compiled shader to pin");
             }
         }
     }
@@ -575,10 +567,10 @@ impl App {
             Command::RemoveCue(id) => self.remove_cue(id),
             Command::SelectCue(id) => self.selected_cue = id,
             Command::SetCueIn(id, s) => {
-                self.edit_cue(id, |c| { c.in_sec = s.max(0.0); normalize_cue_trim(c); })
+                self.edit_cue(id, |c| { c.in_sec = s.max(0.0); normalize_cue_trim(c); });
             }
             Command::SetCueOut(id, s) => {
-                self.edit_cue(id, |c| { c.out_sec = s; normalize_cue_trim(c); })
+                self.edit_cue(id, |c| { c.out_sec = s; normalize_cue_trim(c); });
             }
             Command::SetCueInToPlayhead(id) => {
                 if self.current == Some(id) {
@@ -765,6 +757,7 @@ impl App {
         let has_thumb = |id: ClipId| self.egui.as_ref().is_some_and(|e| e.has_thumb(id));
 
         self.mirror.bpm = snap.bpm;
+        self.mirror.bpm_entry = self.bpm_entry.clone();
         self.mirror.beat = snap.beat;
         self.mirror.phase = snap.phase;
         self.mirror.quantum = snap.quantum;
@@ -775,11 +768,7 @@ impl App {
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
         self.mirror.sync = Some(self.sync);
         self.mirror.peers = self.clock.caps().peers;
-        self.mirror.audio_devices = self
-            .audio_devices
-            .iter()
-            .map(|n| (n.clone(), n.clone()))
-            .collect();
+        self.mirror.audio_devices = self.audio_devices.clone();
         self.mirror.current_device = Some(self.audio_capture.device_name.clone());
         self.mirror.shader_name = self
             .shader_path
@@ -790,7 +779,7 @@ impl App {
             .renderer
             .as_ref()
             .and_then(|r| r.shader_error())
-            .map(str::to_string);
+            .cloned();
         self.mirror.clip_dir = self
             .clip_dir
             .as_ref()
@@ -868,7 +857,10 @@ impl App {
                 .map(|&b| b as f32 / 255.0),
         );
         self.mirror.level = audio.level;
-        self.mirror.fullscreen = self.fullscreen;
+        self.mirror.fullscreen = self
+            .graphics
+            .as_ref()
+            .is_some_and(|g| g.output.window.fullscreen().is_some());
     }
 
     fn render_output(&mut self) {
@@ -914,7 +906,6 @@ impl App {
             g.output
                 .window
                 .set_fullscreen(Some(Fullscreen::Borderless(monitor)));
-            self.fullscreen = true;
         }
     }
 
@@ -922,13 +913,11 @@ impl App {
         if let Some(g) = self.graphics.as_ref() {
             if g.output.window.fullscreen().is_some() {
                 g.output.window.set_fullscreen(None);
-                self.fullscreen = false;
             } else {
                 let monitor = pick_monitor_from_window(&g.output.window, self.monitor);
                 g.output
                     .window
                     .set_fullscreen(Some(Fullscreen::Borderless(monitor)));
-                self.fullscreen = true;
             }
         }
     }
@@ -1021,13 +1010,10 @@ impl ApplicationHandler for App {
                     .with_inner_size(winit::dpi::LogicalSize::new(w, h)),
             )
         };
-        let (output_win, control_win) = match (make("vidiotic output", 1280.0, 720.0), make("vidiotic control", 1000.0, 720.0)) {
-            (Ok(o), Ok(c)) => (Arc::new(o), Arc::new(c)),
-            _ => {
-                log::error!("failed to create windows");
-                event_loop.exit();
-                return;
-            }
+        let (output_win, control_win) = if let (Ok(o), Ok(c)) = (make("vidiotic output", 1280.0, 720.0), make("vidiotic control", 1000.0, 720.0)) { (Arc::new(o), Arc::new(c)) } else {
+            log::error!("failed to create windows");
+            event_loop.exit();
+            return;
         };
         self.output_id = Some(output_win.id());
         self.control_id = Some(control_win.id());
@@ -1095,6 +1081,9 @@ impl ApplicationHandler for App {
 }
 
 /// Run the player until quit: builds the `App` and drives the winit event loop.
+///
+/// # Errors
+/// Propagates failure to create or run the winit event loop.
 pub fn run(boot: Boot) -> anyhow::Result<()> {
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

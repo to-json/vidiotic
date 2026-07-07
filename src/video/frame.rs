@@ -7,7 +7,7 @@ use super::hap::HapTextureFormat;
 /// A frame's pixel payload, in whichever form the decode path produced.
 pub enum PixelData {
     /// GPU-native block-compressed texels (HAP fast path). `alpha` is the BC4
-    /// plane for HapM; `video_mode` is the shader composite mode.
+    /// plane for `HapM`; `video_mode` is the shader composite mode.
     Bc {
         format: HapTextureFormat,
         data: Vec<u8>,
@@ -31,8 +31,8 @@ impl PixelData {
     /// The `videoMode` uniform for the shader's `video()` composite helper.
     pub fn video_mode(&self) -> i32 {
         match self {
-            PixelData::Bc { video_mode, .. } => *video_mode,
-            PixelData::Rgba { .. } => 0,
+            Self::Bc { video_mode, .. } => *video_mode,
+            Self::Rgba { .. } => 0,
         }
     }
 }

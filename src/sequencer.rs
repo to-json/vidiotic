@@ -44,7 +44,7 @@ pub struct Sequencer {
 impl Sequencer {
     /// An idle sequencer with an empty active set.
     pub fn new(phrase_len: f64) -> Self {
-        Sequencer {
+        Self {
             state: SeqState::Idle,
             active: Vec::new(),
             phrase_len: phrase_len.max(1.0),

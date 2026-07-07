@@ -3,6 +3,7 @@
 //! a large pool never blocks the UI.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ffmpeg_next as ff;
 
@@ -17,7 +18,7 @@ const THUMB_H: u32 = 108;
 pub struct Clip {
     pub id: ClipId,
     pub path: PathBuf,
-    pub name: String,
+    pub name: Arc<str>,
 }
 
 /// A decoded first-frame preview, delivered from the thumbnailer thread.
@@ -47,11 +48,11 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
         .into_iter()
         .enumerate()
         .map(|(i, path)| {
-            let name = path
+            let name: Arc<str> = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("clip")
-                .to_string();
+                .into();
             Clip {
                 id: i as ClipId,
                 path,

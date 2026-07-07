@@ -1,6 +1,6 @@
 //! Self-contained HAP transcoder: decode any clip with ffmpeg-next, block-
 //! compress each frame to DXT1 (texpresso), wrap as a Snappy HAP1 frame, and mux
-//! into a QuickTime `.mov`. This exists because a stock Homebrew ffmpeg is built
+//! into a `QuickTime` `.mov`. This exists because a stock Homebrew ffmpeg is built
 //! without libsnappy and therefore has no `-c:v hap` encoder — so the app ships
 //! its own, and the resulting clips play back on the near-zero-CPU HAP path.
 
@@ -15,6 +15,12 @@ const HAP1_TAG: u32 = u32::from_le_bytes(*b"Hap1");
 const OUT_TIMESCALE: i32 = 1000; // millisecond output time base pre-header
 
 /// Transcode `input` (any decodable video) to a HAP1 `.mov` at `output`.
+///
+/// # Errors
+/// Propagates ffmpeg initialization, demux/decode, and mux/write failures.
+///
+/// # Panics
+/// Panics if the output stream just added to the muxer cannot be read back.
 pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
     ff::init()?;
 
@@ -67,7 +73,7 @@ pub fn run(input: &Path, output: &Path) -> anyhow::Result<()> {
     }
     octx.write_header()?;
     // The muxer may pick its own timescale; capture it to rescale packet pts.
-    let out_tb = octx.stream(0).unwrap().time_base();
+    let out_tb = octx.stream(0).expect("stream 0 was just added").time_base();
 
     let bc_size = Format::Bc1.compressed_size(w as usize, h as usize);
     let mut bc1 = vec![0u8; bc_size];

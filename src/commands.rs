@@ -4,6 +4,7 @@
 //! MIDI eventually) map onto the same commands.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::bank::CueId;
 
@@ -79,7 +80,7 @@ pub enum ClipRole {
 #[derive(Clone, Debug)]
 pub struct ClipEntry {
     pub id: ClipId,
-    pub name: String,
+    pub name: Arc<str>,
     pub active: bool,
     pub role: ClipRole,
     pub has_thumb: bool, // texture cached in the UI's thumbnail map
@@ -90,7 +91,7 @@ pub struct ClipEntry {
 pub struct CueView {
     pub id: CueId,
     pub clip: ClipId,
-    pub name: String,
+    pub name: Arc<str>,
     pub in_sec: f64,
     pub out_sec: Option<f64>,
     pub preserve: Option<bool>,
@@ -102,7 +103,7 @@ pub struct CueView {
 /// A bank's identity for the bank bar.
 #[derive(Clone, Debug)]
 pub struct BankView {
-    pub name: String,
+    pub name: Arc<str>,
     pub cue_count: usize,
 }
 
@@ -110,13 +111,14 @@ pub struct BankView {
 #[derive(Clone, Debug)]
 pub struct ShaderPoolView {
     pub id: ShaderId,
-    pub name: String,
+    pub name: Arc<str>,
 }
 
 /// Read-only display state the engine republishes each tick for the control UI.
 #[derive(Clone, Debug, Default)]
 pub struct UiMirror {
     pub bpm: f64,
+    pub bpm_entry: Option<String>, // pending keyboard BPM entry, digits typed so far
     pub beat: f64,
     pub phase: f64, // 0..quantum
     pub quantum: f64,
@@ -127,11 +129,11 @@ pub struct UiMirror {
     pub preserve_playhead: bool, // carry the playhead over on a cut vs. restart the incoming clip
     pub sync: Option<SyncKind>,
     pub peers: u64,
-    pub audio_devices: Vec<(String, String)>, // (id key, name)
-    pub current_device: Option<String>,
+    pub audio_devices: Vec<Arc<str>>, // device names; the name doubles as the selection key
+    pub current_device: Option<Arc<str>>,
     pub audio_error: Option<String>,
     pub shader_name: Option<String>,
-    pub shader_error: Option<String>,
+    pub shader_error: Option<Arc<str>>,
     pub clip_dir: Option<String>,
     pub clips: Vec<ClipEntry>,
     // Cue banks.

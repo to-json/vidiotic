@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -99,11 +100,11 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
     let mut auto_active: Vec<ClipId> = Vec::new();
     if let Some(single) = &cli.clip {
         let id = clips.len() as ClipId;
-        let name = single
+        let name: Arc<str> = single
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("clip")
-            .to_string();
+            .into();
         clips.push(clippool::Clip {
             id,
             path: single.clone(),
@@ -127,9 +128,9 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         .spawn(move || analysis::run(ctl_rx, audio_in))?;
 
     let host = cpal::default_host();
-    let audio_devices: Vec<String> = audio::list_input_devices(&host)
+    let audio_devices: Vec<Arc<str>> = audio::list_input_devices(&host)
         .into_iter()
-        .map(|(_, name)| name)
+        .map(|(_, name)| name.into())
         .collect();
     let audio_capture =
         audio::build_capture(&host, None, cli.audio_device.as_deref(), &ctl_tx, err_tx)?;

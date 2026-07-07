@@ -152,7 +152,7 @@ impl LinkClock {
         let link = rusty_link::AblLink::new(initial_bpm);
         link.enable_start_stop_sync(true);
         link.enable(true); // begins peer discovery
-        LinkClock {
+        Self {
             link,
             state: rusty_link::SessionState::new(),
             quantum,
@@ -327,7 +327,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         c.tap_downbeat();
         let phase = c.snapshot().phase;
-        assert!(phase < 0.05 || phase > 3.95, "phase not near boundary: {phase}");
+        assert!(!(0.05..=3.95).contains(&phase), "phase not near boundary: {phase}");
     }
 
     #[test]

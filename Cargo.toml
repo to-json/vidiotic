@@ -43,3 +43,15 @@ egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false, features = ["links"] }
 rfd = "0.15"
 rusty_link = "0.4"
+
+# A curated subset of clippy's pedantic tier. The blanket tier is not enabled:
+# the numeric-cast lints are noise in graphics/DSP code, and the must-use /
+# const-fn candidates are churn without payoff here.
+[lints.clippy]
+use_self = "warn"
+redundant_clone = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+semicolon_if_nothing_returned = "warn"
+single_match_else = "warn"
