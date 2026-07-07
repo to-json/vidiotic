@@ -7,6 +7,14 @@ on the laptop.
 
 macOS. Built in Rust on wgpu.
 
+## Why did you do this, why are you doing this?
+
+~~Because we hate you~~ Because I've been involved in electronic
+musical performance for quite a while, and the music making has gotten
+better, and the djing has gotten better, and even the access to space
+has gotten better, but cheap vizualization tools are still about as
+good as Milkdrop, a thing that is a quarter century old.
+
 ## Build
 
 ```
