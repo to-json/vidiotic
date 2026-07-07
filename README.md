@@ -7,6 +7,12 @@ on the laptop.
 
 macOS. Built in Rust on wgpu.
 
+## What?
+
+I made 
+[a video](https://bsky.app/profile/fubarchitect.com/post/3mq237pftac2r)
+of it in action, that might be more useful
+
 ## Why did you do this, why are you doing this?
 
 ~~Because we hate you~~ Because I've been involved in electronic
