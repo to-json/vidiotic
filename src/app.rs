@@ -767,7 +767,10 @@ impl App {
         self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
         self.mirror.sync = Some(self.sync);
-        self.mirror.peers = self.clock.caps().peers;
+        let caps = self.clock.caps();
+        self.mirror.peers = caps.peers;
+        self.mirror.can_set_tempo = caps.can_set_tempo;
+        self.mirror.can_set_phase = caps.can_set_phase;
         self.mirror.audio_devices = self.audio_devices.clone();
         self.mirror.current_device = Some(self.audio_capture.device_name.clone());
         self.mirror.shader_name = self

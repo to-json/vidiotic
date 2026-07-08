@@ -129,6 +129,10 @@ pub struct UiMirror {
     pub preserve_playhead: bool, // carry the playhead over on a cut vs. restart the incoming clip
     pub sync: Option<SyncKind>,
     pub peers: u64,
+    /// Whether the active clock source accepts tempo/phase edits. Link is
+    /// listen-only, so its controls (BPM, nudge, tap, downbeat) grey out.
+    pub can_set_tempo: bool,
+    pub can_set_phase: bool,
     pub audio_devices: Vec<Arc<str>>, // device names; the name doubles as the selection key
     pub current_device: Option<Arc<str>>,
     pub audio_error: Option<String>,
