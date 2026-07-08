@@ -253,14 +253,14 @@ fn cue_chip(
             }
 
             ui.horizontal(|ui| {
-                widgets::chip(ui, &trim_label(cue), None);
+                widgets::chip(ui, &trim_label(cue), None, false);
                 if let Some(p) = cue.preserve {
                     let (text, tint) =
                         if p { ("keep", PALETTE.playing) } else { ("cut", PALETTE.fg_muted) };
-                    widgets::chip(ui, text, Some(tint));
+                    widgets::chip(ui, text, Some(tint), false);
                 }
                 if cue.shader.is_some() {
-                    widgets::chip(ui, "fx", Some(PALETTE.accent));
+                    widgets::chip(ui, "fx", Some(PALETTE.accent), false);
                 }
             });
         });

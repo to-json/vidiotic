@@ -65,8 +65,17 @@ pub fn section_label(ui: &mut Ui, text: &str) -> Response {
     ui.label(egui::RichText::new(text.to_uppercase()).small().color(PALETTE.fg_muted))
 }
 
-/// Small rounded pill badge — cue metadata, the peers marker, error tags.
-pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>) {
+/// What happened to a [`chip`] this frame.
+pub struct ChipResponse {
+    pub clicked: bool,
+    pub removed: bool,
+    pub rect: Rect,
+}
+
+/// Small rounded pill badge — cue metadata, the peers marker, error tags,
+/// pinned shaders. When `removable`, a ✕ paints at the right edge on hover;
+/// its click reports as `removed`, separate from the chip's own `clicked`.
+pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> ChipResponse {
     let p = &PALETTE;
     let font = TextStyle::Small.resolve(ui.style());
     let (fill, text_color) = match tint {
@@ -75,9 +84,10 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>) {
     };
 
     let height = 18.0;
+    let close_w = if removable { 14.0 } else { 0.0 };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), text_color);
-    let size = egui::vec2(galley.size().x + SP_SM * 2.0, height);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let size = egui::vec2(galley.size().x + SP_SM * 2.0 + close_w, height);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
 
     let radius = CornerRadius::same((height / 2.0) as u8);
     ui.painter().rect_filled(rect, radius, fill);
@@ -88,6 +98,26 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>) {
         font,
         text_color,
     );
+
+    let mut removed = false;
+    if removable && resp.hovered() {
+        let close_rect = Rect::from_min_size(
+            egui::pos2(rect.max.x - close_w - 2.0, rect.min.y),
+            egui::vec2(close_w, height),
+        );
+        let close_resp = ui.interact(close_rect, resp.id.with("close"), Sense::click());
+        let color = if close_resp.hovered() { p.error } else { p.fg_muted };
+        ui.painter().text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "✕",
+            FontId::proportional(9.0),
+            color,
+        );
+        removed = close_resp.clicked();
+    }
+
+    ChipResponse { clicked: resp.clicked() && !removed, removed, rect }
 }
 
 /// What a [`media_tile`] needs painted: a clip pool tile or a cue chip.

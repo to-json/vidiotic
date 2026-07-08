@@ -223,7 +223,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             }
             if m.sync == Some(SyncKind::Link) && m.peers > 0 {
                 ui.add_space(SP_SM);
-                widgets::chip(ui, &format!("{} peers", m.peers), Some(PALETTE.playing));
+                widgets::chip(ui, &format!("{} peers", m.peers), Some(PALETTE.playing), false);
             }
         });
         ui.add_space(SP_SM);

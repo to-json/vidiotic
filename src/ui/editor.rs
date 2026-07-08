@@ -50,8 +50,8 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             ClipRole::Armed => ("armed", Some(PALETTE.armed)),
             ClipRole::None => ("idle", None),
         };
-        widgets::chip(ui, role_text, role_tint);
-        widgets::chip(ui, &format!("#{}", cue.id), None);
+        widgets::chip(ui, role_text, role_tint, false);
+        widgets::chip(ui, &format!("#{}", cue.id), None, false);
     });
     ui.label(
         egui::RichText::new(format!("⏱ {}", fmt_time(m.playhead_sec)))
