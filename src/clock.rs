@@ -141,6 +141,11 @@ impl ClockSource for InternalClock {
 /// in Performance mode speaks Link, as do Ableton Live and many apps. We always
 /// report `is_playing = true` — VJ visuals should keep running regardless of the
 /// session's transport (start/stop) state.
+///
+/// Listen-only: we capture the session state to read it but never commit, so a
+/// VJ visualizer can never hijack the DAW/DJ's master tempo or phase. All the
+/// mutating trait methods are deliberate no-ops and `caps()` reports the source
+/// as read-only, so the UI greys out the tempo/phase controls.
 pub struct LinkClock {
     link: rusty_link::AblLink,
     state: rusty_link::SessionState, // reusable scratch; capture fills it in place
@@ -173,43 +178,22 @@ impl ClockSource for LinkClock {
         }
     }
 
-    fn set_bpm(&mut self, bpm: f64) {
-        let t = self.link.clock_micros();
-        self.link.capture_app_session_state(&mut self.state);
-        self.state.set_tempo(bpm.clamp(BPM_MIN, BPM_MAX), t);
-        self.link.commit_app_session_state(&self.state);
-    }
+    // Listen-only: tempo and phase come from the session, so none of the
+    // mutators write to it. They stay as no-ops rather than panicking because
+    // the engine calls them generically for any source; `caps()` tells the UI
+    // to disable the controls that route here.
+    fn set_bpm(&mut self, _bpm: f64) {}
 
-    fn nudge_bpm(&mut self, ratio: f64) {
-        let t = self.link.clock_micros();
-        self.link.capture_app_session_state(&mut self.state);
-        let new = (self.state.tempo() * (1.0 + ratio)).clamp(BPM_MIN, BPM_MAX);
-        self.state.set_tempo(new, t);
-        self.link.commit_app_session_state(&self.state);
-    }
+    fn nudge_bpm(&mut self, _ratio: f64) {}
 
-    fn tap_downbeat(&mut self) {
-        let t = self.link.clock_micros();
-        self.link.capture_app_session_state(&mut self.state);
-        let beat = self.state.beat_at_time(t, self.quantum);
-        let target = (beat / self.quantum).round() * self.quantum;
-        self.state.request_beat_at_time(target, t, self.quantum);
-        self.link.commit_app_session_state(&self.state);
-    }
+    fn tap_downbeat(&mut self) {}
 
-    fn reset(&mut self) {
-        // Request the current instant be beat 0. With peers this shifts the
-        // whole session's grid — that's the intended meaning of a manual reset.
-        let t = self.link.clock_micros();
-        self.link.capture_app_session_state(&mut self.state);
-        self.state.request_beat_at_time(0.0, t, self.quantum);
-        self.link.commit_app_session_state(&self.state);
-    }
+    fn reset(&mut self) {}
 
     fn caps(&self) -> ClockCaps {
         ClockCaps {
-            can_set_tempo: true,
-            can_set_phase: true,
+            can_set_tempo: false,
+            can_set_phase: false,
             peers: self.link.num_peers(),
         }
     }
@@ -318,6 +302,20 @@ mod tests {
         assert!(s.is_playing);
         assert_eq!(s.quantum, 4.0);
         let _ = c.caps().peers;
+    }
+
+    #[test]
+    fn link_clock_is_listen_only() {
+        // Link must never write back to the session: it reports itself read-only
+        // (so the UI greys the tempo/phase controls) and its mutators are no-ops.
+        let mut c = LinkClock::new(128.0, 4.0);
+        assert!(!c.caps().can_set_tempo);
+        assert!(!c.caps().can_set_phase);
+        // Calling the mutators must not panic or commit anything.
+        c.set_bpm(200.0);
+        c.nudge_bpm(0.5);
+        c.tap_downbeat();
+        c.reset();
     }
 
     #[test]

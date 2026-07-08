@@ -134,40 +134,53 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                         .size(40.0)
                         .strong(),
                 );
-                ui.vertical(|ui| {
-                    let mut bpm = m.bpm;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut bpm)
-                                .speed(0.1)
-                                .range(20.0..=300.0)
-                                .fixed_decimals(1),
-                        )
-                        .changed()
-                    {
-                        let _ = tx.send(Command::SetBpm(bpm));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("−0.1%").clicked() {
-                            let _ = tx.send(Command::NudgeBpm(-0.001));
+                // Tempo edits are disabled for listen-only sources (Link): the
+                // readout above still tracks the followed tempo, but nothing here
+                // can write back to the session.
+                ui.add_enabled_ui(m.can_set_tempo, |ui| {
+                    ui.vertical(|ui| {
+                        let mut bpm = m.bpm;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut bpm)
+                                    .speed(0.1)
+                                    .range(20.0..=300.0)
+                                    .fixed_decimals(1),
+                            )
+                            .changed()
+                        {
+                            let _ = tx.send(Command::SetBpm(bpm));
                         }
-                        if ui.button("+0.1%").clicked() {
-                            let _ = tx.send(Command::NudgeBpm(0.001));
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("−0.1%").clicked() {
+                                let _ = tx.send(Command::NudgeBpm(-0.001));
+                            }
+                            if ui.button("+0.1%").clicked() {
+                                let _ = tx.send(Command::NudgeBpm(0.001));
+                            }
+                        });
                     });
                 });
             }
 
-            let downbeat_key = !ui.ctx().egui_wants_keyboard_input()
+            // Downbeat is a phase edit: greyed out (and the Space shortcut inert)
+            // when the source is listen-only, e.g. Link.
+            let downbeat_key = m.can_set_phase
+                && !ui.ctx().egui_wants_keyboard_input()
                 && ui.input(|i| i.key_pressed(egui::Key::Space));
-            if tap_button(
-                ui,
-                "downbeat",
-                "1",
-                PALETTE.fg_primary,
-                "Downbeat: snap to now (phase only, nearest bar). Key: t / Space",
-                downbeat_key,
-            ) {
+            if ui
+                .add_enabled_ui(m.can_set_phase, |ui| {
+                    tap_button(
+                        ui,
+                        "downbeat",
+                        "1",
+                        PALETTE.fg_primary,
+                        "Downbeat: snap to now (phase only, nearest bar). Key: t / Space",
+                        downbeat_key,
+                    )
+                })
+                .inner
+            {
                 let _ = tx.send(Command::TapDownbeat);
             }
             if tap_button(
@@ -191,14 +204,20 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             ) {
                 let _ = tx.send(Command::HardReset);
             }
-            if tap_button(
-                ui,
-                "tempo",
-                "♩",
-                PALETTE.fg_primary,
-                "Tap tempo: tap 2+ times to set BPM from the interval. Key: b",
-                false,
-            ) {
+            // Tap tempo sets BPM: disabled for listen-only sources (Link).
+            if ui
+                .add_enabled_ui(m.can_set_tempo, |ui| {
+                    tap_button(
+                        ui,
+                        "tempo",
+                        "♩",
+                        PALETTE.fg_primary,
+                        "Tap tempo: tap 2+ times to set BPM from the interval. Key: b",
+                        false,
+                    )
+                })
+                .inner
+            {
                 let _ = tx.send(Command::TapTempo);
             }
 
