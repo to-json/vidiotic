@@ -120,7 +120,7 @@ pub fn apply(ctx: &Context) {
         v.widgets.open.bg_stroke = Stroke::new(1.0, p.border);
         v.widgets.open.fg_stroke = Stroke::new(1.0, p.fg_primary);
 
-        style.spacing.item_spacing = egui::vec2(SP_MD, SP_SM + 2.0);
+        style.spacing.item_spacing = egui::vec2(SP_MD, SP_SM + SP_XS);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
         style.spacing.interact_size.y = 26.0;
 

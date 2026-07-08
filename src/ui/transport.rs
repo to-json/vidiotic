@@ -152,10 +152,18 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                             let _ = tx.send(Command::SetBpm(bpm));
                         }
                         ui.horizontal(|ui| {
-                            if ui.button("−0.1%").clicked() {
+                            if ui
+                                .button("−0.1%")
+                                .on_hover_text("Nudge tempo down for beat-matching drift. Key: [")
+                                .clicked()
+                            {
                                 let _ = tx.send(Command::NudgeBpm(-0.001));
                             }
-                            if ui.button("+0.1%").clicked() {
+                            if ui
+                                .button("+0.1%")
+                                .on_hover_text("Nudge tempo up for beat-matching drift. Key: ]")
+                                .clicked()
+                            {
                                 let _ = tx.send(Command::NudgeBpm(0.001));
                             }
                         });
@@ -236,7 +244,11 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 SyncKind::Internal => 0,
                 SyncKind::Link => 1,
             };
-            if let Some(i) = widgets::segmented(ui, "sync", &["Internal", "Link"], Some(sync_idx)) {
+            let sync_group =
+                ui.horizontal(|ui| widgets::segmented(ui, "sync", &["Internal", "Link"], Some(sync_idx)));
+            ui.interact(sync_group.response.rect, ui.id().with("sync_hover"), egui::Sense::hover())
+                .on_hover_text("Sync source: free-running Internal clock, or follow Ableton Link");
+            if let Some(i) = sync_group.inner {
                 let kind = if i == 0 { SyncKind::Internal } else { SyncKind::Link };
                 let _ = tx.send(Command::SetSyncSource(kind));
             }
@@ -248,7 +260,9 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         ui.add_space(SP_SM);
         // Cadence controls, in bars. `Next` = how often the sequencer advances to
         // the next active clip; `Loop` = how often the current clip restarts.
-        ui.horizontal(|ui| {
+        // Wrapped so this row folds before the tap-button row above it clips
+        // on a narrow window.
+        ui.horizontal_wrapped(|ui| {
             widgets::section_label(ui, "next every")
                 .on_hover_text("Beats between auto-transitions to the next active clip");
             let next_labels: Vec<&str> = CADENCE_BARS.iter().map(|(l, _)| *l).collect();

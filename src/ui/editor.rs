@@ -161,16 +161,22 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         .and_then(|id| m.shader_pool.iter().find(|s| s.id == id))
         .map(|s| &*s.name)
         .unwrap_or("Live shader");
-    egui::ComboBox::from_id_salt("cue_shader").selected_text(selected_name).show_ui(ui, |ui| {
-        if ui.selectable_label(cue.shader.is_none(), "Live shader").clicked() {
-            let _ = tx.send(Command::SetCueShader(cue.id, None));
-        }
-        for s in &m.shader_pool {
-            if ui.selectable_label(cue.shader == Some(s.id), s.name.as_ref()).clicked() {
-                let _ = tx.send(Command::SetCueShader(cue.id, Some(s.id)));
+    egui::ComboBox::from_id_salt("cue_shader")
+        .selected_text(selected_name)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(cue.shader.is_none(), "Live shader").clicked() {
+                let _ = tx.send(Command::SetCueShader(cue.id, None));
             }
-        }
-    });
+            for s in &m.shader_pool {
+                if ui.selectable_label(cue.shader == Some(s.id), s.name.as_ref()).clicked() {
+                    let _ = tx.send(Command::SetCueShader(cue.id, Some(s.id)));
+                }
+            }
+        })
+        .response
+        .on_hover_text(
+            "Override this cue's shader while it plays. Live shader follows whatever you're livecoding.",
+        );
     if m.shader_pool.is_empty() {
         ui.label(
             egui::RichText::new("No pinned shaders yet — “📌 Pin” the current shader below.")
@@ -183,7 +189,7 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         let remove = egui::Button::new(egui::RichText::new("Remove cue").color(PALETTE.error))
             .fill(PALETTE.error.linear_multiply(0.12))
             .min_size(egui::vec2(ui.available_width(), 0.0));
-        if ui.add(remove).clicked() {
+        if ui.add(remove).on_hover_text("Remove this cue from the bank").clicked() {
             let _ = tx.send(Command::RemoveCue(cue.id));
         }
         ui.add_space(SP_SM);

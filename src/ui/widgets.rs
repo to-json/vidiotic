@@ -88,6 +88,7 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> 
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), text_color);
     let size = egui::vec2(galley.size().x + SP_SM * 2.0 + close_w, height);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if resp.hovered() { fill.gamma_multiply(1.25) } else { fill };
 
     let radius = CornerRadius::same((height / 2.0) as u8);
     ui.painter().rect_filled(rect, radius, fill);

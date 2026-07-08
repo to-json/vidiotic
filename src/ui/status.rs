@@ -16,7 +16,11 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     egui::Panel::bottom(egui::Id::new("io")).show(ui, |ui| {
         ui.add_space(SP_SM);
         ui.horizontal(|ui| {
-            if ui.button("Shader…").clicked() {
+            if ui
+                .button("Shader…")
+                .on_hover_text("Load a GLSL/WGSL shader file to livecode")
+                .clicked()
+            {
                 pick_file(tx.clone(), PickKind::Shader);
             }
             let name_color = if m.shader_error.is_some() { PALETTE.error } else { PALETTE.fg_primary };
@@ -39,6 +43,8 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             let mut unpinned = None;
             for s in &m.shader_pool {
                 let resp = widgets::chip(ui, s.name.as_ref(), None, true);
+                ui.interact(resp.rect, ui.id().with(("pinned_shader_hover", s.id)), egui::Sense::hover())
+                    .on_hover_text("Pinned shader — available to any cue's shader override. Hover, then ✕ to unpin.");
                 if resp.removed {
                     unpinned = Some(s.id);
                 }
@@ -74,7 +80,9 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                                 let _ = tx.send(Command::SetAudioDevice(Some(name.to_string())));
                             }
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Audio input device");
             });
         });
 

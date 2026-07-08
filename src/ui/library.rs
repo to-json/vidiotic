@@ -24,7 +24,11 @@ pub(super) fn show(
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
             widgets::section_label(ui, "clips");
-            if ui.button("Folder…").clicked() {
+            if ui
+                .button("Folder…")
+                .on_hover_text("Pick a folder of video clips to fill the pool")
+                .clicked()
+            {
                 pick_file(tx.clone(), PickKind::ClipDir);
             }
             if let Some(d) = &m.clip_dir {
@@ -79,7 +83,11 @@ fn empty_state(ui: &mut Ui, headline: &str, sub: &str, folder_pick: Option<(&Sen
         ui.label(egui::RichText::new(sub).small().color(PALETTE.fg_muted));
         if let Some((tx, kind)) = folder_pick {
             ui.add_space(SP_SM);
-            if ui.button("Folder…").clicked() {
+            if ui
+                .button("Folder…")
+                .on_hover_text("Pick a folder of video clips to fill the pool")
+                .clicked()
+            {
                 pick_file(tx.clone(), kind);
             }
         }
@@ -229,6 +237,9 @@ fn cue_chip(
                 let _ = tx.send(Command::SelectCue(Some(cue.id)));
             }
             if resp.hovered {
+                let hover_id = ui.id().with(("cue_hover", cue.id));
+                ui.interact(resp.rect, hover_id, egui::Sense::hover())
+                    .on_hover_text("click to edit this cue");
                 let cross_rect = egui::Rect::from_min_size(
                     egui::pos2(resp.rect.max.x - 20.0, resp.rect.min.y + 2.0),
                     egui::vec2(18.0, 18.0),
