@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use egui::{Color32, Ui};
+use egui::{Color32, CornerRadius, FontId, Rect, Sense, TextStyle, Ui};
 
 use super::theme::{self, PALETTE, SP_MD, SP_SM};
 use super::widgets::{self, TileSpec};
 use super::{pick_file, PickKind};
-use crate::commands::{ClipEntry, ClipId, Command, CueView, UiMirror};
+use crate::commands::{BankView, ClipEntry, ClipId, Command, CueView, UiMirror};
 
 /// Central panel: the source clip pool, bank tabs, and the edit bank's cue list.
 pub(super) fn show(
@@ -115,34 +115,91 @@ fn clip_tile(
     }
 }
 
-/// The bank bar: pick which bank to edit, send one live, add a bank. `●` marks
-/// the live bank; the selected tab is the edit bank shown in the list below.
+/// The bank bar: custom-painted underline tabs to pick the edit bank, plus
+/// `＋` to add one. The live bank shows a small dot before its name; the
+/// edit bank (shown in the list below) gets an accent underline.
 fn bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     ui.horizontal(|ui| {
         widgets::section_label(ui, "banks");
         for (i, b) in m.banks.iter().enumerate() {
-            let live = i == m.live_bank;
-            let label = format!("{}{} ({})", if live { "● " } else { "" }, b.name, b.cue_count);
-            if ui
-                .selectable_label(i == m.edit_bank, label)
-                .on_hover_text("edit this bank (shown below)")
-                .clicked()
-            {
-                let _ = tx.send(Command::SetEditBank(i));
-            }
-            if !live
-                && ui
-                    .small_button("▶")
-                    .on_hover_text("play this bank (it takes over at the next phrase)")
-                    .clicked()
-            {
-                let _ = tx.send(Command::SetLiveBank(i));
-            }
+            bank_tab(ui, m, i, b, tx);
         }
         if ui.button("＋").on_hover_text("add a bank").clicked() {
             let _ = tx.send(Command::AddBank);
         }
     });
+}
+
+/// One bank tab: live dot, name, muted cue count, accent underline when this
+/// is the edit bank, and a hover-only `▶` (on non-live tabs) to send it live.
+fn bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &BankView, tx: &Sender<Command>) {
+    let p = &PALETTE;
+    let live = i == m.live_bank;
+    let selected = i == m.edit_bank;
+    let base_id = ui.id().with(("bank_tab", i));
+
+    let name_font = TextStyle::Body.resolve(ui.style());
+    let count_font = TextStyle::Small.resolve(ui.style());
+    let name_color = if selected { p.fg_primary } else { p.fg_secondary };
+    let name_galley = ui.painter().layout_no_wrap(bank.name.to_string(), name_font, name_color);
+    let count_galley =
+        ui.painter().layout_no_wrap(format!("({})", bank.cue_count), count_font, p.fg_muted);
+
+    let dot_w = if live { 10.0 } else { 0.0 };
+    let play_w = if live { 0.0 } else { 20.0 };
+    let content_w = dot_w + name_galley.size().x + SP_SM + count_galley.size().x + play_w;
+    let size = egui::vec2(content_w + SP_MD * 2.0, 26.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let resp =
+        ui.interact(rect, base_id, Sense::click()).on_hover_text("edit this bank (shown below)");
+
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), p.bg_elevated);
+    }
+
+    let mut x = rect.min.x + SP_MD;
+    if live {
+        ui.painter().circle_filled(egui::pos2(x + 3.0, rect.center().y), 2.5, p.playing);
+        x += dot_w;
+    }
+    let name_y = rect.center().y - name_galley.size().y * 0.5;
+    ui.painter().galley(egui::pos2(x, name_y), name_galley.clone(), name_color);
+    x += name_galley.size().x + SP_SM;
+    let count_y = rect.center().y - count_galley.size().y * 0.5;
+    ui.painter().galley(egui::pos2(x, count_y), count_galley, p.fg_muted);
+
+    if selected {
+        let underline = Rect::from_min_max(
+            egui::pos2(rect.min.x, rect.max.y - 2.0),
+            egui::pos2(rect.max.x, rect.max.y),
+        );
+        ui.painter().rect_filled(underline, CornerRadius::ZERO, p.accent);
+    }
+
+    if !live && resp.hovered() {
+        let play_rect = Rect::from_min_size(
+            egui::pos2(rect.max.x - play_w - SP_SM, rect.min.y + 3.0),
+            egui::vec2(play_w, 20.0),
+        );
+        let play_resp = ui
+            .interact(play_rect, base_id.with("play"), Sense::click())
+            .on_hover_text("play this bank (it takes over at the next phrase)");
+        let color = if play_resp.hovered() { p.fg_primary } else { p.fg_secondary };
+        ui.painter().text(
+            play_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "▶",
+            FontId::proportional(11.0),
+            color,
+        );
+        if play_resp.clicked() {
+            let _ = tx.send(Command::SetLiveBank(i));
+        }
+    }
+
+    if resp.clicked() {
+        let _ = tx.send(Command::SetEditBank(i));
+    }
 }
 
 /// A cue tile in the edit bank's list, plus a metadata chip row (trim,
