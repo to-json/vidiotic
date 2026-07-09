@@ -257,7 +257,7 @@ fn bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &BankView, tx: &Sender<Co
         );
         let play_resp = ui
             .interact(play_rect, base_id.with("play"), Sense::click())
-            .on_hover_text("play this bank (it takes over at the next phrase)");
+            .on_hover_text("play this bank (it takes over at the next phrase). Keys: , / . cycle live bank");
         let color = if play_resp.hovered() { p.fg_primary } else { p.fg_secondary };
         ui.painter().text(
             play_rect.center(),

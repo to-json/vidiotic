@@ -508,6 +508,17 @@ impl App {
         self.apply_seq_events(ev);
     }
 
+    /// Step the live bank by `delta`, wrapping around. No-op with fewer than
+    /// two banks. `set_live_bank` ignores a same-index target, so wrap is safe.
+    fn cycle_live_bank(&mut self, delta: i32) {
+        let n = self.banks.len();
+        if n < 2 {
+            return;
+        }
+        let next = (self.live_bank as i32 + delta).rem_euclid(n as i32) as usize;
+        self.set_live_bank(next);
+    }
+
     fn set_edit_bank(&mut self, i: usize) {
         if i >= self.banks.len() {
             return;
@@ -779,6 +790,7 @@ impl App {
             Command::RemoveShader(id) => self.remove_shader(id),
             Command::AddBank => self.add_bank(),
             Command::SetLiveBank(i) => self.set_live_bank(i),
+            Command::CycleLiveBank(d) => self.cycle_live_bank(d),
             Command::SetEditBank(i) => self.set_edit_bank(i),
             Command::SetClipDir(dir) => self.set_clip_dir(dir),
             Command::AddClipDirAsBank(dir) => self.add_clip_dir_as_bank(dir),
@@ -1194,6 +1206,12 @@ impl App {
                 }
                 "c" if !ev.repeat => {
                     let _ = tx.send(Command::CaptureShader);
+                }
+                "," if !ev.repeat => {
+                    let _ = tx.send(Command::CycleLiveBank(-1));
+                }
+                "." if !ev.repeat => {
+                    let _ = tx.send(Command::CycleLiveBank(1));
                 }
                 "f" if !ev.repeat => {
                     let _ = tx.send(Command::ToggleFullscreen);

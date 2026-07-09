@@ -60,6 +60,7 @@ pub enum Command {
     SetAdvancedMode(bool),             // gate per-cue timing/speed resolution + the extended UI
     AddBank,
     SetLiveBank(usize),                // which bank the sequencer plays
+    CycleLiveBank(i32),                // step the live bank by ±1, wrapping (keys , / .)
     SetEditBank(usize),                // which bank the UI edits
     // Shader pool: pin the current live shader's last-good compile so a cue can
     // use it while you keep livecoding the main shader.
