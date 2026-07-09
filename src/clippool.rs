@@ -24,6 +24,17 @@ pub struct Clip {
     pub bpm: Option<f64>,
 }
 
+/// A named group of clips over the flat pool, referenced by id. Purely a
+/// pool-grid filter — a clip may belong to several banks or none; `ClipId`s stay
+/// globally unique so cues reference clips regardless of grouping. `dir` is the
+/// source folder when the bank came from a scan (`None` for ad-hoc groupings).
+#[derive(Clone, Debug)]
+pub struct ClipBank {
+    pub name: Arc<str>,
+    pub dir: Option<PathBuf>,
+    pub clip_ids: Vec<ClipId>,
+}
+
 /// A decoded first-frame preview, delivered from the thumbnailer thread.
 pub struct Thumbnail {
     pub id: ClipId,
@@ -32,8 +43,15 @@ pub struct Thumbnail {
     pub rgba: Vec<u8>,
 }
 
-/// List video clips in `dir` (non-recursive), sorted by name, with stable ids.
+/// List video clips in `dir` (non-recursive), sorted by name, with stable ids
+/// starting at 0.
 pub fn scan(dir: &Path) -> Vec<Clip> {
+    scan_from(dir, 0)
+}
+
+/// Like [`scan`], but assign clip ids from `start_id` upward so several scanned
+/// directories can share one flat, globally-unique id space.
+pub fn scan_from(dir: &Path, start_id: ClipId) -> Vec<Clip> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -57,7 +75,7 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
                 .unwrap_or("clip")
                 .into();
             Clip {
-                id: i as ClipId,
+                id: start_id + i as ClipId,
                 path,
                 name,
                 bpm: None,

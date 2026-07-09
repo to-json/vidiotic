@@ -184,6 +184,7 @@ fn fmt_time(secs: f64) -> String {
 
 enum PickKind {
     ClipDir,
+    ClipBankDir,
     Shader,
 }
 
@@ -196,6 +197,14 @@ fn pick_file(tx: Sender<Command>, kind: PickKind) {
             std::thread::spawn(move || {
                 if let Some(h) = pollster::block_on(fut) {
                     let _ = tx.send(Command::SetClipDir(h.path().to_path_buf()));
+                }
+            });
+        }
+        PickKind::ClipBankDir => {
+            let fut = rfd::AsyncFileDialog::new().pick_folder();
+            std::thread::spawn(move || {
+                if let Some(h) = pollster::block_on(fut) {
+                    let _ = tx.send(Command::AddClipDirAsBank(h.path().to_path_buf()));
                 }
             });
         }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -6,8 +6,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use vidiotic::analysis::{self, AudioCtl, AudioFrame};
 use vidiotic::app::{self, Boot};
 use vidiotic::audio;
-use vidiotic::clippool;
+use vidiotic::bank::Bank;
+use vidiotic::clippool::{self, Clip, ClipBank};
 use vidiotic::commands::{ClipId, Command, SyncKind};
+use vidiotic::project;
 use vidiotic::transcode;
 
 const QUANTUM: f64 = 4.0;
@@ -42,9 +44,20 @@ struct RunArgs {
     #[arg(short = 'd', long)]
     clip_dir: Option<PathBuf>,
 
-    /// Fragment shader: .frag/.fs/.glsl (GLSL) or .wgsl.
+    /// A saved `.viproj` project: clips, clip banks, cue banks, and session
+    /// defaults. Mutually exclusive with --clip/--clip-dir.
+    #[arg(long)]
+    project: Option<PathBuf>,
+
+    /// When loading a --project whose clip files have moved, re-match missing
+    /// clips by name under this directory.
+    #[arg(long)]
+    relink_root: Option<PathBuf>,
+
+    /// Fragment shader: .frag/.fs/.glsl (GLSL) or .wgsl. Optional when a
+    /// --project supplies one; required otherwise.
     #[arg(short, long)]
-    shader: PathBuf,
+    shader: Option<PathBuf>,
 
     /// Initial BPM.
     #[arg(long, default_value_t = 120.0)]
@@ -91,8 +104,25 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_player(cli: RunArgs) -> anyhow::Result<()> {
-    // Build the clip pool: a directory, a single --clip, or both.
+/// The pool and session state assembled from either a `--project` file or the
+/// `--clip`/`--clip-dir` flags, before audio/window plumbing is attached.
+struct Loaded {
+    clips: Vec<Clip>,
+    clip_banks: Vec<ClipBank>,
+    cue_banks: Vec<Bank>,
+    auto_active: Vec<ClipId>,
+    bpm: f64,
+    phrase_len: u32,
+    sync: SyncKind,
+    preserve_playhead: bool,
+    loop_len: Option<u32>,
+    advanced: bool,
+    shader: PathBuf,
+}
+
+/// Build the pool from `--clip`/`--clip-dir`: a flat pool wrapped in one clip
+/// bank, no cue banks (the engine starts with a default empty bank).
+fn load_from_flags(cli: &RunArgs) -> anyhow::Result<Loaded> {
     let mut clips = Vec::new();
     if let Some(dir) = &cli.clip_dir {
         clips = clippool::scan(dir);
@@ -105,7 +135,7 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or("clip")
             .into();
-        clips.push(clippool::Clip {
+        clips.push(Clip {
             id,
             path: single.clone(),
             name,
@@ -115,10 +145,149 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
     }
     anyhow::ensure!(
         !clips.is_empty(),
-        "provide --clip <file> and/or --clip-dir <dir>"
+        "provide --clip <file>, --clip-dir <dir>, or --project <file.viproj>"
     );
-    let clip_dir = cli.clip_dir.clone();
-    let thumb_rx = Some(clippool::spawn_thumbnailer(clips.clone()));
+    let shader = cli
+        .shader
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--shader is required (or load a --project that supplies one)"))?;
+    // One clip bank covering the whole flat pool, named for the source folder.
+    let name: Arc<str> = cli
+        .clip_dir
+        .as_ref()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("clips")
+        .into();
+    let clip_banks = vec![ClipBank {
+        name,
+        dir: cli.clip_dir.clone(),
+        clip_ids: clips.iter().map(|c| c.id).collect(),
+    }];
+    Ok(Loaded {
+        clips,
+        clip_banks,
+        cue_banks: Vec::new(),
+        auto_active,
+        bpm: cli.bpm,
+        phrase_len: cli.phrase_len,
+        sync: match cli.sync {
+            SyncArg::Internal => SyncKind::Internal,
+            SyncArg::Link => SyncKind::Link,
+        },
+        preserve_playhead: true,
+        loop_len: None,
+        advanced: false,
+        shader,
+    })
+}
+
+/// Load a `.viproj`: resolve clip paths (relinking missing ones under
+/// `--relink-root` if given), then rebuild the flat pool, clip banks, and cue
+/// banks with fresh ids.
+fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
+    let project = project::load(path)?;
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut resolved = project::resolve(project, project_dir);
+
+    if !resolved.missing.is_empty() {
+        if let Some(root) = &cli.relink_root {
+            for cand in project::relink_by_root(&resolved, root) {
+                if let Some(found) = cand.found {
+                    project::apply_relink(&mut resolved, cand.clip_id, found);
+                }
+            }
+        }
+        if !resolved.missing.is_empty() {
+            let names: Vec<String> = resolved
+                .missing
+                .iter()
+                .filter_map(|id| resolved.project.clips.iter().find(|c| &c.id == id))
+                .map(|c| c.name.clone())
+                .collect();
+            anyhow::bail!(
+                "missing clip files (pass --relink-root <dir> to re-locate): {}",
+                names.join(", ")
+            );
+        }
+    }
+
+    let d = &resolved.project.defaults;
+    let clips: Vec<Clip> = resolved
+        .project
+        .clips
+        .iter()
+        .map(|spec| spec.to_clip(resolved.clip_paths[&spec.id].clone()))
+        .collect();
+    let clip_banks: Vec<ClipBank> = resolved
+        .project
+        .clip_banks
+        .iter()
+        .map(|b| ClipBank {
+            name: b.name.as_str().into(),
+            dir: None,
+            clip_ids: b.clip_ids.clone(),
+        })
+        .collect();
+    // Assign cue ids sequentially across all banks.
+    let mut next_cue = 1u32;
+    let cue_banks: Vec<Bank> = resolved
+        .project
+        .cue_banks
+        .iter()
+        .map(|cb| {
+            let cues = cb
+                .cues
+                .iter()
+                .map(|cs| {
+                    let id = next_cue;
+                    next_cue += 1;
+                    cs.to_cue(id)
+                })
+                .collect();
+            Bank {
+                name: cb.name.as_str().into(),
+                cues,
+            }
+        })
+        .collect();
+
+    // Shader: prefer the project's, fall back to --shader.
+    let shader = d
+        .shader_path
+        .as_ref()
+        .map(|s| project::resolve_path(project_dir, s))
+        .or_else(|| cli.shader.clone())
+        .ok_or_else(|| anyhow::anyhow!("project has no shader; pass --shader"))?;
+
+    Ok(Loaded {
+        clips,
+        clip_banks,
+        cue_banks,
+        auto_active: Vec::new(),
+        bpm: if d.bpm > 0.0 { d.bpm } else { cli.bpm },
+        phrase_len: if d.phrase_len > 0 { d.phrase_len } else { cli.phrase_len },
+        sync: match d.sync {
+            project::SyncSpec::Internal => SyncKind::Internal,
+            project::SyncSpec::Link => SyncKind::Link,
+        },
+        preserve_playhead: d.preserve_playhead,
+        loop_len: d.loop_len,
+        advanced: d.advanced,
+        shader,
+    })
+}
+
+fn run_player(cli: RunArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cli.project.is_none() || (cli.clip.is_none() && cli.clip_dir.is_none()),
+        "--project is mutually exclusive with --clip/--clip-dir"
+    );
+    let loaded = match &cli.project {
+        Some(path) => load_from_project(&cli, path)?,
+        None => load_from_flags(&cli)?,
+    };
+    let thumb_rx = Some(clippool::spawn_thumbnailer(loaded.clips.clone()));
 
     // Audio analysis handoff.
     let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded::<AudioCtl>();
@@ -140,19 +309,20 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
 
     let boot = Boot {
-        shader_path: cli.shader,
+        shader_path: loaded.shader,
         windowed: cli.windowed,
         monitor: cli.monitor,
-        bpm: cli.bpm,
+        bpm: loaded.bpm,
         quantum: QUANTUM,
-        phrase_len: cli.phrase_len,
-        initial_sync: match cli.sync {
-            SyncArg::Internal => SyncKind::Internal,
-            SyncArg::Link => SyncKind::Link,
-        },
-        clip_dir,
-        clips,
-        auto_active,
+        phrase_len: loaded.phrase_len,
+        initial_sync: loaded.sync,
+        clips: loaded.clips,
+        clip_banks: loaded.clip_banks,
+        cue_banks: loaded.cue_banks,
+        auto_active: loaded.auto_active,
+        preserve_playhead: loaded.preserve_playhead,
+        loop_len: loaded.loop_len,
+        advanced: loaded.advanced,
         thumb_rx,
         audio_out,
         audio_capture,

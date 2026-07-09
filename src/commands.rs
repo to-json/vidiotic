@@ -65,7 +65,9 @@ pub enum Command {
     // use it while you keep livecoding the main shader.
     CaptureShader,                     // pin the current live shader into the pool
     RemoveShader(ShaderId),            // drop a pinned shader (cues fall back to the live shader)
-    SetClipDir(PathBuf),
+    SetClipDir(PathBuf),                // replace the whole pool with one bank from this dir
+    AddClipDirAsBank(PathBuf),          // append this dir as a new clip bank (keeps existing clips/cues)
+    SetActiveClipBank(usize),           // which clip bank the pool grid shows
     SetShaderPath(PathBuf),
     SetAudioDevice(Option<String>), // id key; None = default
     ToggleFullscreen,               // shell-intercepted
@@ -104,6 +106,14 @@ pub struct ClipEntry {
     pub role: ClipRole,
     pub has_thumb: bool, // texture cached in the UI's thumbnail map
     pub bpm: Option<f64>, // source tempo metadata, if set
+    pub bank: usize,     // the clip bank this entry is shown under
+}
+
+/// A clip bank's identity for the clip-bank bar above the pool grid.
+#[derive(Clone, Debug)]
+pub struct ClipBankView {
+    pub name: Arc<str>,
+    pub clip_count: usize,
 }
 
 /// One cue of the edit bank, as shown in the sequencer section / editor.
@@ -170,8 +180,10 @@ pub struct UiMirror {
     pub audio_error: Option<String>,
     pub shader_name: Option<String>,
     pub shader_error: Option<Arc<str>>,
-    pub clip_dir: Option<String>,
-    pub clips: Vec<ClipEntry>,
+    pub clip_dir: Option<String>, // the active clip bank's source dir, for the header
+    pub clip_banks: Vec<ClipBankView>,
+    pub active_clip_bank: usize,
+    pub clips: Vec<ClipEntry>, // the active clip bank's clips, in id order
     // Cue banks.
     pub banks: Vec<BankView>,
     pub live_bank: usize,

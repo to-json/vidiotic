@@ -8,7 +8,7 @@ use egui::{Color32, CornerRadius, FontId, Rect, Sense, TextStyle, Ui};
 use super::theme::{self, PALETTE, SP_MD, SP_SM};
 use super::widgets::{self, TileSpec};
 use super::{pick_file, PickKind};
-use crate::commands::{BankView, ClipEntry, ClipId, Command, CueView, UiMirror};
+use crate::commands::{BankView, ClipBankView, ClipEntry, ClipId, Command, CueView, UiMirror};
 
 /// Central panel: the source clip pool, bank tabs, and the edit bank's cue list.
 pub(super) fn show(
@@ -35,6 +35,7 @@ pub(super) fn show(
                 ui.add(egui::Label::new(egui::RichText::new(d).small().color(PALETTE.fg_muted)).truncate());
             }
         });
+        clip_bank_bar(ui, m, tx);
         ui.weak("double-click a clip to add it as a cue to the edit bank");
         egui::ScrollArea::vertical()
             .id_salt("clip_pool")
@@ -120,6 +121,71 @@ fn clip_tile(
     }
     if resp.double_clicked {
         let _ = tx.send(Command::AddCue(clip.id));
+    }
+}
+
+/// The clip-bank bar: pick which clip bank (source folder) the pool grid shows,
+/// plus `＋` to add another folder as a new bank. Hidden until at least one bank
+/// exists. The clip-dir "Folder…" button replaces the pool; `＋` here appends.
+fn clip_bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    if m.clip_banks.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        for (i, b) in m.clip_banks.iter().enumerate() {
+            clip_bank_tab(ui, m, i, b, tx);
+        }
+        if ui
+            .button("＋")
+            .on_hover_text("add a folder as another clip bank")
+            .clicked()
+        {
+            pick_file(tx.clone(), PickKind::ClipBankDir);
+        }
+    });
+}
+
+/// One clip-bank tab: name + muted clip count, accent underline when active.
+fn clip_bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &ClipBankView, tx: &Sender<Command>) {
+    let p = &PALETTE;
+    let selected = i == m.active_clip_bank;
+    let base_id = ui.id().with(("clip_bank_tab", i));
+
+    let name_font = TextStyle::Body.resolve(ui.style());
+    let count_font = TextStyle::Small.resolve(ui.style());
+    let name_color = if selected { p.fg_primary } else { p.fg_secondary };
+    let name_galley = ui.painter().layout_no_wrap(bank.name.to_string(), name_font, name_color);
+    let count_galley =
+        ui.painter().layout_no_wrap(format!("({})", bank.clip_count), count_font, p.fg_muted);
+
+    let content_w = name_galley.size().x + SP_SM + count_galley.size().x;
+    let size = egui::vec2(content_w + SP_MD * 2.0, 24.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let resp = ui
+        .interact(rect, base_id, Sense::click())
+        .on_hover_text("show this clip bank in the pool");
+
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), p.bg_elevated);
+    }
+
+    let mut x = rect.min.x + SP_MD;
+    let name_y = rect.center().y - name_galley.size().y * 0.5;
+    ui.painter().galley(egui::pos2(x, name_y), name_galley.clone(), name_color);
+    x += name_galley.size().x + SP_SM;
+    let count_y = rect.center().y - count_galley.size().y * 0.5;
+    ui.painter().galley(egui::pos2(x, count_y), count_galley, p.fg_muted);
+
+    if selected {
+        let underline = Rect::from_min_max(
+            egui::pos2(rect.min.x, rect.max.y - 2.0),
+            egui::pos2(rect.max.x, rect.max.y),
+        );
+        ui.painter().rect_filled(underline, CornerRadius::ZERO, p.accent);
+    }
+
+    if resp.clicked() {
+        let _ = tx.send(Command::SetActiveClipBank(i));
     }
 }
 

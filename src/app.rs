@@ -19,11 +19,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::analysis::AudioFrame;
 use crate::audio::{self, AudioCapture};
 use crate::bank::{Bank, Cue, CueId};
-use crate::clippool::{self, Clip, Thumbnail};
+use crate::clippool::{self, Clip, ClipBank, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{
-    BankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView, ShaderPoolView, SyncKind,
-    UiMirror, LOOP_TICKS_PER_BEAT,
+    BankView, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView,
+    ShaderPoolView, SyncKind, UiMirror, LOOP_TICKS_PER_BEAT,
 };
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -51,9 +51,17 @@ pub struct Boot {
     pub quantum: f64,
     pub phrase_len: u32,
     pub initial_sync: SyncKind,
-    pub clip_dir: Option<PathBuf>,
     pub clips: Vec<Clip>,
+    /// Named groupings over `clips`; at least one bank should cover the pool or
+    /// the grid shows nothing. The non-project path passes a single bank.
+    pub clip_banks: Vec<ClipBank>,
+    /// Cue banks to seed the sequencer with; empty ⇒ one default bank "A".
+    pub cue_banks: Vec<Bank>,
     pub auto_active: Vec<ClipId>,
+    /// Session playback defaults (project load overrides the CLI defaults).
+    pub preserve_playhead: bool,
+    pub loop_len: Option<u32>,
+    pub advanced: bool,
     pub thumb_rx: Option<Receiver<Thumbnail>>,
     pub audio_out: triple_buffer::Output<AudioFrame>,
     pub audio_capture: AudioCapture,
@@ -79,7 +87,11 @@ pub struct App {
     quantum: f64,
     sequencer: Sequencer,
     clips: Vec<Clip>,
-    clip_dir: Option<PathBuf>,
+    // Clip banks group the flat pool for the UI; `ClipId`s stay globally unique
+    // so cues are unaffected. `active_clip_bank` is the one the grid shows.
+    clip_banks: Vec<ClipBank>,
+    active_clip_bank: usize,
+    next_clip_id: ClipId,
     thumb_rx: Option<Receiver<Thumbnail>>,
     // Cue banks: the sequencer plays `live_bank`; the UI edits `edit_bank` (they
     // can differ so you play one set while modifying another). Decoders and
@@ -153,6 +165,11 @@ pub struct App {
 
 impl App {
     pub fn new(boot: Boot) -> Self {
+        // A loaded project seeds cue banks; otherwise start with one empty "A".
+        let seeded = !boot.cue_banks.is_empty();
+        let next_clip_id = boot.clips.iter().map(|c| c.id).max().map_or(0, |m| m + 1);
+        let cue_banks = if seeded { boot.cue_banks } else { vec![Bank::new("A")] };
+        let next_cue_id = cue_banks.iter().flat_map(Bank::ids).max().map_or(1, |m| m + 1);
         let mut app = Self {
             graphics: None,
             renderer: None,
@@ -162,23 +179,25 @@ impl App {
             quantum: boot.quantum,
             sequencer: Sequencer::new(boot.phrase_len as f64),
             clips: boot.clips,
-            clip_dir: boot.clip_dir,
+            clip_banks: boot.clip_banks,
+            active_clip_bank: 0,
+            next_clip_id,
             thumb_rx: boot.thumb_rx,
-            banks: vec![Bank::new("A")],
+            banks: cue_banks,
             live_bank: 0,
             edit_bank: 0,
             selected_cue: None,
-            next_cue_id: 1,
+            next_cue_id,
             decoders: HashMap::new(),
             current: None,
             current_pts: 0.0,
             video_mode: 0,
             last_beat: 0.0,
             last_bpm: boot.bpm,
-            advanced: false,
-            loop_len: None,
+            advanced: boot.advanced,
+            loop_len: boot.loop_len,
             loop_tracker: BoundaryTracker::new(),
-            preserve_playhead: true,
+            preserve_playhead: boot.preserve_playhead,
             tap_times: Vec::new(),
             audio_out: boot.audio_out,
             audio_capture: boot.audio_capture,
@@ -206,9 +225,12 @@ impl App {
             control_occluded: false,
         };
         // Activate any clips requested at startup (e.g. from --clip): each becomes
-        // a default full-length cue in the live bank.
-        for id in boot.auto_active {
-            app.toggle_clip_active(id, 0.0);
+        // a default full-length cue in the live bank. Skipped when a project
+        // already seeded cue banks.
+        if !seeded {
+            for id in boot.auto_active {
+                app.toggle_clip_active(id, 0.0);
+            }
         }
         if boot.initial_sync == SyncKind::Link {
             app.set_sync_source(SyncKind::Link);
@@ -556,12 +578,23 @@ impl App {
         }
     }
 
+    /// Replace the entire pool with a single clip bank scanned from `dir`. Cues
+    /// referenced the old pool, so they are cleared. (The `＋` in the clip-bank
+    /// bar appends instead — see [`Self::add_clip_dir_as_bank`].)
     fn set_clip_dir(&mut self, dir: PathBuf) {
         let clips = clippool::scan(&dir);
         log::info!("clip pool: {} clips in {}", clips.len(), dir.display());
         self.thumb_rx = Some(clippool::spawn_thumbnailer(clips.clone()));
+        let clip_ids = clips.iter().map(|c| c.id).collect();
+        self.next_clip_id = clips.len() as ClipId;
         self.clips = clips;
-        self.clip_dir = Some(dir);
+        let name = dir_bank_name(&dir);
+        self.clip_banks = vec![ClipBank {
+            name,
+            dir: Some(dir),
+            clip_ids,
+        }];
+        self.active_clip_bank = 0;
         self.decoders.clear();
         self.current = None;
         // Cues referenced clips from the old pool; start fresh.
@@ -573,6 +606,37 @@ impl App {
         self.sequencer = Sequencer::new(self.sequencer.phrase_len());
         if let Some(egui) = self.egui.as_mut() {
             egui.clear_thumbnails();
+        }
+    }
+
+    /// Append `dir` as a new clip bank, extending the flat pool with fresh global
+    /// ids and thumbnailing only the added clips. Existing clips, cues, and
+    /// thumbnails are untouched; the new bank becomes active.
+    fn add_clip_dir_as_bank(&mut self, dir: PathBuf) {
+        let new = clippool::scan_from(&dir, self.next_clip_id);
+        if new.is_empty() {
+            log::warn!("no clips found in {}", dir.display());
+            return;
+        }
+        log::info!("clip bank: +{} clips from {}", new.len(), dir.display());
+        let clip_ids: Vec<ClipId> = new.iter().map(|c| c.id).collect();
+        self.next_clip_id = clip_ids.iter().max().map_or(self.next_clip_id, |m| m + 1);
+        // A single thumb_rx is polled each tick; the new receiver carries only the
+        // added clips, and already-cached thumbnails are kept (not cleared).
+        self.thumb_rx = Some(clippool::spawn_thumbnailer(new.clone()));
+        self.clips.extend(new);
+        let name = dir_bank_name(&dir);
+        self.clip_banks.push(ClipBank {
+            name,
+            dir: Some(dir),
+            clip_ids,
+        });
+        self.active_clip_bank = self.clip_banks.len() - 1;
+    }
+
+    fn set_active_clip_bank(&mut self, i: usize) {
+        if i < self.clip_banks.len() {
+            self.active_clip_bank = i;
         }
     }
 
@@ -717,6 +781,8 @@ impl App {
             Command::SetLiveBank(i) => self.set_live_bank(i),
             Command::SetEditBank(i) => self.set_edit_bank(i),
             Command::SetClipDir(dir) => self.set_clip_dir(dir),
+            Command::AddClipDirAsBank(dir) => self.add_clip_dir_as_bank(dir),
+            Command::SetActiveClipBank(i) => self.set_active_clip_bank(i),
             Command::SetShaderPath(p) => {
                 self.shader_path = p;
                 self.watcher = ShaderWatcher::new(&self.shader_path).ok();
@@ -913,13 +979,32 @@ impl App {
             .as_ref()
             .and_then(|r| r.shader_error())
             .cloned();
+        // The pool grid shows one clip bank at a time; the clip-bank bar lists
+        // them all. Cues still resolve against the full flat pool (via ClipId),
+        // so playing/armed marking works across banks.
+        let active = self.active_clip_bank;
+        let clip_ids: Vec<ClipId> = self
+            .clip_banks
+            .get(active)
+            .map(|b| b.clip_ids.clone())
+            .unwrap_or_default();
         self.mirror.clip_dir = self
-            .clip_dir
-            .as_ref()
+            .clip_banks
+            .get(active)
+            .and_then(|b| b.dir.as_ref())
             .map(|d| d.display().to_string());
-        self.mirror.clips = self
-            .clips
+        self.mirror.clip_banks = self
+            .clip_banks
             .iter()
+            .map(|b| ClipBankView {
+                name: b.name.clone(),
+                clip_count: b.clip_ids.len(),
+            })
+            .collect();
+        self.mirror.active_clip_bank = active;
+        self.mirror.clips = clip_ids
+            .iter()
+            .filter_map(|&id| self.clips.iter().find(|c| c.id == id))
             .map(|c| ClipEntry {
                 id: c.id,
                 name: c.name.clone(),
@@ -933,6 +1018,7 @@ impl App {
                 },
                 has_thumb: has_thumb(c.id),
                 bpm: c.bpm,
+                bank: active,
             })
             .collect();
         // Cue banks: the bank bar, and the edit bank's cues (with live roles).
@@ -1155,6 +1241,14 @@ fn normalize_cue_trim(cue: &mut Cue) {
     if cue.out_sec.is_some_and(|o| o <= cue.in_sec) {
         cue.out_sec = None;
     }
+}
+
+/// A clip bank's display name from its source directory (the folder's own name).
+fn dir_bank_name(dir: &std::path::Path) -> std::sync::Arc<str> {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clips")
+        .into()
 }
 
 fn pick_monitor_from_window(window: &Window, index: Option<usize>) -> Option<MonitorHandle> {
