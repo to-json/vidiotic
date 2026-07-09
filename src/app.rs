@@ -1186,6 +1186,15 @@ impl App {
                 "]" => {
                     let _ = tx.send(Command::NudgeBpm(0.001));
                 }
+                "r" if !ev.repeat => {
+                    let _ = tx.send(Command::SoftReset);
+                }
+                "R" if !ev.repeat => {
+                    let _ = tx.send(Command::HardReset);
+                }
+                "c" if !ev.repeat => {
+                    let _ = tx.send(Command::CaptureShader);
+                }
                 "f" if !ev.repeat => {
                     let _ = tx.send(Command::ToggleFullscreen);
                 }

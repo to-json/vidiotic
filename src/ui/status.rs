@@ -33,7 +33,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 .button("📌 Pin")
                 .on_hover_text(
                     "Pin the current shader's last good compile into the pool so a \
-                     cue can use it while you keep livecoding this one.",
+                     cue can use it while you keep livecoding this one. Key: c",
                 )
                 .clicked()
             {

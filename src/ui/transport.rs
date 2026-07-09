@@ -184,7 +184,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 "soft_reset",
                 "↺",
                 PALETTE.fg_primary,
-                "Soft reset: clock to bar 1, beat 1. Playlist position and playhead unchanged.",
+                "Soft reset: clock to bar 1, beat 1. Playlist position and playhead unchanged. Key: r",
                 false,
             ) {
                 let _ = tx.send(Command::SoftReset);
@@ -195,7 +195,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 "⏮",
                 PALETTE.error,
                 "Hard reset: soft reset, AND jump the playlist back to its first cue \
-                 and restart its playhead from the in-point.",
+                 and restart its playhead from the in-point. Key: Shift+r",
                 false,
             ) {
                 let _ = tx.send(Command::HardReset);
