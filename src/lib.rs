@@ -9,6 +9,7 @@ pub mod clippool;
 pub mod clock;
 pub mod commands;
 pub mod gfx;
+pub mod project;
 pub mod render;
 pub mod sequencer;
 pub mod shader;

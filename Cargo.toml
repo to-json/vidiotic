@@ -43,6 +43,7 @@ egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false, features = ["links"] }
 rfd = "0.15"
 rusty_link = "0.4"
+nanoserde = "0.2"
 
 # A curated subset of clippy's pedantic tier. The blanket tier is not enabled:
 # the numeric-cast lints are noise in graphics/DSP code, and the must-use /

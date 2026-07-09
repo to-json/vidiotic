@@ -1,0 +1,552 @@
+//! The vidiotic project save format (`.viproj`, RON on disk).
+//!
+//! On-disk "spec" types are deliberately decoupled from the runtime types
+//! (`clippool::Clip`, `bank::Cue`, `bank::Bank`): the file owns a stable, flat
+//! clip-id space and flattens the runtime `Toggle<T>` knobs to `Option<T>`, so
+//! the format can evolve without dragging the engine's in-memory representation
+//! along. Both the player (vidiotic) and the authoring tool (vidiotic-prep) load
+//! and save through this one module, so the format has a single source of truth.
+//!
+//! Serialization is `nanoserde` (RON) — no `serde`/`serde_derive` proc-macro. A
+//! `.viproj` is read once per open and written once per save, never in a hot
+//! loop, so parser speed is irrelevant; RON is chosen for hand-edit ergonomics
+//! (comments, native int/float literals, terse enums).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use nanoserde::{DeRon, SerRon};
+
+use crate::bank::{Cue, CueId, Toggle};
+use crate::clippool::Clip;
+use crate::commands::ClipId;
+
+/// Bumped on any breaking change to the on-disk shape; [`load`] routes older
+/// files through [`migrate`].
+pub const FORMAT_VERSION: u32 = 1;
+
+/// A whole saved session: a flat clip pool, named clip-bank groupings over it,
+/// and the cue banks the sequencer plays.
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct Project {
+    #[nserde(default)]
+    pub version: u32,
+    #[nserde(default)]
+    pub defaults: SessionDefaults,
+    /// Flat, global clip pool. `ClipSpec::id` is the stable handle cue/clip-bank
+    /// specs reference.
+    pub clips: Vec<ClipSpec>,
+    /// Named groupings over `clips[].id` — a UI filter, not an ownership tree
+    /// (an id may appear in several banks, or none).
+    pub clip_banks: Vec<ClipBankSpec>,
+    pub cue_banks: Vec<CueBankSpec>,
+}
+
+/// Session-wide playback defaults; mirrors the engine's global knobs.
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
+pub struct SessionDefaults {
+    pub bpm: f64,
+    pub quantum: f64,
+    pub phrase_len: u32,
+    #[nserde(default)]
+    pub sync: SyncSpec,
+    #[nserde(default)]
+    pub preserve_playhead: bool,
+    /// Forced re-loop grid in 1/32-beat ticks; `None` = loop on EOF only.
+    #[nserde(default)]
+    pub loop_len: Option<u32>,
+    #[nserde(default)]
+    pub advanced: bool,
+    /// The live (livecoded) shader file; relative-to-project or absolute.
+    #[nserde(default)]
+    pub shader_path: Option<String>,
+}
+
+/// One source clip. `path` is relative to the `.viproj`'s directory, or
+/// absolute; [`resolve`] turns it into a concrete path and flags misses.
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct ClipSpec {
+    pub id: ClipId,
+    pub path: String,
+    pub name: String,
+    #[nserde(default)]
+    pub bpm: Option<f64>,
+    #[nserde(default)]
+    pub fps: Option<f64>,
+    #[nserde(default)]
+    pub frames: Option<u64>,
+    #[nserde(default)]
+    pub duration_sec: Option<f64>,
+    /// If this clip was baked from a span of a larger source, how it was cut.
+    #[nserde(default)]
+    pub source: Option<SpanProvenance>,
+}
+
+/// How a baked clip was carved out of its pre-transcode original — informational
+/// and enough to re-bake. `out_frame` is exclusive.
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct SpanProvenance {
+    pub original_path: String,
+    pub in_frame: u64,
+    pub out_frame: u64,
+    pub in_sec: f64,
+    pub out_sec: f64,
+}
+
+/// A named group of clips, referenced by id. Purely a pool-grid filter.
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct ClipBankSpec {
+    pub name: String,
+    pub clip_ids: Vec<ClipId>,
+}
+
+/// A named, ordered set of cues — the on-disk form of a [`crate::bank::Bank`].
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct CueBankSpec {
+    pub name: String,
+    pub cues: Vec<CueSpec>,
+}
+
+/// A cue placement. Runtime `Toggle<T>` advanced knobs are flattened to
+/// `Option<T>` (`None` = off; the toggle's retained-off value is not persisted).
+/// The per-cue shader override is intentionally absent in v1 — pinned/livecoded
+/// shaders have no stable persistence handle.
+#[derive(SerRon, DeRon, Clone, Debug)]
+pub struct CueSpec {
+    pub clip: ClipId,
+    #[nserde(default)]
+    pub name: String,
+    #[nserde(default)]
+    pub in_sec: f64,
+    #[nserde(default)]
+    pub out_sec: Option<f64>,
+    #[nserde(default)]
+    pub preserve: Option<bool>,
+    #[nserde(default)]
+    pub dwell: Option<u32>,
+    #[nserde(default)]
+    pub loop_len: Option<u32>,
+    #[nserde(default)]
+    pub loop_phase: Option<i32>,
+    #[nserde(default)]
+    pub start_nudge: Option<f64>,
+    #[nserde(default)]
+    pub trig_delay: Option<u32>,
+    #[nserde(default)]
+    pub bpm: Option<f64>,
+    #[nserde(default)]
+    pub bpm_sync_on: bool,
+    #[nserde(default)]
+    pub speed_mul: Option<f64>,
+}
+
+/// On-disk mirror of [`crate::commands::SyncKind`], kept separate so the format
+/// does not depend on the command enum's layout.
+#[derive(SerRon, DeRon, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncSpec {
+    #[default]
+    Internal,
+    Link,
+}
+
+// --- load / save ---------------------------------------------------------
+
+/// Serialize `p` to RON and write it to `path`.
+///
+/// # Errors
+/// Propagates the file write failure.
+pub fn save(p: &Project, path: &Path) -> anyhow::Result<()> {
+    std::fs::write(path, p.serialize_ron())?;
+    Ok(())
+}
+
+/// Read and parse a `.viproj`, then run version migrations.
+///
+/// # Errors
+/// Propagates read failures and RON parse errors.
+pub fn load(path: &Path) -> anyhow::Result<Project> {
+    let text = std::fs::read_to_string(path)?;
+    let mut p = Project::deserialize_ron(&text)
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+    migrate(&mut p);
+    Ok(p)
+}
+
+/// Upgrade an older `Project` in place. A `version` of 0 (a file with no version
+/// field, or a pre-versioning file) is treated as the current version.
+fn migrate(p: &mut Project) {
+    if p.version == 0 {
+        p.version = FORMAT_VERSION;
+    }
+    // Future breaking changes add their fix-ups here, keyed on p.version.
+}
+
+// --- path resolution -----------------------------------------------------
+
+/// Resolve a stored clip path against the project directory: absolute paths pass
+/// through, relative ones join `project_dir`.
+pub fn resolve_path(project_dir: &Path, stored: &str) -> PathBuf {
+    let p = Path::new(stored);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        project_dir.join(p)
+    }
+}
+
+/// Store `abs` relative to `project_dir` when it lives under it; otherwise keep
+/// it absolute. Returns a forward-slash string suitable for the `.viproj`.
+pub fn relativize(project_dir: &Path, abs: &Path) -> String {
+    abs.strip_prefix(project_dir)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
+}
+
+// --- resolved form (shared by both apps) --------------------------------
+
+/// A loaded project with each clip id resolved to a concrete path, plus the set
+/// of ids whose file is currently missing (candidates for relinking).
+#[derive(Clone, Debug)]
+pub struct ResolvedProject {
+    pub project: Project,
+    pub project_dir: PathBuf,
+    pub clip_paths: HashMap<ClipId, PathBuf>,
+    pub missing: Vec<ClipId>,
+}
+
+/// Resolve every clip path and record which ones do not exist on disk.
+pub fn resolve(project: Project, project_dir: &Path) -> ResolvedProject {
+    let mut clip_paths = HashMap::new();
+    let mut missing = Vec::new();
+    for c in &project.clips {
+        let path = resolve_path(project_dir, &c.path);
+        if !path.exists() {
+            missing.push(c.id);
+        }
+        clip_paths.insert(c.id, path);
+    }
+    ResolvedProject {
+        project,
+        project_dir: project_dir.to_path_buf(),
+        clip_paths,
+        missing,
+    }
+}
+
+// --- relink --------------------------------------------------------------
+
+/// A missing clip and the best re-match found under a candidate root.
+#[derive(Clone, Debug)]
+pub struct RelinkCandidate {
+    pub clip_id: ClipId,
+    pub name: String,
+    pub found: Option<PathBuf>,
+}
+
+/// For each missing clip, look for a file with the same base name anywhere under
+/// `new_root`. Does not mutate; the caller applies chosen matches via
+/// [`apply_relink`].
+pub fn relink_by_root(r: &ResolvedProject, new_root: &Path) -> Vec<RelinkCandidate> {
+    let mut by_name: HashMap<String, PathBuf> = HashMap::new();
+    let mut stack = vec![new_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // First match wins; a shallower directory is popped later, but
+                // any hit is a reasonable candidate for the user to confirm.
+                by_name.entry(name.to_owned()).or_insert(path.clone());
+            }
+        }
+    }
+    r.missing
+        .iter()
+        .map(|&id| {
+            let spec = r.project.clips.iter().find(|c| c.id == id);
+            let name = spec.map(|c| c.name.clone()).unwrap_or_default();
+            let base = spec
+                .and_then(|c| Path::new(&c.path).file_name().and_then(|n| n.to_str()))
+                .map(str::to_owned)
+                .unwrap_or_else(|| name.clone());
+            RelinkCandidate {
+                clip_id: id,
+                name,
+                found: by_name.get(&base).cloned(),
+            }
+        })
+        .collect()
+}
+
+/// Point a clip at a new file: update its resolved path and drop it from
+/// `missing`. Also rewrites the stored `ClipSpec.path` so a subsequent save
+/// persists the relink.
+pub fn apply_relink(r: &mut ResolvedProject, clip_id: ClipId, path: PathBuf) {
+    let stored = relativize(&r.project_dir, &path);
+    if let Some(spec) = r.project.clips.iter_mut().find(|c| c.id == clip_id) {
+        spec.path = stored;
+    }
+    r.clip_paths.insert(clip_id, path);
+    r.missing.retain(|&id| id != clip_id);
+}
+
+// --- gather --------------------------------------------------------------
+
+/// Copy every resolved clip into `dest_dir/clips/` and return a new `Project`
+/// whose clip paths are rewritten relative (`clips/<name>`), making the folder
+/// self-contained. Clips still missing are left with their original path.
+///
+/// # Errors
+/// Propagates directory-creation and copy failures.
+pub fn gather(r: &ResolvedProject, dest_dir: &Path) -> anyhow::Result<Project> {
+    let clips_dir = dest_dir.join("clips");
+    std::fs::create_dir_all(&clips_dir)?;
+    let mut project = r.project.clone();
+    let mut used: HashMap<String, ClipId> = HashMap::new();
+    for spec in &mut project.clips {
+        let Some(src) = r.clip_paths.get(&spec.id) else {
+            continue;
+        };
+        if !src.exists() {
+            continue;
+        }
+        // Dedupe file names across clips: on collision, prefix the id.
+        let base = Path::new(&spec.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("clip{}.mov", spec.id));
+        let file_name = match used.get(&base) {
+            Some(_) => format!("{}_{base}", spec.id),
+            None => base.clone(),
+        };
+        used.insert(base, spec.id);
+        std::fs::copy(src, clips_dir.join(&file_name))?;
+        spec.path = format!("clips/{file_name}");
+    }
+    Ok(project)
+}
+
+// --- conversions ---------------------------------------------------------
+
+/// Probe metadata attached to a clip when authoring a spec.
+#[derive(Clone, Debug, Default)]
+pub struct ClipMeta {
+    pub fps: Option<f64>,
+    pub frames: Option<u64>,
+    pub duration_sec: Option<f64>,
+    pub source: Option<SpanProvenance>,
+}
+
+impl ClipSpec {
+    /// Build a spec from a runtime clip, storing its path relative to
+    /// `project_dir` where possible.
+    pub fn from_clip(c: &Clip, project_dir: &Path, meta: ClipMeta) -> Self {
+        Self {
+            id: c.id,
+            path: relativize(project_dir, &c.path),
+            name: c.name.to_string(),
+            bpm: c.bpm,
+            fps: meta.fps,
+            frames: meta.frames,
+            duration_sec: meta.duration_sec,
+            source: meta.source,
+        }
+    }
+
+    /// Build a runtime clip from a spec with its already-resolved absolute path.
+    pub fn to_clip(&self, resolved: PathBuf) -> Clip {
+        Clip {
+            id: self.id,
+            path: resolved,
+            name: self.name.as_str().into(),
+            bpm: self.bpm,
+        }
+    }
+}
+
+impl CueSpec {
+    /// Snapshot a runtime cue. Drops the runtime `id` (reassigned on load) and
+    /// the shader override; maps each `Toggle` to `Some(val)` only when on.
+    pub fn from_cue(c: &Cue) -> Self {
+        Self {
+            clip: c.clip,
+            name: c.name.to_string(),
+            in_sec: c.in_sec,
+            out_sec: c.out_sec,
+            preserve: c.preserve,
+            dwell: c.dwell,
+            loop_len: c.loop_len,
+            loop_phase: c.loop_phase.on.then_some(c.loop_phase.val),
+            start_nudge: c.start_nudge.on.then_some(c.start_nudge.val),
+            trig_delay: c.trig_delay.on.then_some(c.trig_delay.val),
+            bpm: c.bpm,
+            bpm_sync_on: c.bpm_sync_on,
+            speed_mul: c.speed_mul.on.then_some(c.speed_mul.val),
+        }
+    }
+
+    /// Rebuild a runtime cue with the caller-assigned `id`. Absent toggles come
+    /// back off, carrying the same retained defaults as [`Cue::new`].
+    pub fn to_cue(&self, id: CueId) -> Cue {
+        Cue {
+            id,
+            clip: self.clip,
+            name: self.name.as_str().into(),
+            in_sec: self.in_sec,
+            out_sec: self.out_sec,
+            preserve: self.preserve,
+            shader: None,
+            dwell: self.dwell,
+            loop_len: self.loop_len,
+            loop_phase: toggle(self.loop_phase, 0),
+            start_nudge: toggle(self.start_nudge, 0.0),
+            trig_delay: toggle(self.trig_delay, 0),
+            bpm: self.bpm,
+            bpm_sync_on: self.bpm_sync_on,
+            speed_mul: toggle(self.speed_mul, 1.0),
+        }
+    }
+}
+
+/// `Some(v)` → an on toggle carrying `v`; `None` → off carrying `default`.
+fn toggle<T>(opt: Option<T>, default: T) -> Toggle<T> {
+    match opt {
+        Some(val) => Toggle { on: true, val },
+        None => Toggle { on: false, val: default },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Project {
+        Project {
+            version: FORMAT_VERSION,
+            defaults: SessionDefaults {
+                bpm: 128.0,
+                quantum: 4.0,
+                phrase_len: 16,
+                sync: SyncSpec::Link,
+                preserve_playhead: true,
+                loop_len: Some(128),
+                advanced: false,
+                shader_path: Some("shaders/demo.frag".into()),
+            },
+            clips: vec![ClipSpec {
+                id: 0,
+                path: "clips/kick.mov".into(),
+                name: "kick.mov".into(),
+                bpm: Some(128.0),
+                fps: Some(30.0),
+                frames: Some(64),
+                duration_sec: Some(2.133),
+                source: Some(SpanProvenance {
+                    original_path: "/src/drums.mov".into(),
+                    in_frame: 10,
+                    out_frame: 74,
+                    in_sec: 0.333,
+                    out_sec: 2.466,
+                }),
+            }],
+            clip_banks: vec![ClipBankSpec {
+                name: "drums".into(),
+                clip_ids: vec![0],
+            }],
+            cue_banks: vec![CueBankSpec {
+                name: "A".into(),
+                cues: vec![CueSpec {
+                    clip: 0,
+                    name: "kick".into(),
+                    in_sec: 0.0,
+                    out_sec: Some(2.0),
+                    preserve: Some(false),
+                    dwell: Some(64),
+                    loop_len: None,
+                    loop_phase: Some(-4),
+                    start_nudge: None,
+                    trig_delay: None,
+                    bpm: Some(128.0),
+                    bpm_sync_on: true,
+                    speed_mul: Some(1.5),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn round_trips_through_ron() {
+        let p = sample();
+        let text = p.serialize_ron();
+        let back = Project::deserialize_ron(&text).expect("parse");
+        assert_eq!(back.version, p.version);
+        assert_eq!(back.clips.len(), 1);
+        assert_eq!(back.clips[0].name, "kick.mov");
+        assert_eq!(back.clips[0].source.as_ref().unwrap().in_frame, 10);
+        assert_eq!(back.clip_banks[0].clip_ids, vec![0]);
+        assert_eq!(back.defaults.sync, SyncSpec::Link);
+        let cue = &back.cue_banks[0].cues[0];
+        assert_eq!(cue.loop_phase, Some(-4));
+        assert_eq!(cue.start_nudge, None);
+        assert_eq!(cue.speed_mul, Some(1.5));
+    }
+
+    #[test]
+    fn cue_toggle_round_trip() {
+        let cue = sample().cue_banks[0].cues[0].clone();
+        let runtime = cue.to_cue(7);
+        assert_eq!(runtime.id, 7);
+        assert!(runtime.loop_phase.on && runtime.loop_phase.val == -4);
+        assert!(!runtime.start_nudge.on && runtime.start_nudge.val == 0.0);
+        assert!(runtime.speed_mul.on && runtime.speed_mul.val == 1.5);
+        let back = CueSpec::from_cue(&runtime);
+        assert_eq!(back.loop_phase, Some(-4));
+        assert_eq!(back.start_nudge, None);
+        assert_eq!(back.speed_mul, Some(1.5));
+    }
+
+    #[test]
+    fn missing_default_version_is_current() {
+        // A hand-written file with no `version` field parses and migrates to 1.
+        let text = r#"(
+            defaults: (bpm: 120.0, quantum: 4.0, phrase_len: 16),
+            clips: [],
+            clip_banks: [],
+            cue_banks: [],
+        )"#;
+        let mut p = Project::deserialize_ron(text).expect("parse hand-written");
+        migrate(&mut p);
+        assert_eq!(p.version, FORMAT_VERSION);
+        assert!(p.clips.is_empty());
+    }
+
+    #[test]
+    fn resolve_flags_missing_and_relinks() {
+        let dir = std::env::temp_dir().join("vidiotic_proj_test_relink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("moved")).unwrap();
+        // The project points at clips/kick.mov (absent); the real file is under moved/.
+        std::fs::write(dir.join("moved/kick.mov"), b"x").unwrap();
+
+        let mut project = sample();
+        project.clips[0].source = None;
+        let r = resolve(project, &dir);
+        assert_eq!(r.missing, vec![0]);
+
+        let cands = relink_by_root(&r, &dir.join("moved"));
+        assert_eq!(cands.len(), 1);
+        let found = cands[0].found.clone().expect("re-matched kick.mov");
+
+        let mut r = r;
+        apply_relink(&mut r, 0, found);
+        assert!(r.missing.is_empty());
+        assert!(r.clip_paths[&0].ends_with("moved/kick.mov"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
