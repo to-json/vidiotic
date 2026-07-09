@@ -1340,8 +1340,13 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::ModifiersChanged(m) if is_output => self.modifiers = m,
-            WindowEvent::KeyboardInput { event, .. } if is_output => self.handle_key(&event),
+            // Keyboard shortcuts are honored from either window. Control-window
+            // key events only reach here when egui didn't consume them above
+            // (i.e. no text field is focused), so typing still wins.
+            WindowEvent::ModifiersChanged(m) if is_output || is_control => self.modifiers = m,
+            WindowEvent::KeyboardInput { event, .. } if is_output || is_control => {
+                self.handle_key(&event)
+            }
             WindowEvent::Occluded(occluded) if is_output => self.output_occluded = occluded,
             WindowEvent::Occluded(occluded) if is_control => self.control_occluded = occluded,
             WindowEvent::RedrawRequested if is_output => self.render_output(),
