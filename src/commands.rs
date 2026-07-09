@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::bank::CueId;
+use crate::bank::{CueId, Toggle};
 
 /// Identifies a source clip in the pool (its scan index).
 pub type ClipId = u32;
@@ -54,6 +54,10 @@ pub enum Command {
     SetCueOutToPlayhead(CueId),        // snap out-point to the displayed playhead
     SetCuePreserve(CueId, Option<bool>), // per-cue preserve override; None = inherit global
     SetCueShader(CueId, Option<ShaderId>), // per-cue shader override; None = the live shader
+    SetCueParam(CueId, CueParam),      // one advanced per-cue timing/speed knob
+    MoveCue(CueId, usize),             // reorder within the edit bank to a target index (drag / ◀▶)
+    SetClipBpm(ClipId, Option<f64>),   // source-clip tempo metadata; None clears it
+    SetAdvancedMode(bool),             // gate per-cue timing/speed resolution + the extended UI
     AddBank,
     SetLiveBank(usize),                // which bank the sequencer plays
     SetEditBank(usize),                // which bank the UI edits
@@ -66,6 +70,21 @@ pub enum Command {
     SetAudioDevice(Option<String>), // id key; None = default
     ToggleFullscreen,               // shell-intercepted
     Quit,
+}
+
+/// One advanced per-cue knob, edited via [`Command::SetCueParam`]. Mirrors the
+/// advanced fields on [`crate::bank::Cue`]; ticks are 1/32-beat
+/// ([`LOOP_TICKS_PER_BEAT`]).
+#[derive(Clone, Copy, Debug)]
+pub enum CueParam {
+    Dwell(Option<u32>),        // beats-until-advance in ticks; None = inherit global
+    Loop(Option<u32>),         // re-loop grid in ticks; None = inherit global
+    LoopPhase(Toggle<i32>),    // loop-grid micro-timing, signed ticks
+    StartNudge(Toggle<f64>),   // in-point nudge, seconds
+    TrigDelay(Toggle<u32>),    // swap-in lead-in, ticks
+    Bpm(Option<f64>),          // source tempo override; None = inherit clip
+    BpmSync(bool),             // retime to session tempo
+    SpeedMul(Toggle<f64>),     // user speed multiplier
 }
 
 /// A clip/cue's live-playback role, for UI markers.
@@ -84,6 +103,7 @@ pub struct ClipEntry {
     pub active: bool,
     pub role: ClipRole,
     pub has_thumb: bool, // texture cached in the UI's thumbnail map
+    pub bpm: Option<f64>, // source tempo metadata, if set
 }
 
 /// One cue of the edit bank, as shown in the sequencer section / editor.
@@ -98,6 +118,17 @@ pub struct CueView {
     pub shader: Option<ShaderId>, // per-cue shader override; None = the live shader
     pub role: ClipRole, // Playing/Armed if this cue is the live bank's current/next
     pub has_thumb: bool,
+    // Advanced-mode timing/speed (see `crate::bank::Cue`). Ticks are 1/32-beat.
+    pub dwell: Option<u32>,
+    pub loop_len: Option<u32>,
+    pub loop_phase: Toggle<i32>,
+    pub start_nudge: Toggle<f64>,
+    pub trig_delay: Toggle<u32>,
+    pub bpm: Option<f64>,       // this cue's source-tempo override
+    pub clip_bpm: Option<f64>,  // the source clip's own BPM (the inherited value)
+    pub bpm_sync_on: bool,
+    pub speed_mul: Toggle<f64>,
+    pub speed: f64,             // resolved effective playback speed (for the readout)
 }
 
 /// A bank's identity for the bank bar.
@@ -127,6 +158,7 @@ pub struct UiMirror {
     pub phrase_len: u32,
     pub loop_len: Option<u32>, // forced re-loop grid in 1/32-beat ticks; None = EOF-only
     pub preserve_playhead: bool, // carry the playhead over on a cut vs. restart the incoming clip
+    pub advanced: bool, // advanced sequencer mode: per-cue timing/speed + extended UI
     pub sync: Option<SyncKind>,
     pub peers: u64,
     /// Whether the active clock source accepts tempo/phase edits. Link is

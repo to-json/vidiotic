@@ -11,7 +11,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "../throw-shade/beltram.mkv".to_string());
 
-    let handle = match decoder::spawn(path.into(), 0.0, None) {
+    let handle = match decoder::spawn(path.into(), 0.0, None, 1.0) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("spawn failed: {e:#}");

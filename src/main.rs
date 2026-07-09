@@ -109,6 +109,7 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
             id,
             path: single.clone(),
             name,
+            bpm: None,
         });
         auto_active.push(id);
     }

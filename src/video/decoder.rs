@@ -43,18 +43,25 @@ impl Drop for DecodeHandle {
 
 /// Spawn a decode worker for one cue. `in_sec`/`out_sec` trim the loop: playback
 /// (and every restart) begins at `in_sec` and loops back once it reaches
-/// `out_sec` (or the clip's natural end when `out_sec` is `None`).
+/// `out_sec` (or the clip's natural end when `out_sec` is `None`). `speed` scales
+/// the pacing: `2.0` plays twice as fast, `0.5` half; `1.0` is native.
 ///
 /// # Errors
 /// Returns an error if ffmpeg initialization fails. Per-clip decode failures
 /// are logged on the worker thread, not returned here.
-pub fn spawn(path: PathBuf, in_sec: f64, out_sec: Option<f64>) -> anyhow::Result<DecodeHandle> {
+pub fn spawn(
+    path: PathBuf,
+    in_sec: f64,
+    out_sec: Option<f64>,
+    speed: f64,
+) -> anyhow::Result<DecodeHandle> {
     ff::init()?;
+    let speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
     let (frame_tx, frames) = bounded::<DecodedFrame>(3);
     let (close_tx, close_rx) = bounded::<()>(1);
     let (restart_tx, restart_rx) = bounded::<()>(1);
     let join = std::thread::spawn(move || {
-        if let Err(e) = run(&path, &frame_tx, &close_rx, &restart_rx, in_sec, out_sec) {
+        if let Err(e) = run(&path, &frame_tx, &close_rx, &restart_rx, in_sec, out_sec, speed) {
             log::error!("decode worker for {}: {e:#}", path.display());
         }
     });
@@ -99,10 +106,11 @@ fn send_or_stop(tx: &Sender<DecodedFrame>, close_rx: &Receiver<()>, frame: Decod
 }
 
 /// Sleep so the frame at `pts` seconds appears at the right wall-clock time,
-/// relative to the first frame of this playthrough.
-fn pace(base: Instant, first_pts: &mut Option<f64>, pts: f64) {
+/// relative to the first frame of this playthrough. `speed` compresses (>1) or
+/// stretches (<1) that timeline: the frame lands at `(pts - first)/speed`.
+fn pace(base: Instant, first_pts: &mut Option<f64>, pts: f64, speed: f64) {
     let fp = *first_pts.get_or_insert(pts);
-    let target = base + Duration::from_secs_f64((pts - fp).max(0.0));
+    let target = base + Duration::from_secs_f64(((pts - fp).max(0.0)) / speed);
     let now = Instant::now();
     if target > now {
         std::thread::sleep(target - now);
@@ -116,6 +124,7 @@ fn seek_secs(ictx: &mut ff::format::context::Input, secs: f64) -> anyhow::Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     path: &Path,
     tx: &Sender<DecodedFrame>,
@@ -123,6 +132,7 @@ fn run(
     restart_rx: &Receiver<()>,
     in_sec: f64,
     out_sec: Option<f64>,
+    speed: f64,
 ) -> anyhow::Result<()> {
     let mut ictx = ff::format::input(path)?;
 
@@ -156,7 +166,7 @@ fn run(
         );
         run_hap(
             &mut ictx, tx, close_rx, restart_rx, vid_idx, tb, width, height, texture_count,
-            in_sec, out_sec,
+            in_sec, out_sec, speed,
         )
     } else {
         log::info!(
@@ -165,7 +175,7 @@ fn run(
             params.id()
         );
         run_software(
-            &mut ictx, tx, close_rx, restart_rx, vid_idx, params, tb, in_sec, out_sec,
+            &mut ictx, tx, close_rx, restart_rx, vid_idx, params, tb, in_sec, out_sec, speed,
         )
     }
 }
@@ -191,6 +201,7 @@ fn run_hap(
     texture_count: u8,
     in_sec: f64,
     out_sec: Option<f64>,
+    speed: f64,
 ) -> anyhow::Result<()> {
     loop {
         // Position at the cue's in-point for this playthrough (also the target
@@ -232,7 +243,7 @@ fn run_hap(
                     continue;
                 }
             };
-            pace(base, &mut first_pts, pts);
+            pace(base, &mut first_pts, pts, speed);
 
             let frame = DecodedFrame {
                 pixels: PixelData::Bc {
@@ -265,6 +276,7 @@ fn run_software(
     tb: f64,
     in_sec: f64,
     out_sec: Option<f64>,
+    speed: f64,
 ) -> anyhow::Result<()> {
     use ff::format::Pixel;
     use ff::software::scaling;
@@ -291,7 +303,7 @@ fn run_software(
                          pace_it: bool|
      -> anyhow::Result<bool> {
         if pace_it {
-            pace(base, first_pts, pts);
+            pace(base, first_pts, pts, speed);
         }
         let mut rgba = ff::frame::Video::empty();
         scaler.run(decoded, &mut rgba)?;

@@ -4,10 +4,14 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::fmt_time;
 use super::theme::{PALETTE, SP_LG, SP_MD, SP_SM};
 use super::widgets;
-use crate::commands::{ClipRole, Command, CueView, UiMirror};
+use super::{fmt_time, LOOP_CADENCE};
+use crate::bank::Toggle;
+use crate::commands::{ClipRole, Command, CueParam, CueView, UiMirror, LOOP_TICKS_PER_BEAT};
+
+/// Ticks per beat, as a float for beat↔tick conversions in the advanced rows.
+const TPB: f64 = LOOP_TICKS_PER_BEAT as f64;
 
 /// The right panel: the selected cue's fields, or an empty-state prompt.
 pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
@@ -61,6 +65,16 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     ui.add_space(SP_MD);
 
     ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
+    // The fields scroll: advanced mode adds enough rows to overflow a short window.
+    egui::ScrollArea::vertical()
+        .id_salt("cue_fields")
+        .auto_shrink([false, false])
+        .show(ui, |ui| cue_fields(ui, m, cue, tx));
+}
+
+/// The scrollable field stack: trim, preserve, shader, the advanced sections
+/// (when enabled), and the remove button.
+fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     egui::Grid::new("cue_trim").num_columns(2).spacing(egui::vec2(SP_SM, SP_SM)).show(ui, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new("In").color(PALETTE.fg_muted));
@@ -185,19 +199,280 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         );
     }
 
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        let remove = egui::Button::new(egui::RichText::new("Remove cue").color(PALETTE.error))
-            .fill(PALETTE.error.linear_multiply(0.12))
-            .min_size(egui::vec2(ui.available_width(), 0.0));
-        if ui.add(remove).on_hover_text("Remove this cue from the bank").clicked() {
-            let _ = tx.send(Command::RemoveCue(cue.id));
+    if m.advanced {
+        advanced_sections(ui, m, cue, tx);
+    }
+
+    ui.add_space(SP_LG);
+    let remove = egui::Button::new(egui::RichText::new("Remove cue").color(PALETTE.error))
+        .fill(PALETTE.error.linear_multiply(0.12))
+        .min_size(egui::vec2(ui.available_width(), 0.0));
+    if ui.add(remove).on_hover_text("Remove this cue from the bank").clicked() {
+        let _ = tx.send(Command::RemoveCue(cue.id));
+    }
+    ui.add_space(SP_SM);
+    ui.label(
+        egui::RichText::new("Trim, timing & speed apply the next time this cue is triggered.")
+            .small()
+            .color(PALETTE.fg_muted),
+    );
+    ui.add_space(SP_SM);
+}
+
+/// The advanced per-cue sections: dwell, loop rate, timing offsets, and speed.
+/// Only shown when advanced mode is on (`UiMirror::advanced`).
+fn advanced_sections(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    ui.add_space(SP_LG);
+    widgets::section_label(ui, "dwell").on_hover_text(
+        "Beats this cue plays before advancing. Inherit follows the global “next every”.",
+    );
+    dwell_row(ui, m, cue, tx);
+
+    ui.add_space(SP_MD);
+    widgets::section_label(ui, "loop rate").on_hover_text(
+        "Retrigger this cue's video on this grid while it plays. Inherit follows the \
+         global “loop every”; off never re-loops.",
+    );
+    loop_row(ui, cue, tx);
+
+    ui.add_space(SP_LG);
+    widgets::section_label(ui, "offsets");
+    if let Some((on, v)) = param_row(
+        ui,
+        "swing",
+        "Shift the loop-restart grid by ± ticks (32/beat) for swing / micro-timing.",
+        cue.loop_phase.on,
+        cue.loop_phase.val as f64,
+        1.0,
+        -256.0..=256.0,
+        " tk",
+        0,
+    ) {
+        let val = v.round() as i32;
+        let _ = tx.send(Command::SetCueParam(cue.id, CueParam::LoopPhase(Toggle { on, val })));
+    }
+    if let Some((on, v)) = param_row(
+        ui,
+        "nudge",
+        "Add seconds to the in-point on each (re)start — sweep which frames show.",
+        cue.start_nudge.on,
+        cue.start_nudge.val,
+        0.01,
+        -600.0..=600.0,
+        " s",
+        2,
+    ) {
+        let _ = tx.send(Command::SetCueParam(cue.id, CueParam::StartNudge(Toggle { on, val: v })));
+    }
+    if let Some((on, v)) = param_row(
+        ui,
+        "delay",
+        "Hold the previous cue this many beats before this one cuts in.",
+        cue.trig_delay.on,
+        cue.trig_delay.val as f64 / TPB,
+        0.25,
+        0.0..=32.0,
+        " b",
+        2,
+    ) {
+        let val = (v * TPB).round().max(0.0) as u32;
+        let _ = tx.send(Command::SetCueParam(cue.id, CueParam::TrigDelay(Toggle { on, val })));
+    }
+
+    ui.add_space(SP_LG);
+    speed_section(ui, cue, tx);
+}
+
+/// Dwell: an "inherit" toggle plus a beats `DragValue` when overridden.
+fn dwell_row(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    ui.horizontal(|ui| {
+        let mut inherit = cue.dwell.is_none();
+        if ui.checkbox(&mut inherit, "inherit").changed() {
+            let cmd = (!inherit).then(|| m.phrase_len.max(1) * LOOP_TICKS_PER_BEAT);
+            let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Dwell(cmd)));
         }
-        ui.add_space(SP_SM);
-        ui.label(
-            egui::RichText::new("Trim & preserve apply the next time this cue is triggered.")
-                .small()
-                .color(PALETTE.fg_muted),
-        );
-        ui.add_space(SP_SM);
+        match cue.dwell {
+            Some(ticks) => {
+                let mut beats = ticks as f64 / TPB;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut beats)
+                            .speed(0.25)
+                            .range(0.25..=256.0)
+                            .suffix(" b")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    let val = (beats * TPB).round().max(1.0) as u32;
+                    let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Dwell(Some(val))));
+                }
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(format!("{} b (global)", m.phrase_len))
+                        .color(PALETTE.fg_muted),
+                );
+            }
+        }
     });
+}
+
+/// Loop rate: inherit / off / one of the shared cadences, via a combo box.
+fn loop_row(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
+    let selected = match cue.loop_len {
+        None => "inherit".to_string(),
+        Some(0) => "off".to_string(),
+        Some(t) => LOOP_CADENCE
+            .iter()
+            .find(|(_, tk)| *tk == t)
+            .map(|(l, _)| (*l).to_string())
+            .unwrap_or_else(|| format!("{t} tk")),
+    };
+    egui::ComboBox::from_id_salt("cue_loop")
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(cue.loop_len.is_none(), "inherit").clicked() {
+                let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Loop(None)));
+            }
+            if ui.selectable_label(cue.loop_len == Some(0), "off").clicked() {
+                let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Loop(Some(0))));
+            }
+            for (label, ticks) in LOOP_CADENCE {
+                if ui.selectable_label(cue.loop_len == Some(ticks), label).clicked() {
+                    let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Loop(Some(ticks))));
+                }
+            }
+        });
+}
+
+/// A toggle + `DragValue` row for an offset param. Returns `(on, value)` when the
+/// user changed either. Value is retained (shown greyed) while switched off.
+#[allow(clippy::too_many_arguments)]
+fn param_row(
+    ui: &mut Ui,
+    label: &str,
+    hover: &str,
+    on: bool,
+    val: f64,
+    speed: f64,
+    range: std::ops::RangeInclusive<f64>,
+    suffix: &str,
+    decimals: usize,
+) -> Option<(bool, f64)> {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        let mut o = on;
+        if ui.checkbox(&mut o, "").on_hover_text(hover).changed() {
+            out = Some((o, val));
+        }
+        let color = if o { PALETTE.fg_secondary } else { PALETTE.fg_muted };
+        ui.label(egui::RichText::new(label).color(color));
+        ui.add_enabled_ui(o, |ui| {
+            let mut v = val;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .speed(speed)
+                        .range(range)
+                        .suffix(suffix)
+                        .fixed_decimals(decimals),
+                )
+                .changed()
+            {
+                out = Some((o, v));
+            }
+        });
+    });
+    out
+}
+
+/// Speed: clip/cue BPM metadata, the BPM-sync toggle, the user multiplier, and
+/// the resolved effective-speed readout. The two toggles stack.
+fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
+    widgets::section_label(ui, "speed").on_hover_text(
+        "Playback speed = BPM-sync factor × user multiplier. Both stack; either can be off.",
+    );
+    // Clip-level BPM metadata (shared by every cue on this clip).
+    ui.horizontal(|ui| {
+        let mut has = cue.clip_bpm.is_some();
+        if ui
+            .checkbox(&mut has, "clip bpm")
+            .on_hover_text("Source tempo of the underlying clip, shared by every cue on it.")
+            .changed()
+        {
+            let _ = tx.send(Command::SetClipBpm(cue.clip, has.then(|| cue.clip_bpm.unwrap_or(120.0))));
+        }
+        if let Some(bpm) = cue.clip_bpm {
+            let mut v = bpm;
+            if ui.add(bpm_drag(&mut v)).changed() {
+                let _ = tx.send(Command::SetClipBpm(cue.clip, Some(v)));
+            }
+        }
+    });
+    // Per-cue BPM override.
+    ui.horizontal(|ui| {
+        let mut has = cue.bpm.is_some();
+        if ui
+            .checkbox(&mut has, "cue bpm")
+            .on_hover_text("Override the clip's tempo for just this cue.")
+            .changed()
+        {
+            let seed = cue.bpm.or(cue.clip_bpm).unwrap_or(120.0);
+            let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Bpm(has.then_some(seed))));
+        }
+        if let Some(bpm) = cue.bpm {
+            let mut v = bpm;
+            if ui.add(bpm_drag(&mut v)).changed() {
+                let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Bpm(Some(v))));
+            }
+        }
+    });
+    // BPM-sync toggle (needs a known source tempo).
+    let source_known = cue.bpm.or(cue.clip_bpm).is_some();
+    ui.add_enabled_ui(source_known, |ui| {
+        let mut sync = cue.bpm_sync_on;
+        if ui
+            .checkbox(&mut sync, "sync to tempo")
+            .on_hover_text("Retime playback so the clip runs at the session tempo (needs a source BPM).")
+            .changed()
+        {
+            let _ = tx.send(Command::SetCueParam(cue.id, CueParam::BpmSync(sync)));
+        }
+    });
+    // User multiplier, stacked on top.
+    ui.horizontal(|ui| {
+        let mut on = cue.speed_mul.on;
+        if ui.checkbox(&mut on, "× mult").changed() {
+            let _ = tx.send(Command::SetCueParam(
+                cue.id,
+                CueParam::SpeedMul(Toggle { on, val: cue.speed_mul.val }),
+            ));
+        }
+        ui.add_enabled_ui(on, |ui| {
+            let mut v = cue.speed_mul.val;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .speed(0.01)
+                        .range(0.05..=20.0)
+                        .suffix("×")
+                        .fixed_decimals(2),
+                )
+                .changed()
+            {
+                let _ = tx.send(Command::SetCueParam(cue.id, CueParam::SpeedMul(Toggle { on, val: v })));
+            }
+        });
+    });
+    ui.label(
+        egui::RichText::new(format!("→ {:.2}× effective", cue.speed))
+            .monospace()
+            .color(PALETTE.fg_secondary),
+    );
+}
+
+/// A BPM `DragValue`, shared by the clip and cue tempo fields.
+fn bpm_drag(v: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).speed(0.5).range(20.0..=400.0).suffix(" bpm").fixed_decimals(1)
 }

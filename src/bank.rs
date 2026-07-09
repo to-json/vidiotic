@@ -11,7 +11,26 @@ use crate::commands::{ClipId, ShaderId};
 /// several cues (different trim / options), so decoders are keyed by cue.
 pub type CueId = u32;
 
+/// A per-cue parameter that keeps its value while switched off, so toggling a
+/// knob off and back on restores what the user last dialed in. Advanced-mode
+/// controls (offsets, speed multiplier) use this.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Toggle<T> {
+    pub on: bool,
+    pub val: T,
+}
+
+impl<T> Toggle<T> {
+    /// A disabled toggle carrying `val` as its retained value.
+    pub fn off(val: T) -> Self {
+        Self { on: false, val }
+    }
+}
+
 /// A placement of a source clip: trim points plus per-cue playback overrides.
+///
+/// The advanced-mode fields (`dwell` through `speed_mul`) are always stored but
+/// only take effect when the engine's advanced mode is on; see `App::advanced`.
 #[derive(Clone, Debug)]
 pub struct Cue {
     pub id: CueId,
@@ -27,10 +46,31 @@ pub struct Cue {
     /// Per-cue shader override: a pinned pool shader used while this cue plays.
     /// `None` = use whatever the live (livecoded) shader is.
     pub shader: Option<ShaderId>,
+    /// Beats-until-advance, in 1/32-beat ticks (`LOOP_TICKS_PER_BEAT`); `None`
+    /// inherits the global phrase length. How long this cue plays before the
+    /// sequencer advances to the next.
+    pub dwell: Option<u32>,
+    /// Per-cue video re-loop grid in ticks: `None` inherits the global loop
+    /// rate, `Some(0)` forces no re-loop, `Some(n)` loops every `n` ticks.
+    /// Independent of `dwell`: a cue can dwell 16 beats but retrigger every 4.
+    pub loop_len: Option<u32>,
+    /// Micro-timing: shift this cue's loop-restart grid by signed ticks (swing).
+    pub loop_phase: Toggle<i32>,
+    /// Sample-start nudge: seconds added to `in_sec` on each (re)start.
+    pub start_nudge: Toggle<f64>,
+    /// Trig delay: ticks of lead-in the previous cue holds before this one starts.
+    pub trig_delay: Toggle<u32>,
+    /// Source-clip tempo metadata override; `None` inherits the clip's own BPM.
+    pub bpm: Option<f64>,
+    /// When on (and a source BPM is known), retime playback so the clip plays at
+    /// the session tempo: `speed *= session_bpm / source_bpm`.
+    pub bpm_sync_on: bool,
+    /// User playback-speed multiplier, stacked on top of any BPM-sync factor.
+    pub speed_mul: Toggle<f64>,
 }
 
 impl Cue {
-    /// A full-length cue: no trim, all overrides inherited.
+    /// A full-length cue: no trim, all overrides inherited, advanced knobs off.
     pub fn new(id: CueId, clip: ClipId, name: impl Into<Arc<str>>) -> Self {
         Self {
             id,
@@ -40,6 +80,14 @@ impl Cue {
             out_sec: None,
             preserve: None,
             shader: None,
+            dwell: None,
+            loop_len: None,
+            loop_phase: Toggle::off(0),
+            start_nudge: Toggle::off(0.0),
+            trig_delay: Toggle::off(0),
+            bpm: None,
+            bpm_sync_on: false,
+            speed_mul: Toggle::off(1.0),
         }
     }
 }

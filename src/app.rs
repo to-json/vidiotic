@@ -22,11 +22,12 @@ use crate::bank::{Bank, Cue, CueId};
 use crate::clippool::{self, Clip, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{
-    BankView, ClipEntry, ClipId, ClipRole, Command, CueView, ShaderPoolView, SyncKind, UiMirror,
+    BankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView, ShaderPoolView, SyncKind,
+    UiMirror, LOOP_TICKS_PER_BEAT,
 };
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
-use crate::sequencer::{Sequencer, SequencerEvent};
+use crate::sequencer::{CueStep, Sequencer, SequencerEvent};
 use crate::shader::lang_of;
 use crate::shaderwatch::ShaderWatcher;
 use crate::ui::EguiCtl;
@@ -93,8 +94,14 @@ pub struct App {
     current_pts: f64, // playhead of the displayed clip, for set-in/out-to-playhead
     video_mode: i32,
     last_beat: f64,
+    last_bpm: f64, // most recent snapshot tempo, for spawn-time BPM-synced speed
+    // Advanced sequencer mode: when on, per-cue dwell/loop/offset/speed take
+    // effect and the extended UI shows. Off (default) reproduces the simple
+    // global-phrase behavior; per-cue edits are still stored, just inert.
+    advanced: bool,
     // musical re-loop: force the current clip back to its start on a beat grid,
-    // measured in 1/32-beat ticks. None = let the clip loop on EOF only.
+    // measured in 1/32-beat ticks. None = let the clip loop on EOF only. In
+    // advanced mode a per-cue rate/phase can override this for the playing cue.
     loop_len: Option<u32>,
     loop_tracker: BoundaryTracker,
     // on a cut, carry the outgoing playhead into the incoming clip (true, the
@@ -167,6 +174,8 @@ impl App {
             current_pts: 0.0,
             video_mode: 0,
             last_beat: 0.0,
+            last_bpm: boot.bpm,
+            advanced: false,
             loop_len: None,
             loop_tracker: BoundaryTracker::new(),
             preserve_playhead: true,
@@ -234,18 +243,80 @@ impl App {
         if self.decoders.contains_key(&id) {
             return;
         }
-        let Some(cue) = self.live_cue(id) else { return };
+        let Some(cue) = self.live_cue(id).cloned() else { return };
         let clip = cue.clip;
-        let in_sec = cue.in_sec.max(0.0);
+        // Advanced mode: sample-start nudge shifts the in-point, and playback
+        // speed (BPM-sync × user multiplier) is baked in at spawn time.
+        let nudge = if self.advanced && cue.start_nudge.on { cue.start_nudge.val } else { 0.0 };
+        let in_sec = (cue.in_sec + nudge).max(0.0);
         let out_sec = cue.out_sec.filter(|&o| o > in_sec);
+        let speed = self.effective_speed(&cue);
         if let Some(path) = self.clip_path(clip) {
-            match decoder::spawn(path, in_sec, out_sec) {
+            match decoder::spawn(path, in_sec, out_sec, speed) {
                 Ok(h) => {
                     self.decoders.insert(id, h);
                 }
                 Err(e) => log::error!("decode spawn for cue {id} (clip {clip}): {e:#}"),
             }
         }
+    }
+
+    /// This clip's source-tempo metadata, if set.
+    fn clip_bpm(&self, id: ClipId) -> Option<f64> {
+        self.clips.iter().find(|c| c.id == id).and_then(|c| c.bpm)
+    }
+
+    /// Effective playback speed for a cue: `1.0` unless advanced mode is on.
+    fn effective_speed(&self, cue: &Cue) -> f64 {
+        resolve_speed(self.advanced, self.last_bpm, cue, self.clip_bpm(cue.clip))
+    }
+
+    /// The sequencer timing a cue contributes, resolving inherited dwell against
+    /// the global phrase length. In simple mode every cue uses the global dwell
+    /// with no trig delay, reproducing a fixed phrase grid.
+    fn step_for(&self, cue: &Cue) -> CueStep {
+        let tpb = LOOP_TICKS_PER_BEAT as f64;
+        let default = self.sequencer.phrase_len();
+        if self.advanced {
+            CueStep {
+                id: cue.id,
+                dwell: cue.dwell.map(|t| t as f64 / tpb).unwrap_or(default),
+                trig_delay: if cue.trig_delay.on { cue.trig_delay.val as f64 / tpb } else { 0.0 },
+            }
+        } else {
+            CueStep { id: cue.id, dwell: default, trig_delay: 0.0 }
+        }
+    }
+
+    /// The [`CueStep`]s for a bank's cues, in play order.
+    fn cue_steps(&self, bank: usize) -> Vec<CueStep> {
+        self.banks
+            .get(bank)
+            .map(|b| b.cues.iter().map(|c| self.step_for(c)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The re-loop grid (ticks) and phase offset (beats) for the playing cue:
+    /// per-cue in advanced mode, else the global loop setting.
+    fn current_loop_params(&self) -> (Option<u32>, f64) {
+        let global = self.loop_len;
+        if !self.advanced {
+            return (global, 0.0);
+        }
+        let Some(cue) = self.current.and_then(|c| self.live_cue(c)) else {
+            return (global, 0.0);
+        };
+        let ticks = match cue.loop_len {
+            Some(0) => None,      // per-cue: force no re-loop
+            Some(t) => Some(t),   // per-cue rate
+            None => global,       // inherit the global loop setting
+        };
+        let phase = if cue.loop_phase.on {
+            cue.loop_phase.val as f64 / LOOP_TICKS_PER_BEAT as f64
+        } else {
+            0.0
+        };
+        (ticks, phase)
     }
 
     /// Add a full-length cue for `clip` to the live bank if none exists there,
@@ -257,20 +328,21 @@ impl App {
             .iter()
             .position(|c| c.clip == clip);
         if let Some(pos) = existing {
-            let cue_id = self.banks[self.live_bank].cues[pos].id;
-            let ev = self.sequencer.toggle_active(cue_id, beat);
+            let cue = self.banks[self.live_bank].cues[pos].clone();
+            let step = self.step_for(&cue);
+            let ev = self.sequencer.toggle_active(step, beat);
             self.banks[self.live_bank].cues.remove(pos);
-            if self.selected_cue == Some(cue_id) {
+            if self.selected_cue == Some(cue.id) {
                 self.selected_cue = None;
             }
             self.apply_seq_events(ev);
         } else {
             let cue_id = self.alloc_cue_id();
             let name = self.clip_name(clip);
-            self.banks[self.live_bank]
-                .cues
-                .push(Cue::new(cue_id, clip, name));
-            let ev = self.sequencer.toggle_active(cue_id, beat);
+            let cue = Cue::new(cue_id, clip, name);
+            let step = self.step_for(&cue);
+            self.banks[self.live_bank].cues.push(cue);
+            let ev = self.sequencer.toggle_active(step, beat);
             self.apply_seq_events(ev);
         }
     }
@@ -317,8 +389,8 @@ impl App {
     /// (call after adding/removing a cue in the edit bank).
     fn resync_live_if_editing(&mut self) {
         if self.edit_bank == self.live_bank {
-            let ids = self.banks[self.live_bank].ids();
-            let ev = self.sequencer.set_active_set(ids);
+            let steps = self.cue_steps(self.live_bank);
+            let ev = self.sequencer.set_active_set(steps);
             self.apply_seq_events(ev);
         }
     }
@@ -352,6 +424,55 @@ impl App {
         }
     }
 
+    /// Apply one advanced per-cue knob to the edit bank. Dwell/trig-delay change
+    /// the rotation's timing, so those refresh the sequencer's active set; the
+    /// rest are read at the cue's next decoder spawn or loop tick.
+    fn set_cue_param(&mut self, id: CueId, p: CueParam) {
+        self.edit_cue(id, |c| match p {
+            CueParam::Dwell(v) => c.dwell = v,
+            CueParam::Loop(v) => c.loop_len = v,
+            CueParam::LoopPhase(t) => c.loop_phase = t,
+            CueParam::StartNudge(t) => c.start_nudge = t,
+            CueParam::TrigDelay(t) => c.trig_delay = t,
+            CueParam::Bpm(v) => c.bpm = v,
+            CueParam::BpmSync(on) => c.bpm_sync_on = on,
+            CueParam::SpeedMul(t) => c.speed_mul = t,
+        });
+        if matches!(p, CueParam::Dwell(_) | CueParam::TrigDelay(_)) {
+            self.resync_live_if_editing();
+        }
+    }
+
+    /// Reorder a cue within the edit bank to `target`, then re-sync the live set.
+    fn move_cue(&mut self, id: CueId, target: usize) {
+        let cues = &mut self.banks[self.edit_bank].cues;
+        let Some(from) = cues.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let cue = cues.remove(from);
+        let to = target.min(cues.len());
+        cues.insert(to, cue);
+        self.resync_live_if_editing();
+    }
+
+    /// Set (or clear) a source clip's tempo metadata.
+    fn set_clip_bpm(&mut self, id: ClipId, bpm: Option<f64>) {
+        if let Some(c) = self.clips.iter_mut().find(|c| c.id == id) {
+            c.bpm = bpm.filter(|b| b.is_finite() && *b > 0.0);
+        }
+    }
+
+    /// Toggle advanced sequencer mode. Per-cue timing resolution changes for the
+    /// whole rotation, so rebuild the active set and re-prime the loop grid.
+    fn set_advanced(&mut self, on: bool) {
+        if self.advanced == on {
+            return;
+        }
+        self.advanced = on;
+        self.loop_tracker.reset();
+        self.resync_live_if_editing();
+    }
+
     fn set_live_bank(&mut self, i: usize) {
         if i >= self.banks.len() || i == self.live_bank {
             return;
@@ -360,8 +481,8 @@ impl App {
         // The new bank takes over: keep playing the current cue if it happens to
         // still resolve, otherwise the sequencer advances into the new set at the
         // next arm window.
-        let ids = self.banks[self.live_bank].ids();
-        let ev = self.sequencer.set_active_set(ids);
+        let steps = self.cue_steps(self.live_bank);
+        let ev = self.sequencer.set_active_set(steps);
         self.apply_seq_events(ev);
     }
 
@@ -586,6 +707,10 @@ impl App {
             }
             Command::SetCuePreserve(id, v) => self.edit_cue(id, |c| c.preserve = v),
             Command::SetCueShader(id, s) => self.edit_cue(id, |c| c.shader = s),
+            Command::SetCueParam(id, p) => self.set_cue_param(id, p),
+            Command::MoveCue(id, to) => self.move_cue(id, to),
+            Command::SetClipBpm(id, bpm) => self.set_clip_bpm(id, bpm),
+            Command::SetAdvancedMode(on) => self.set_advanced(on),
             Command::CaptureShader => self.capture_shader(),
             Command::RemoveShader(id) => self.remove_shader(id),
             Command::AddBank => self.add_bank(),
@@ -638,14 +763,18 @@ impl App {
         // 5. Clock + sequencer.
         let snap = self.clock.snapshot();
         self.last_beat = snap.beat;
+        self.last_bpm = snap.bpm;
         let ev = self.sequencer.tick(&snap);
         self.apply_seq_events(ev);
 
-        // 5b. Musical re-loop: on each grid boundary of `loop_len` (in 1/32-beat
-        // ticks), seek the current clip back to its start so it restarts on the beat.
-        if let (Some(ticks), Some(cur)) = (self.loop_len, self.current) {
-            let grid = ticks as f64 / crate::commands::LOOP_TICKS_PER_BEAT as f64;
-            if snap.is_playing && self.loop_tracker.crossed(snap.beat, grid).is_some() {
+        // 5b. Musical re-loop: on each grid boundary (in 1/32-beat ticks), seek
+        // the current clip back to its start so it restarts on the beat. The
+        // rate/phase come from the playing cue in advanced mode, else the global
+        // loop setting; a loop phase shifts the grid for swing/micro-timing.
+        let (loop_ticks, loop_phase) = self.current_loop_params();
+        if let (Some(ticks), Some(cur)) = (loop_ticks, self.current) {
+            let grid = ticks as f64 / LOOP_TICKS_PER_BEAT as f64;
+            if snap.is_playing && self.loop_tracker.crossed(snap.beat - loop_phase, grid).is_some() {
                 if let Some(h) = self.decoders.get(&cur) {
                     h.request_restart();
                 }
@@ -764,6 +893,7 @@ impl App {
         self.mirror.phrase_len = phrase as u32;
         self.mirror.loop_len = self.loop_len;
         self.mirror.preserve_playhead = self.preserve_playhead;
+        self.mirror.advanced = self.advanced;
         self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
         self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
         self.mirror.sync = Some(self.sync);
@@ -802,6 +932,7 @@ impl App {
                     ClipRole::None
                 },
                 has_thumb: has_thumb(c.id),
+                bpm: c.bpm,
             })
             .collect();
         // Cue banks: the bank bar, and the edit bank's cues (with live roles).
@@ -829,25 +960,44 @@ impl App {
             })
             .unwrap_or_default();
         self.mirror.playhead_sec = self.current_pts;
+        // Locals captured by the map so it borrows only disjoint fields of `self`
+        // (banks/clips/egui) and can be assigned back into `self.mirror`.
+        let advanced = self.advanced;
+        let last_bpm = self.last_bpm;
+        let clips = &self.clips;
+        let clip_bpm = |id: ClipId| clips.iter().find(|c| c.id == id).and_then(|c| c.bpm);
         self.mirror.cues = self.banks[self.edit_bank]
             .cues
             .iter()
-            .map(|c| CueView {
-                id: c.id,
-                clip: c.clip,
-                name: c.name.clone(),
-                in_sec: c.in_sec,
-                out_sec: c.out_sec,
-                preserve: c.preserve,
-                shader: c.shader,
-                role: if playing_cue == Some(c.id) {
-                    ClipRole::Playing
-                } else if armed_cue == Some(c.id) {
-                    ClipRole::Armed
-                } else {
-                    ClipRole::None
-                },
-                has_thumb: has_thumb(c.clip),
+            .map(|c| {
+                let clip_bpm = clip_bpm(c.clip);
+                CueView {
+                    id: c.id,
+                    clip: c.clip,
+                    name: c.name.clone(),
+                    in_sec: c.in_sec,
+                    out_sec: c.out_sec,
+                    preserve: c.preserve,
+                    shader: c.shader,
+                    role: if playing_cue == Some(c.id) {
+                        ClipRole::Playing
+                    } else if armed_cue == Some(c.id) {
+                        ClipRole::Armed
+                    } else {
+                        ClipRole::None
+                    },
+                    has_thumb: has_thumb(c.clip),
+                    dwell: c.dwell,
+                    loop_len: c.loop_len,
+                    loop_phase: c.loop_phase,
+                    start_nudge: c.start_nudge,
+                    trig_delay: c.trig_delay,
+                    bpm: c.bpm,
+                    clip_bpm,
+                    bpm_sync_on: c.bpm_sync_on,
+                    speed_mul: c.speed_mul,
+                    speed: resolve_speed(advanced, last_bpm, c, clip_bpm),
+                }
             })
             .collect();
 
@@ -979,6 +1129,25 @@ impl App {
     }
 }
 
+/// Resolve a cue's effective playback speed: `1.0` in simple mode; in advanced
+/// mode a BPM-sync factor (`session_bpm / source_bpm`, when synced and a source
+/// tempo is known) stacked with the user multiplier, clamped to a sane range.
+fn resolve_speed(advanced: bool, session_bpm: f64, cue: &Cue, clip_bpm: Option<f64>) -> f64 {
+    if !advanced {
+        return 1.0;
+    }
+    let sync = if cue.bpm_sync_on {
+        match cue.bpm.or(clip_bpm) {
+            Some(src) if src > 0.0 => session_bpm / src,
+            _ => 1.0,
+        }
+    } else {
+        1.0
+    };
+    let mul = if cue.speed_mul.on { cue.speed_mul.val } else { 1.0 };
+    (sync * mul).clamp(0.05, 20.0)
+}
+
 /// Keep stored trim consistent with the decoder's rule (`ensure_decoder` only
 /// honors an out-point strictly after the in-point): collapse an out ≤ in to
 /// "untrimmed" so the editor never shows a trim that playback ignores.
@@ -1093,4 +1262,53 @@ pub fn run(boot: Boot) -> anyhow::Result<()> {
     let mut app = App::new(boot);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bank::Toggle;
+
+    fn cue() -> Cue {
+        Cue::new(1, 0, "c")
+    }
+
+    #[test]
+    fn speed_is_unity_in_simple_mode() {
+        let mut c = cue();
+        c.bpm_sync_on = true;
+        c.speed_mul = Toggle { on: true, val: 2.0 };
+        // advanced = false: every knob is inert, playback is native speed.
+        assert_eq!(resolve_speed(false, 140.0, &c, Some(70.0)), 1.0);
+    }
+
+    #[test]
+    fn bpm_sync_uses_session_over_source() {
+        let mut c = cue();
+        c.bpm_sync_on = true;
+        // clip authored at 70 bpm, session at 140 -> play twice as fast
+        assert_eq!(resolve_speed(true, 140.0, &c, Some(70.0)), 2.0);
+        // cue-level bpm overrides the clip's
+        c.bpm = Some(140.0);
+        assert_eq!(resolve_speed(true, 140.0, &c, Some(70.0)), 1.0);
+    }
+
+    #[test]
+    fn bpm_sync_without_source_is_unity() {
+        let mut c = cue();
+        c.bpm_sync_on = true;
+        assert_eq!(resolve_speed(true, 140.0, &c, None), 1.0);
+    }
+
+    #[test]
+    fn sync_and_multiplier_stack() {
+        let mut c = cue();
+        c.bpm_sync_on = true;
+        c.speed_mul = Toggle { on: true, val: 1.5 };
+        // (140/70) * 1.5 = 3.0
+        assert_eq!(resolve_speed(true, 140.0, &c, Some(70.0)), 3.0);
+        // multiplier alone, no sync
+        c.bpm_sync_on = false;
+        assert_eq!(resolve_speed(true, 140.0, &c, Some(70.0)), 1.5);
+    }
 }

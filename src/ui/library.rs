@@ -65,8 +65,8 @@ pub(super) fn show(
                     empty_state(ui, "Empty bank", "double-click a clip above to add a cue", None);
                 } else {
                     ui.horizontal_wrapped(|ui| {
-                        for cue in &m.cues {
-                            cue_chip(ui, m, cue, thumbs, tx, beat_pulse);
+                        for (i, cue) in m.cues.iter().enumerate() {
+                            cue_chip(ui, m, i, cue, thumbs, tx, beat_pulse);
                         }
                     });
                 }
@@ -215,6 +215,7 @@ fn bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &BankView, tx: &Sender<Co
 fn cue_chip(
     ui: &mut Ui,
     m: &UiMirror,
+    index: usize,
     cue: &CueView,
     thumbs: &HashMap<ClipId, egui::TextureHandle>,
     tx: &Sender<Command>,
@@ -233,10 +234,39 @@ fn cue_chip(
                 size: egui::vec2(146.0, 98.0),
             };
             let resp = widgets::media_tile(ui, &spec);
-            if resp.clicked {
+            // Advanced mode: the tile doubles as a drag-to-reorder handle. Click
+            // still selects; a drag carries this cue's id and reorders on drop.
+            // Uses an explicit-id `interact` (never `push_id`, which would break
+            // the surrounding ScrollArea's wheel input).
+            let mut clicked = resp.clicked;
+            // The drag overlay, when present, sits above the tile and takes the
+            // pointer — so route click/hover through it, not the tile beneath.
+            let mut hovered = resp.hovered;
+            if m.advanced {
+                let drag_id = ui.id().with(("cue_drag", cue.id));
+                let dr = ui.interact(resp.rect, drag_id, egui::Sense::click_and_drag());
+                clicked = dr.clicked();
+                hovered = dr.hovered();
+                if dr.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), cue.id);
+                }
+                if dr.dragged() {
+                    ui.painter().rect_filled(
+                        resp.rect,
+                        egui::CornerRadius::same(4),
+                        theme::with_alpha(Color32::BLACK, 90),
+                    );
+                }
+                if let Some(dragged) = dr.dnd_release_payload::<crate::bank::CueId>() {
+                    if *dragged != cue.id {
+                        let _ = tx.send(Command::MoveCue(*dragged, index));
+                    }
+                }
+            }
+            if clicked {
                 let _ = tx.send(Command::SelectCue(Some(cue.id)));
             }
-            if resp.hovered {
+            if hovered {
                 let hover_id = ui.id().with(("cue_hover", cue.id));
                 ui.interact(resp.rect, hover_id, egui::Sense::hover())
                     .on_hover_text("click to edit this cue");
@@ -264,6 +294,16 @@ fn cue_chip(
             }
 
             ui.horizontal(|ui| {
+                if m.advanced {
+                    ui.spacing_mut().item_spacing.x = SP_SM;
+                    ui.spacing_mut().button_padding = egui::vec2(4.0, 0.0);
+                    if ui.small_button("◀").on_hover_text("move earlier").clicked() && index > 0 {
+                        let _ = tx.send(Command::MoveCue(cue.id, index - 1));
+                    }
+                    if ui.small_button("▶").on_hover_text("move later").clicked() {
+                        let _ = tx.send(Command::MoveCue(cue.id, index + 1));
+                    }
+                }
                 widgets::chip(ui, &trim_label(cue), None, false);
                 if let Some(p) = cue.preserve {
                     let (text, tint) =
@@ -273,9 +313,46 @@ fn cue_chip(
                 if cue.shader.is_some() {
                     widgets::chip(ui, "fx", Some(PALETTE.accent), false);
                 }
+                if m.advanced {
+                    advanced_badges(ui, cue);
+                }
             });
         });
     });
+}
+
+/// Compact advanced-mode metadata chips: dwell, loop rate, active offsets, and
+/// a non-unity playback speed. Only the set/non-default knobs show, to keep the
+/// tile's chip row from overflowing.
+fn advanced_badges(ui: &mut Ui, cue: &CueView) {
+    if let Some(ticks) = cue.dwell {
+        widgets::chip(ui, &format!("⌛{}b", fmt_beats(ticks)), None, false);
+    }
+    match cue.loop_len {
+        Some(0) => {
+            widgets::chip(ui, "loop off", None, false);
+        }
+        Some(t) => {
+            widgets::chip(ui, &format!("↻{}b", fmt_beats(t)), None, false);
+        }
+        None => {}
+    }
+    if cue.loop_phase.on || cue.start_nudge.on || cue.trig_delay.on {
+        widgets::chip(ui, "offset", Some(PALETTE.armed), false);
+    }
+    if (cue.speed - 1.0).abs() > 1e-3 {
+        widgets::chip(ui, &format!("{:.2}×", cue.speed), Some(PALETTE.accent), false);
+    }
+}
+
+/// Format a tick count as a compact beat count: `512` → `16`, `48` → `1.5`.
+fn fmt_beats(ticks: u32) -> String {
+    let b = ticks as f64 / crate::commands::LOOP_TICKS_PER_BEAT as f64;
+    if b.fract() == 0.0 {
+        format!("{}", b as i64)
+    } else {
+        format!("{b:.2}").trim_end_matches('0').trim_end_matches('.').to_string()
+    }
 }
 
 fn trim_label(cue: &CueView) -> String {

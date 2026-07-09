@@ -19,6 +19,9 @@ pub struct Clip {
     pub id: ClipId,
     pub path: PathBuf,
     pub name: Arc<str>,
+    /// User-entered source tempo, used for advanced-mode BPM-synced playback;
+    /// `None` until set (not derived from the file — container FPS is unreliable).
+    pub bpm: Option<f64>,
 }
 
 /// A decoded first-frame preview, delivered from the thumbnailer thread.
@@ -57,6 +60,7 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
                 id: i as ClipId,
                 path,
                 name,
+                bpm: None,
             }
         })
         .collect()

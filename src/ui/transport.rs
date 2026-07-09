@@ -20,19 +20,7 @@ const CADENCE_BARS: [(&str, u32); 5] = [
     ("16 bars", 16),
 ];
 
-/// "Loop every" cadence: (label, ticks) at 32 ticks/beat (`LOOP_TICKS_PER_BEAT`).
-/// A beat is a quarter note (32), so an eighth note is 16 and a 4/4 bar is 128.
-/// Goes sub-bar for beat-roll/stutter effects.
-const LOOP_CADENCE: [(&str, u32); 8] = [
-    ("1/8", 16),
-    ("1/4", 32),
-    ("1/2", 64),
-    ("1 bar", 128),
-    ("2 bars", 256),
-    ("4 bars", 512),
-    ("8 bars", 1024),
-    ("16 bars", 2048),
-];
+use super::LOOP_CADENCE;
 
 /// Run one tap button through the flash-decay temp-memory pattern: paints at
 /// the previous frame's decayed flash, then bumps it back to 1.0 if triggered
@@ -295,6 +283,20 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 .changed()
             {
                 let _ = tx.send(Command::SetPreservePlayhead(preserve));
+            }
+
+            ui.add_space(SP_MD);
+            let mut advanced = m.advanced;
+            if ui
+                .checkbox(&mut advanced, "advanced")
+                .on_hover_text(
+                    "Advanced sequencer: each cue gets its own dwell length, loop \
+                     rate, timing offsets, and playback speed (edited per cue on the \
+                     right). Off: the simple global cadence above drives every cue.",
+                )
+                .changed()
+            {
+                let _ = tx.send(Command::SetAdvancedMode(advanced));
             }
         });
         ui.add_space(SP_SM);

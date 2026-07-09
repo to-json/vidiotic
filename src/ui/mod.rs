@@ -148,6 +148,20 @@ impl EguiCtl {
     }
 }
 
+/// "Loop every" cadence choices shared by the transport (global) and the cue
+/// editor (per-cue): (label, ticks) at 32 ticks/beat (`LOOP_TICKS_PER_BEAT`).
+/// A beat is a quarter note (32), so an eighth note is 16 and a 4/4 bar is 128.
+pub(super) const LOOP_CADENCE: [(&str, u32); 8] = [
+    ("1/8", 16),
+    ("1/4", 32),
+    ("1/2", 64),
+    ("1 bar", 128),
+    ("2 bars", 256),
+    ("4 bars", 512),
+    ("8 bars", 1024),
+    ("16 bars", 2048),
+];
+
 fn control_ui(
     ui: &mut egui::Ui,
     m: &UiMirror,
