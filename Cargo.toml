@@ -19,6 +19,19 @@ path = "src/bin/spike_render.rs"
 name = "spike_decode"
 path = "src/bin/spike_decode.rs"
 
+# The transcode hot path (BC1 block compression, its rayon fan-out, and snappy
+# framing) is drastically slower unoptimized — build it optimized even in dev.
+[profile.dev.package.texpresso]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.rayon]
+opt-level = 3
+[profile.dev.package.rayon-core]
+opt-level = 3
+[profile.dev.package.snap]
+opt-level = 3
+
 [dependencies]
 ffmpeg-next = "8.1"
 crossbeam-channel = "0.5"
