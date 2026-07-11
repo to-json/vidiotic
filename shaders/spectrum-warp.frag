@@ -12,7 +12,7 @@ void main() {
     int b = int(clamp(uv.y * 21.0, 0.0, 20.0));
     float m = band(b);
     float warp = sin(uv.y * 40.0 + time * 3.0) * m * 0.08;
-    vec3 col = video(vec2(uv.x + warp, uv.y)).rgb;
+    vec3 col = prev(vec2(uv.x + warp, uv.y)).rgb;
 
     // stain hot rows with a rainbow across the frequency axis
     vec3 tint = 0.5 + 0.5 * cos(6.2831 * (uv.y + vec3(0.0, 0.33, 0.67)));

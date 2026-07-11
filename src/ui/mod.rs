@@ -15,6 +15,7 @@ mod transport;
 mod widgets;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crossbeam_channel::Sender;
 use winit::window::Window;
@@ -182,15 +183,18 @@ fn fmt_time(secs: f64) -> String {
     format!("{mins}:{rem:05.2}")
 }
 
-enum PickKind {
+pub(crate) enum PickKind {
     ClipDir,
     ClipBankDir,
     Shader,
+    /// Save the project. The payload is the currently-loaded path, used to
+    /// pre-fill the dialog's directory and file name (`None` = a fresh session).
+    SaveProject(Option<PathBuf>),
 }
 
 /// Open a native picker on a worker thread and deliver the choice as a Command.
 /// (`NSOpenPanel` is main-thread-only for blocking dialogs, so use the async API.)
-fn pick_file(tx: Sender<Command>, kind: PickKind) {
+pub(crate) fn pick_file(tx: Sender<Command>, kind: PickKind) {
     match kind {
         PickKind::ClipDir => {
             let fut = rfd::AsyncFileDialog::new().pick_folder();
@@ -215,6 +219,24 @@ fn pick_file(tx: Sender<Command>, kind: PickKind) {
             std::thread::spawn(move || {
                 if let Some(h) = pollster::block_on(fut) {
                     let _ = tx.send(Command::SetShaderPath(h.path().to_path_buf()));
+                }
+            });
+        }
+        PickKind::SaveProject(current) => {
+            let mut dialog = rfd::AsyncFileDialog::new().add_filter("project", &["viproj"]);
+            let name = current
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("session.viproj");
+            dialog = dialog.set_file_name(name);
+            if let Some(dir) = current.as_ref().and_then(|p| p.parent()) {
+                dialog = dialog.set_directory(dir);
+            }
+            let fut = dialog.save_file();
+            std::thread::spawn(move || {
+                if let Some(h) = pollster::block_on(fut) {
+                    let _ = tx.send(Command::SaveProjectTo(h.path().to_path_buf()));
                 }
             });
         }

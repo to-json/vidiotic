@@ -376,7 +376,7 @@ fn cue_chip(
                         if p { ("keep", PALETTE.playing) } else { ("cut", PALETTE.fg_muted) };
                     widgets::chip(ui, text, Some(tint), false);
                 }
-                if cue.shader.is_some() {
+                if !cue.chain.is_empty() {
                     widgets::chip(ui, "fx", Some(PALETTE.accent), false);
                 }
                 if m.advanced {

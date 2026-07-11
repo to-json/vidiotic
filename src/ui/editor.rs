@@ -8,7 +8,9 @@ use super::theme::{PALETTE, SP_LG, SP_MD, SP_SM};
 use super::widgets;
 use super::{fmt_time, LOOP_CADENCE};
 use crate::bank::Toggle;
-use crate::commands::{ClipRole, Command, CueParam, CueView, UiMirror, LOOP_TICKS_PER_BEAT};
+use crate::commands::{
+    ChainSlot, ClipRole, Command, CueParam, CueView, SlotRef, UiMirror, LOOP_TICKS_PER_BEAT,
+};
 
 /// Ticks per beat, as a float for beat↔tick conversions in the advanced rows.
 const TPB: f64 = LOOP_TICKS_PER_BEAT as f64;
@@ -167,37 +169,7 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     }
 
     ui.add_space(SP_LG);
-    widgets::section_label(ui, "shader").on_hover_text(
-        "Render this cue with a pinned shader instead of the live one. Applies immediately while the cue plays.",
-    );
-    let selected_name = cue
-        .shader
-        .and_then(|id| m.shader_pool.iter().find(|s| s.id == id))
-        .map(|s| &*s.name)
-        .unwrap_or("Live shader");
-    egui::ComboBox::from_id_salt("cue_shader")
-        .selected_text(selected_name)
-        .show_ui(ui, |ui| {
-            if ui.selectable_label(cue.shader.is_none(), "Live shader").clicked() {
-                let _ = tx.send(Command::SetCueShader(cue.id, None));
-            }
-            for s in &m.shader_pool {
-                if ui.selectable_label(cue.shader == Some(s.id), s.name.as_ref()).clicked() {
-                    let _ = tx.send(Command::SetCueShader(cue.id, Some(s.id)));
-                }
-            }
-        })
-        .response
-        .on_hover_text(
-            "Override this cue's shader while it plays. Live shader follows whatever you're livecoding.",
-        );
-    if m.shader_pool.is_empty() {
-        ui.label(
-            egui::RichText::new("No pinned shaders yet — “📌 Pin” the current shader below.")
-                .small()
-                .color(PALETTE.fg_muted),
-        );
-    }
+    chain_section(ui, m, cue, tx);
 
     if m.advanced {
         advanced_sections(ui, m, cue, tx);
@@ -217,6 +189,98 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             .color(PALETTE.fg_muted),
     );
     ui.add_space(SP_SM);
+}
+
+/// Human-readable label for a chain slot.
+fn slot_label(slot: &SlotRef, m: &UiMirror) -> String {
+    match slot {
+        SlotRef::Live => "Live shader".to_string(),
+        SlotRef::Builtin(name) => name.to_string(),
+        SlotRef::Pinned(id) => m
+            .shader_pool
+            .iter()
+            .find(|s| s.id == *id)
+            .map(|s| s.name.to_string())
+            .unwrap_or_else(|| format!("pin #{id}")),
+    }
+}
+
+/// The per-cue effect chain: an ordered stack of shaders. Each stage reads the
+/// previous stage's output via `prev()`; empty = the live shader. Rows can be
+/// reordered and removed; the combo appends a slot.
+fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    widgets::section_label(ui, "effect chain").on_hover_text(
+        "Stack shaders applied while this cue plays. Each stage feeds the next via prev(); \
+         empty runs the live shader. The live shader can sit anywhere in the stack.",
+    );
+
+    if cue.chain.is_empty() {
+        ui.label(
+            egui::RichText::new("No effects — runs the live shader.")
+                .small()
+                .color(PALETTE.fg_muted),
+        );
+    }
+
+    let n = cue.chain.len();
+    for (i, slot) in cue.chain.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(format!("{}.", i + 1));
+            ui.label(slot_label(&slot.shader, m));
+            // Right-aligned reorder / remove controls.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small())
+                    .on_hover_text("Move down")
+                    .clicked()
+                {
+                    let mut c = cue.chain.clone();
+                    c.swap(i, i + 1);
+                    let _ = tx.send(Command::SetCueChain(cue.id, c));
+                }
+                if ui.add_enabled(i > 0, egui::Button::new("▲").small())
+                    .on_hover_text("Move up")
+                    .clicked()
+                {
+                    let mut c = cue.chain.clone();
+                    c.swap(i, i - 1);
+                    let _ = tx.send(Command::SetCueChain(cue.id, c));
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("✕").color(PALETTE.error)).small())
+                    .on_hover_text("Remove from chain")
+                    .clicked()
+                {
+                    let mut c = cue.chain.clone();
+                    c.remove(i);
+                    let _ = tx.send(Command::SetCueChain(cue.id, c));
+                }
+            });
+        });
+    }
+
+    // Append control: Live shader, then each pool shader (built-ins + pins).
+    let append = |slot: SlotRef| {
+        let mut c = cue.chain.clone();
+        c.push(ChainSlot::new(slot));
+        Command::SetCueChain(cue.id, c)
+    };
+    egui::ComboBox::from_id_salt("cue_chain_add")
+        .selected_text("＋ add effect")
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(false, "Live shader").clicked() {
+                let _ = tx.send(append(SlotRef::Live));
+            }
+            for s in &m.shader_pool {
+                if ui.selectable_label(false, s.name.as_ref()).clicked() {
+                    let slot = if s.builtin {
+                        SlotRef::Builtin(s.name.clone())
+                    } else {
+                        SlotRef::Pinned(s.id)
+                    };
+                    let _ = tx.send(append(slot));
+                }
+            }
+        });
 }
 
 /// The advanced per-cue sections: dwell, loop rate, timing offsets, and speed.

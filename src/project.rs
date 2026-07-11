@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use nanoserde::{DeRon, SerRon};
 
-use crate::bank::{Cue, CueId, Toggle};
-use crate::clippool::Clip;
-use crate::commands::ClipId;
+use crate::bank::{Bank, Cue, CueId, Toggle};
+use crate::clippool::{Clip, ClipBank};
+use crate::commands::{ChainSlot, ClipId, SlotRef};
 
 /// Bumped on any breaking change to the on-disk shape; [`load`] routes older
 /// files through [`migrate`].
@@ -107,11 +107,19 @@ pub struct CueBankSpec {
     pub cues: Vec<CueSpec>,
 }
 
+/// One serialized entry in a cue's effect chain. Built-ins are referenced by
+/// stable name; the live (livecoded) shader is a tagged position. Pinned
+/// livecode captures have no stable source and are not serialized (dropped on
+/// save), so there is no `Pinned` variant here.
+#[derive(SerRon, DeRon, Clone, Debug, PartialEq, Eq)]
+pub enum CueEffectSpec {
+    Live,
+    Builtin(String),
+}
+
 /// A cue placement. Runtime `Toggle<T>` advanced knobs are flattened to
 /// `Option<T>` (`None` = off; the toggle's retained-off value is not persisted).
-/// The per-cue shader override is intentionally absent in v1 — pinned/livecoded
-/// shaders have no stable persistence handle.
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct CueSpec {
     pub clip: ClipId,
     #[nserde(default)]
@@ -138,6 +146,23 @@ pub struct CueSpec {
     pub bpm_sync_on: bool,
     #[nserde(default)]
     pub speed_mul: Option<f64>,
+    /// The cue's effect chain, in order. Empty = the live shader. Built-ins by
+    /// name; pinned livecode captures are dropped on save.
+    #[nserde(default)]
+    pub chain: Vec<CueEffectSpec>,
+}
+
+impl CueSpec {
+    /// A whole-clip cue: no trim, every override inherited, no effect chain.
+    /// The stable constructor callers (incl. vidiotic-prep) should use instead of
+    /// a struct literal, so added fields don't break them.
+    pub fn full_length(clip: ClipId, name: String) -> Self {
+        Self {
+            clip,
+            name,
+            ..Self::default()
+        }
+    }
 }
 
 /// On-disk mirror of [`crate::commands::SyncKind`], kept separate so the format
@@ -192,6 +217,17 @@ pub fn resolve_path(project_dir: &Path, stored: &str) -> PathBuf {
     } else {
         project_dir.join(p)
     }
+}
+
+/// Best-effort absolute form of a path for storage: canonical when the file
+/// exists (clean, symlink-resolved), otherwise a lexical absolutize, otherwise
+/// the input unchanged. A path scanned from a relative `--clip-dir` is
+/// CWD-relative, so it must be absolutized before [`relativize`] or the saved
+/// string would resolve against the wrong root on load.
+pub fn absolutize(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p)
+        .or_else(|_| std::path::absolute(p))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Store `abs` relative to `project_dir` when it lives under it; otherwise keep
@@ -345,10 +381,15 @@ pub struct ClipMeta {
 impl ClipSpec {
     /// Build a spec from a runtime clip, storing its path relative to
     /// `project_dir` where possible.
+    ///
+    /// The runtime path is [`absolutize`]d first (a clip pool scanned from a
+    /// relative `--clip-dir` holds CWD-relative paths); otherwise saving into a
+    /// different directory would emit a string that resolves against the wrong
+    /// root on load.
     pub fn from_clip(c: &Clip, project_dir: &Path, meta: ClipMeta) -> Self {
         Self {
             id: c.id,
-            path: relativize(project_dir, &c.path),
+            path: relativize(project_dir, &absolutize(&c.path)),
             name: c.name.to_string(),
             bpm: c.bpm,
             fps: meta.fps,
@@ -371,8 +412,22 @@ impl ClipSpec {
 
 impl CueSpec {
     /// Snapshot a runtime cue. Drops the runtime `id` (reassigned on load) and
-    /// the shader override; maps each `Toggle` to `Some(val)` only when on.
+    /// maps each `Toggle` to `Some(val)` only when on. Chain slots serialize by
+    /// stable name; pinned livecode captures have no stable source, so they are
+    /// dropped (with a warning).
     pub fn from_cue(c: &Cue) -> Self {
+        let chain = c
+            .chain
+            .iter()
+            .filter_map(|slot| match &slot.shader {
+                SlotRef::Live => Some(CueEffectSpec::Live),
+                SlotRef::Builtin(name) => Some(CueEffectSpec::Builtin(name.to_string())),
+                SlotRef::Pinned(id) => {
+                    log::warn!("dropping pinned shader {id} from saved cue chain (not persistable)");
+                    None
+                }
+            })
+            .collect();
         Self {
             clip: c.clip,
             name: c.name.to_string(),
@@ -387,12 +442,24 @@ impl CueSpec {
             bpm: c.bpm,
             bpm_sync_on: c.bpm_sync_on,
             speed_mul: c.speed_mul.on.then_some(c.speed_mul.val),
+            chain,
         }
     }
 
     /// Rebuild a runtime cue with the caller-assigned `id`. Absent toggles come
     /// back off, carrying the same retained defaults as [`Cue::new`].
     pub fn to_cue(&self, id: CueId) -> Cue {
+        let chain = self
+            .chain
+            .iter()
+            .map(|e| {
+                let shader = match e {
+                    CueEffectSpec::Live => SlotRef::Live,
+                    CueEffectSpec::Builtin(name) => SlotRef::Builtin(name.as_str().into()),
+                };
+                ChainSlot::new(shader)
+            })
+            .collect();
         Cue {
             id,
             clip: self.clip,
@@ -400,7 +467,7 @@ impl CueSpec {
             in_sec: self.in_sec,
             out_sec: self.out_sec,
             preserve: self.preserve,
-            shader: None,
+            chain,
             dwell: self.dwell,
             loop_len: self.loop_len,
             loop_phase: toggle(self.loop_phase, 0),
@@ -409,6 +476,63 @@ impl CueSpec {
             bpm: self.bpm,
             bpm_sync_on: self.bpm_sync_on,
             speed_mul: toggle(self.speed_mul, 1.0),
+        }
+    }
+}
+
+impl ClipBankSpec {
+    /// Snapshot a runtime clip bank. `dir` (a scan source) is not persisted — a
+    /// saved bank is just its name and clip-id membership.
+    pub fn from_bank(b: &ClipBank) -> Self {
+        Self {
+            name: b.name.to_string(),
+            clip_ids: b.clip_ids.clone(),
+        }
+    }
+}
+
+impl CueBankSpec {
+    /// Snapshot a runtime cue bank, converting each cue via [`CueSpec::from_cue`].
+    pub fn from_bank(b: &Bank) -> Self {
+        Self {
+            name: b.name.to_string(),
+            cues: b.cues.iter().map(CueSpec::from_cue).collect(),
+        }
+    }
+}
+
+impl Project {
+    /// Assemble a `Project` from live runtime state, ready to [`save`]. Clip paths
+    /// are stored relative to `dir` (the save directory) where possible.
+    ///
+    /// `clip_meta` supplies probe data the runtime [`Clip`] does not retain
+    /// (`fps`/`frames`/`duration_sec`/`source`); clips absent from the map — e.g.
+    /// added at runtime from a folder scan — fall back to [`ClipMeta::default`]
+    /// and are re-probed on the next load. Clip ids are stable across a
+    /// load/save round-trip, so clip-bank membership references stay valid.
+    ///
+    /// This is the shared inverse of the load path in the binary: any consumer of
+    /// the `vidiotic` lib that holds runtime `Clip`/`ClipBank`/`Bank` state can
+    /// build a savable project through it.
+    pub fn from_runtime(
+        dir: &Path,
+        clips: &[Clip],
+        clip_banks: &[ClipBank],
+        cue_banks: &[Bank],
+        clip_meta: &HashMap<ClipId, ClipMeta>,
+        defaults: SessionDefaults,
+    ) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            defaults,
+            clips: clips
+                .iter()
+                .map(|c| {
+                    ClipSpec::from_clip(c, dir, clip_meta.get(&c.id).cloned().unwrap_or_default())
+                })
+                .collect(),
+            clip_banks: clip_banks.iter().map(ClipBankSpec::from_bank).collect(),
+            cue_banks: cue_banks.iter().map(CueBankSpec::from_bank).collect(),
         }
     }
 }
@@ -474,6 +598,7 @@ mod tests {
                     bpm: Some(128.0),
                     bpm_sync_on: true,
                     speed_mul: Some(1.5),
+                    chain: vec![CueEffectSpec::Builtin("kaleido".into()), CueEffectSpec::Live],
                 }],
             }],
         }
@@ -508,6 +633,100 @@ mod tests {
         assert_eq!(back.loop_phase, Some(-4));
         assert_eq!(back.start_nudge, None);
         assert_eq!(back.speed_mul, Some(1.5));
+    }
+
+    #[test]
+    fn from_runtime_round_trips_through_save() {
+        let dir = std::env::temp_dir().join("vidiotic_proj_test_from_runtime");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+
+        // Runtime state: one clip, one clip bank, one cue bank whose sole cue
+        // carries a `Builtin("kaleido") → Live` chain (the feature we must persist).
+        let clips = vec![Clip {
+            id: 0,
+            path: dir.join("clips/kick.mov"),
+            name: "kick.mov".into(),
+            bpm: Some(128.0),
+        }];
+        let clip_banks = vec![ClipBank {
+            name: "drums".into(),
+            dir: None,
+            clip_ids: vec![0],
+        }];
+        let cue = sample().cue_banks[0].cues[0].clone().to_cue(1);
+        let cue_banks = vec![Bank {
+            name: "A".into(),
+            cues: vec![cue],
+        }];
+        // The metadata a runtime `Clip` drops but a faithful save must retain.
+        let clip_meta = HashMap::from([(
+            0,
+            ClipMeta {
+                fps: Some(30.0),
+                frames: Some(64),
+                duration_sec: Some(2.133),
+                source: Some(SpanProvenance {
+                    original_path: "/src/drums.mov".into(),
+                    in_frame: 10,
+                    out_frame: 74,
+                    in_sec: 0.333,
+                    out_sec: 2.466,
+                }),
+            },
+        )]);
+        let defaults = SessionDefaults {
+            bpm: 128.0,
+            quantum: 4.0,
+            phrase_len: 16,
+            sync: SyncSpec::Link,
+            preserve_playhead: true,
+            loop_len: Some(128),
+            advanced: false,
+            shader_path: Some("shaders/demo.frag".into()),
+        };
+
+        let proj = Project::from_runtime(&dir, &clips, &clip_banks, &cue_banks, &clip_meta, defaults);
+        let path = dir.join("out.viproj");
+        save(&proj, &path).expect("save");
+        let back = load(&path).expect("load");
+
+        // Clip path relativized against the save dir; retained metadata survives.
+        assert_eq!(back.clips[0].path, "clips/kick.mov");
+        assert_eq!(back.clips[0].fps, Some(30.0));
+        assert_eq!(back.clips[0].source.as_ref().unwrap().in_frame, 10);
+        // A clip with no meta entry falls back to blank probe data (no panic).
+        assert_eq!(back.clip_banks[0].clip_ids, vec![0]);
+        // The effect chain round-trips intact.
+        assert_eq!(
+            back.cue_banks[0].cues[0].chain,
+            vec![CueEffectSpec::Builtin("kaleido".into()), CueEffectSpec::Live]
+        );
+        assert_eq!(back.defaults.bpm, 128.0);
+        assert_eq!(back.defaults.sync, SyncSpec::Link);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_clip_absolutizes_relative_path() {
+        // A clip scanned from a relative `--clip-dir` holds a CWD-relative path.
+        // Saving into an unrelated directory must not emit that string verbatim
+        // (it would resolve against the wrong root on load) — from_clip absolutizes
+        // first, so relativizing against a foreign dir yields an absolute path.
+        let clip = Clip {
+            id: 0,
+            path: "some/relative/clip.mov".into(),
+            name: "clip.mov".into(),
+            bpm: None,
+        };
+        let spec = ClipSpec::from_clip(&clip, Path::new("/elsewhere/proj"), ClipMeta::default());
+        assert!(
+            Path::new(&spec.path).is_absolute(),
+            "expected absolute path, got {:?}",
+            spec.path
+        );
+        assert!(spec.path.ends_with("some/relative/clip.mov"));
     }
 
     #[test]

@@ -54,6 +54,25 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 let _ = tx.send(Command::RemoveShader(id));
             }
 
+            ui.add_space(SP_MD);
+            if ui
+                .button("💾 Save")
+                .on_hover_text(
+                    "Save the project (⌘/Ctrl+S). Writes back to the loaded file, or \
+                     asks where to put it for a fresh session.",
+                )
+                .clicked()
+            {
+                let _ = tx.send(Command::SaveProject);
+            }
+            if ui
+                .button("Save As…")
+                .on_hover_text("Save the project to a new .viproj file")
+                .clicked()
+            {
+                let _ = tx.send(Command::SaveProjectAs);
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(err) = &m.audio_error {
                     let resp = widgets::chip(ui, "audio ⚠", Some(PALETTE.error), false);

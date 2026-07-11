@@ -29,7 +29,7 @@ void main() {
     r /= (1.0 + bass * 0.6);
 
     vec2 kuv = vec2(cos(a), sin(a)) * r + 0.5;
-    vec3 col = video(kuv).rgb;
+    vec3 col = prev(kuv).rgb;
 
     // per-beat brighten + downbeat ring flash
     col *= 1.0 + pow(max(0.0, 1.0 - fract(beat)), 4.0) * 0.5;

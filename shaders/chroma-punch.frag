@@ -25,9 +25,9 @@ void main() {
     float ca = (0.004 + bass * 0.022) * (0.4 + length(c));
     vec2 dir = normalize(c + 1e-5);
     vec3 col;
-    col.r = video(suv + dir * ca).r;
-    col.g = video(suv).g;
-    col.b = video(suv - dir * ca).b;
+    col.r = prev(suv + dir * ca).r;
+    col.g = prev(suv).g;
+    col.b = prev(suv - dir * ca).b;
 
     col *= 1.0 + energy;
 

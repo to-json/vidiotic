@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::commands::{ClipId, ShaderId};
+use crate::commands::{ChainSlot, ClipId};
 
 /// Identifies a cue. Distinct from `ClipId`: the same source clip can appear as
 /// several cues (different trim / options), so decoders are keyed by cue.
@@ -43,9 +43,11 @@ pub struct Cue {
     pub out_sec: Option<f64>,
     /// Per-cue override of the global preserve-playhead default; `None` inherits.
     pub preserve: Option<bool>,
-    /// Per-cue shader override: a pinned pool shader used while this cue plays.
-    /// `None` = use whatever the live (livecoded) shader is.
-    pub shader: Option<ShaderId>,
+    /// Per-cue effect chain: an ordered stack of shaders applied while this cue
+    /// plays; each stage reads the previous stage's output via `prev()`. Empty =
+    /// use whatever the live (livecoded) shader is. The live shader can appear as
+    /// a slot (`SlotRef::Live`) anywhere in the stack.
+    pub chain: Vec<ChainSlot>,
     /// Beats-until-advance, in 1/32-beat ticks (`LOOP_TICKS_PER_BEAT`); `None`
     /// inherits the global phrase length. How long this cue plays before the
     /// sequencer advances to the next.
@@ -79,7 +81,7 @@ impl Cue {
             in_sec: 0.0,
             out_sec: None,
             preserve: None,
-            shader: None,
+            chain: Vec::new(),
             dwell: None,
             loop_len: None,
             loop_phase: Toggle::off(0),

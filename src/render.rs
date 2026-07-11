@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::analysis::{AUDIO_TEX_LEN, AUDIO_TEX_W};
-use crate::commands::ShaderId;
+use crate::commands::{ChainSlot, ShaderId, SlotRef};
 use crate::shader::{self, ShaderError, ShaderLang};
 use crate::video::frame::{DecodedFrame, PixelData};
 use crate::video::hap::HapTextureFormat;
@@ -84,11 +84,34 @@ struct VideoTexture {
     bind_group: wgpu::BindGroup,
 }
 
-/// A shader pinned into the pool: a frozen compile a cue can render with.
+/// A shader in the pool: a frozen compile a cue's chain can render with.
+/// `builtin` entries are the bundled effects (addressable by stable name and
+/// persistable); non-builtin entries are livecoded pins (runtime-only).
 struct PooledShader {
     id: ShaderId,
     name: Arc<str>,
+    builtin: bool,
     pipeline: wgpu::RenderPipeline,
+}
+
+/// The bundled effect shaders loaded into the pool at startup, addressable by
+/// the stable name written into `.viproj`. Each is a fragment shader that reads
+/// its input via `prev()`; every entry is covered by the
+/// `bundled_frag_shaders_compile` test.
+const BUILTIN_EFFECTS: &[(&str, &str)] = &[
+    ("kaleido", include_str!("../shaders/kaleido.frag")),
+    ("glitch-vhs", include_str!("../shaders/glitch-vhs.frag")),
+    ("chroma-punch", include_str!("../shaders/chroma-punch.frag")),
+    ("spectrum-warp", include_str!("../shaders/spectrum-warp.frag")),
+];
+
+/// Two persistent offscreen color buffers ping-ponged between chain stages,
+/// sized to the current output. Kept across frames (never transient) so a future
+/// feedback effect can sample last frame's result.
+struct PingPong {
+    w: u32,
+    h: u32,
+    views: [wgpu::TextureView; 2],
 }
 
 /// Owns the composite pass: the compiled user shader (plus pinned pool shaders
@@ -97,11 +120,18 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     bgl_video: wgpu::BindGroupLayout,
+    bgl_input: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vs_glsl: wgpu::ShaderModule, // paired with GLSL fragment shaders
     vs_wgsl: wgpu::ShaderModule, // paired with WGSL fragment shaders
     sampler: wgpu::Sampler,
     dummy_alpha_view: wgpu::TextureView,
+    // 1x1 black RGBA bound as the set=2 input when no real previous-stage output
+    // exists (the empty-chain fast path and the seed pass, which read `video()`).
+    dummy_input_view: wgpu::TextureView,
+    // Ping-pong intermediates, allocated on first multi-stage render and when the
+    // output size changes.
+    ping: Option<PingPong>,
     // Shadertoy audio texture (512x2 R8): row 0 FFT, row 1 waveform. Persistent,
     // rewritten every frame, and bound into every video bind group.
     audio_tex: wgpu::Texture,
@@ -116,12 +146,12 @@ pub struct Renderer {
     // Source of the current last-good live compile, so it can be re-compiled into
     // a frozen pool entry on `capture_current`.
     last_good: Option<(String, ShaderLang)>,
-    // Pinned shaders and the id of the one currently overriding the live shader
-    // (set by the app from the playing cue). Falls back to the live shader when
-    // the id no longer resolves.
+    // Built-in effects (loaded at startup) plus livecoded pins. Chain slots
+    // resolve against this by name (built-ins) or id (pins).
     pool: Vec<PooledShader>,
     next_pool_id: ShaderId,
-    active_override: Option<ShaderId>,
+    // The playing cue's effect chain (set by the app). Empty = the live shader.
+    active_chain: Vec<ChainSlot>,
 }
 
 impl Renderer {
@@ -192,9 +222,25 @@ impl Renderer {
             ],
         });
 
+        // set=2: per-pass inputs. binding 0/1 are the chain-input texture+sampler
+        // (the previous stage's output). Higher bindings are reserved for future
+        // per-stage params and a feedback texture.
+        let bgl_input = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("input-bgl"),
+            entries: &[
+                tex_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("output-layout"),
-            bind_group_layouts: &[Some(&bgl_globals), Some(&bgl_video)],
+            bind_group_layouts: &[Some(&bgl_globals), Some(&bgl_video), Some(&bgl_input)],
             immediate_size: 0,
         });
 
@@ -241,6 +287,23 @@ impl Renderer {
         });
         let dummy_alpha_view = dummy.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // 1x1 black RGBA for the set=2 input when there is no previous stage.
+        let dummy_input = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("input-dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_input_view = dummy_input.create_view(&wgpu::TextureViewDescriptor::default());
+
         // Persistent 512x2 R8 audio texture, rewritten each frame from the
         // analysis thread's packed spectrum + waveform rows.
         let audio_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -284,15 +347,45 @@ impl Renderer {
             build_pipeline(device, &pipeline_layout, &vs_glsl, &fs, color_format)
         };
 
+        // Load the bundled effects into the pool, addressable by stable name.
+        // A build-time invariant (the `bundled_frag_shaders_compile` test) keeps
+        // these compiling; if one somehow fails here we log and skip it rather
+        // than take the app down.
+        let mut pool = Vec::new();
+        let mut next_pool_id: ShaderId = 1;
+        for (name, src) in BUILTIN_EFFECTS {
+            match shader::compile_glsl_to_module(src) {
+                Ok(module) => {
+                    let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("builtin-fs"),
+                        source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+                    });
+                    let pipeline =
+                        build_pipeline(device, &pipeline_layout, &vs_glsl, &fs, color_format);
+                    pool.push(PooledShader {
+                        id: next_pool_id,
+                        name: (*name).into(),
+                        builtin: true,
+                        pipeline,
+                    });
+                    next_pool_id += 1;
+                }
+                Err(e) => log::error!("built-in effect {name} failed to compile: {e}"),
+            }
+        }
+
         Self {
             globals_buf,
             globals_bg,
             bgl_video,
+            bgl_input,
             pipeline_layout,
             vs_glsl,
             vs_wgsl,
             sampler,
             dummy_alpha_view,
+            dummy_input_view,
+            ping: None,
             audio_tex,
             audio_view,
             audio_sampler,
@@ -302,9 +395,9 @@ impl Renderer {
             passthrough,
             shader_error: None,
             last_good: None,
-            pool: Vec::new(),
-            next_pool_id: 1,
-            active_override: None,
+            pool,
+            next_pool_id,
+            active_chain: Vec::new(),
         }
     }
 
@@ -345,6 +438,7 @@ impl Renderer {
                 self.pool.push(PooledShader {
                     id,
                     name: name.into(),
+                    builtin: false,
                     pipeline,
                 });
                 Some(id)
@@ -357,22 +451,41 @@ impl Renderer {
         }
     }
 
-    /// Drop a pinned shader from the pool, clearing the override if it was active.
+    /// Drop a pinned shader from the pool, removing any chain slots that
+    /// reference it (built-ins are never removed this way).
     pub fn remove_pool_shader(&mut self, id: ShaderId) {
-        self.pool.retain(|p| p.id != id);
-        if self.active_override == Some(id) {
-            self.active_override = None;
+        self.pool.retain(|p| p.id != id || p.builtin);
+        self.active_chain
+            .retain(|slot| slot.shader != SlotRef::Pinned(id));
+    }
+
+    /// Set the effect chain rendered this frame (empty = the live shader).
+    pub fn set_active_chain(&mut self, chain: Vec<ChainSlot>) {
+        self.active_chain = chain;
+    }
+
+    /// (id, name, builtin) of each pool shader, built-ins first (load order).
+    pub fn pool_view(&self) -> Vec<(ShaderId, Arc<str>, bool)> {
+        self.pool
+            .iter()
+            .map(|p| (p.id, p.name.clone(), p.builtin))
+            .collect()
+    }
+
+    /// Resolve a chain slot to its pipeline, or `None` if it no longer exists
+    /// (a removed pin, or a built-in name absent from this build).
+    fn resolve_slot(&self, slot: &SlotRef) -> Option<&wgpu::RenderPipeline> {
+        match slot {
+            SlotRef::Live => Some(self.pipeline.as_ref().unwrap_or(&self.passthrough)),
+            SlotRef::Builtin(name) => self
+                .pool
+                .iter()
+                .find(|p| p.builtin && p.name.as_ref() == name.as_ref())
+                .map(|p| &p.pipeline),
+            SlotRef::Pinned(id) => {
+                self.pool.iter().find(|p| p.id == *id).map(|p| &p.pipeline)
+            }
         }
-    }
-
-    /// Select which pinned shader overrides the live one this frame (`None` = live).
-    pub fn set_active_shader(&mut self, id: Option<ShaderId>) {
-        self.active_override = id;
-    }
-
-    /// (id, name) of each pinned shader, in pin order.
-    pub fn pool_view(&self) -> Vec<(ShaderId, Arc<str>)> {
-        self.pool.iter().map(|p| (p.id, p.name.clone())).collect()
     }
 
     fn compile(
@@ -571,20 +684,102 @@ impl Renderer {
         );
     }
 
-    /// Draw the composite into `view`. Uses the active user pipeline, or the
-    /// built-in passthrough if none has been set yet.
-    pub fn render(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
-        // A playing cue's pinned override wins, else the live shader, else passthrough.
-        let pipeline = self
-            .active_override
-            .and_then(|id| self.pool.iter().find(|p| p.id == id))
-            .map(|p| &p.pipeline)
-            .or(self.pipeline.as_ref())
-            .unwrap_or(&self.passthrough);
+    /// Draw the composite into `view` at `width`x`height`.
+    ///
+    /// With no effect chain this is a single pass — the live shader (or the
+    /// built-in passthrough) straight to `view`, exactly as before. With a chain,
+    /// a seed pass primes buffer 0 with the decoded source (so `prev()` in the
+    /// first stage == the source), then each stage reads the previous stage's
+    /// output via the set=2 input and ping-pongs, the last stage targeting `view`.
+    ///
+    /// # Panics
+    /// Panics only on internal invariants that always hold: the video texture is
+    /// present past the early-out, and the ping-pong buffers are allocated
+    /// whenever the resolved chain is non-empty.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        // No video yet → nothing to composite; clear to black and return.
+        if self.video.is_none() {
+            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("output-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            return;
+        }
+
+        if !self.active_chain.is_empty() {
+            self.ensure_ping(device, width, height);
+        }
+
+        let v = self.video.as_ref().expect("video present (checked above)");
+        // Resolve the chain to pipelines, skipping slots that no longer exist.
+        let passes: Vec<&wgpu::RenderPipeline> = self
+            .active_chain
+            .iter()
+            .filter_map(|slot| self.resolve_slot(&slot.shader))
+            .collect();
+
+        // Empty (or fully-unresolved) chain: today's single-pass fast path — the
+        // live shader (or passthrough) straight to `view`, input = dummy.
+        if passes.is_empty() {
+            let pipeline = self.pipeline.as_ref().unwrap_or(&self.passthrough);
+            let input_bg = self.make_input_bg(device, &self.dummy_input_view);
+            self.draw_pass(encoder, pipeline, &v.bind_group, &input_bg, view);
+            return;
+        }
+
+        let ping = self.ping.as_ref().expect("ping allocated for non-empty chain");
+        // Pre-build the set=2 input bind groups: the seed reads the dummy (it
+        // uses `video()`), each effect reads the buffer the prior stage wrote.
+        let seed_input = self.make_input_bg(device, &self.dummy_input_view);
+        let input_bgs: Vec<wgpu::BindGroup> = (0..passes.len())
+            .map(|i| self.make_input_bg(device, &ping.views[i % 2]))
+            .collect();
+
+        // Seed: decoded source → buffer 0.
+        self.draw_pass(encoder, &self.passthrough, &v.bind_group, &seed_input, &ping.views[0]);
+        for (i, pipeline) in passes.iter().enumerate() {
+            let target = if i + 1 == passes.len() {
+                view
+            } else {
+                &ping.views[(i + 1) % 2]
+            };
+            self.draw_pass(encoder, pipeline, &v.bind_group, &input_bgs[i], target);
+        }
+    }
+
+    /// One fullscreen pass: `pipeline` reading globals (set 0), video (set 1) and
+    /// the given input (set 2), writing into `target`.
+    fn draw_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        video_bg: &wgpu::BindGroup,
+        input_bg: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("output-pass"),
+            label: Some("chain-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
+                view: target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -599,11 +794,57 @@ impl Renderer {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.globals_bg, &[]);
-        if let Some(v) = &self.video {
-            pass.set_bind_group(1, &v.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+        pass.set_bind_group(1, video_bg, &[]);
+        pass.set_bind_group(2, input_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Build a set=2 input bind group pointing at `input`.
+    fn make_input_bg(&self, device: &wgpu::Device, input: &wgpu::TextureView) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("input-bg"),
+            layout: &self.bgl_input,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(input),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+
+    /// (Re)allocate the ping-pong intermediates when the output size changes.
+    fn ensure_ping(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let (w, h) = (width.max(1), height.max(1));
+        if self.ping.as_ref().is_some_and(|p| p.w == w && p.h == h) {
+            return;
         }
-        // No video yet → nothing to composite; the clear (black) stands.
+        let make = |label| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.color_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            tex.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        self.ping = Some(PingPong {
+            w,
+            h,
+            views: [make("chain-buf-0"), make("chain-buf-1")],
+        });
     }
 }
 

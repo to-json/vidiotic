@@ -4,7 +4,7 @@
 //! output shader.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,13 @@ pub struct Boot {
     /// Cue banks to seed the sequencer with; empty ⇒ one default bank "A".
     pub cue_banks: Vec<Bank>,
     pub auto_active: Vec<ClipId>,
+    /// Probe metadata (`fps`/`frames`/`duration_sec`/`source`) for loaded clips,
+    /// keyed by id. The runtime `Clip` drops these, so they are retained here to
+    /// round-trip through a save. Empty for the non-project path.
+    pub clip_meta: HashMap<ClipId, crate::project::ClipMeta>,
+    /// The `.viproj` this session was loaded from, if any — the default target
+    /// for an in-place save. `None` when started from `--clip`/`--clip-dir`.
+    pub project_path: Option<PathBuf>,
     /// Session playback defaults (project load overrides the CLI defaults).
     pub preserve_playhead: bool,
     pub loop_len: Option<u32>,
@@ -92,6 +99,11 @@ pub struct App {
     clip_banks: Vec<ClipBank>,
     active_clip_bank: usize,
     next_clip_id: ClipId,
+    // Retained load-time clip probe metadata + the source `.viproj`, so a save can
+    // round-trip data the runtime `Clip` doesn't hold and default to writing back
+    // where the session was loaded from.
+    clip_meta: HashMap<ClipId, crate::project::ClipMeta>,
+    project_path: Option<PathBuf>,
     thumb_rx: Option<Receiver<Thumbnail>>,
     // Cue banks: the sequencer plays `live_bank`; the UI edits `edit_bank` (they
     // can differ so you play one set while modifying another). Decoders and
@@ -182,6 +194,8 @@ impl App {
             clip_banks: boot.clip_banks,
             active_clip_bank: 0,
             next_clip_id,
+            clip_meta: boot.clip_meta,
+            project_path: boot.project_path,
             thumb_rx: boot.thumb_rx,
             banks: cue_banks,
             live_bank: 0,
@@ -248,6 +262,42 @@ impl App {
             .find(|c| c.id == id)
             .map(|c| c.name.clone())
             .unwrap_or_default()
+    }
+
+    /// Assemble the current session into a `Project` and write it to `path`. A
+    /// failed write is logged, never fatal — losing a save must not kill the set.
+    /// `SessionDefaults` are gathered from the live clock/sequencer here; the
+    /// spec assembly itself lives in the shared [`crate::project`] module.
+    fn save_project_to(&mut self, path: &Path) {
+        use crate::project::{self, Project, SessionDefaults, SyncSpec};
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let defaults = SessionDefaults {
+            bpm: self.clock.snapshot().bpm,
+            quantum: self.quantum,
+            phrase_len: self.sequencer.phrase_len() as u32,
+            sync: match self.sync {
+                SyncKind::Internal => SyncSpec::Internal,
+                SyncKind::Link => SyncSpec::Link,
+            },
+            preserve_playhead: self.preserve_playhead,
+            loop_len: self.loop_len,
+            advanced: self.advanced,
+            // Absolutize like clip paths: a CWD-relative `--shader` would resolve
+            // against the save dir on load and be lost.
+            shader_path: Some(project::relativize(dir, &project::absolutize(&self.shader_path))),
+        };
+        let proj = Project::from_runtime(
+            dir,
+            &self.clips,
+            &self.clip_banks,
+            &self.banks,
+            &self.clip_meta,
+            defaults,
+        );
+        match project::save(&proj, path) {
+            Ok(()) => log::info!("saved project to {}", path.display()),
+            Err(e) => log::error!("failed to save project to {}: {e:#}", path.display()),
+        }
     }
 
     /// The cue with `id`, looked up in the live bank.
@@ -582,9 +632,8 @@ impl App {
         }
         for bank in &mut self.banks {
             for cue in &mut bank.cues {
-                if cue.shader == Some(id) {
-                    cue.shader = None;
-                }
+                cue.chain
+                    .retain(|slot| slot.shader != crate::commands::SlotRef::Pinned(id));
             }
         }
     }
@@ -781,7 +830,7 @@ impl App {
                 }
             }
             Command::SetCuePreserve(id, v) => self.edit_cue(id, |c| c.preserve = v),
-            Command::SetCueShader(id, s) => self.edit_cue(id, |c| c.shader = s),
+            Command::SetCueChain(id, chain) => self.edit_cue(id, |c| c.chain = chain),
             Command::SetCueParam(id, p) => self.set_cue_param(id, p),
             Command::MoveCue(id, to) => self.move_cue(id, to),
             Command::SetClipBpm(id, bpm) => self.set_clip_bpm(id, bpm),
@@ -802,6 +851,26 @@ impl App {
             }
             Command::SetAudioDevice(name) => self.switch_audio_device(name),
             Command::ToggleFullscreen => self.toggle_fullscreen(),
+            Command::SaveProject => {
+                if let Some(p) = self.project_path.clone() {
+                    self.save_project_to(&p);
+                } else {
+                    crate::ui::pick_file(
+                        self.cmd_tx.clone(),
+                        crate::ui::PickKind::SaveProject(None),
+                    );
+                }
+            }
+            Command::SaveProjectAs => {
+                crate::ui::pick_file(
+                    self.cmd_tx.clone(),
+                    crate::ui::PickKind::SaveProject(self.project_path.clone()),
+                );
+            }
+            Command::SaveProjectTo(p) => {
+                self.save_project_to(&p);
+                self.project_path = Some(p);
+            }
             Command::Quit => self.should_quit = true,
         }
     }
@@ -883,14 +952,15 @@ impl App {
             }
         }
 
-        // 6b. Point the renderer at the playing cue's shader override (a pinned
-        // pool shader), or back to the live shader when the cue has none.
-        let override_shader = self
+        // 6b. Point the renderer at the playing cue's effect chain, or an empty
+        // chain (the live shader) when the cue has none.
+        let chain = self
             .current
             .and_then(|c| self.live_cue(c))
-            .and_then(|cue| cue.shader);
+            .map(|cue| cue.chain.clone())
+            .unwrap_or_default();
         if let Some(r) = self.renderer.as_mut() {
-            r.set_active_shader(override_shader);
+            r.set_active_chain(chain);
         }
 
         // 7. Uniforms. Skipped while occluded: these are two GPU queue writes
@@ -1053,7 +1123,7 @@ impl App {
             .map(|r| {
                 r.pool_view()
                     .into_iter()
-                    .map(|(id, name)| ShaderPoolView { id, name })
+                    .map(|(id, name, builtin)| ShaderPoolView { id, name, builtin })
                     .collect()
             })
             .unwrap_or_default();
@@ -1076,7 +1146,7 @@ impl App {
                     in_sec: c.in_sec,
                     out_sec: c.out_sec,
                     preserve: c.preserve,
-                    shader: c.shader,
+                    chain: c.chain.clone(),
                     role: if playing_cue == Some(c.id) {
                         ClipRole::Playing
                     } else if armed_cue == Some(c.id) {
@@ -1115,12 +1185,13 @@ impl App {
     }
 
     fn render_output(&mut self) {
-        let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_ref()) else {
+        let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) else {
             return;
         };
         if self.output_occluded {
             return;
         }
+        let (w, h) = (g.output.config.width, g.output.config.height);
         if let Some(frame) = g.output.acquire(&g.device) {
             let view = frame
                 .texture
@@ -1128,7 +1199,7 @@ impl App {
             let mut encoder = g
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            r.render(&mut encoder, &view);
+            r.render(&g.device, &mut encoder, &view, w, h);
             g.queue.submit([encoder.finish()]);
             frame.present();
         }
@@ -1218,6 +1289,11 @@ impl App {
                 }
                 "q" if self.modifiers.state().super_key() => {
                     let _ = tx.send(Command::Quit);
+                }
+                "s" if self.modifiers.state().super_key()
+                    || self.modifiers.state().control_key() =>
+                {
+                    let _ = tx.send(Command::SaveProject);
                 }
                 d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
                     let e = self.bpm_entry.get_or_insert_with(String::new);

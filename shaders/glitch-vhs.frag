@@ -19,9 +19,9 @@ void main() {
     // RGB split widens with bass
     float s = 0.005 + bass * 0.03;
     vec3 col;
-    col.r = video(vec2(fract(suv.x + s), suv.y)).r;
-    col.g = video(suv).g;
-    col.b = video(vec2(fract(suv.x - s), suv.y)).b;
+    col.r = prev(vec2(fract(suv.x + s), suv.y)).r;
+    col.g = prev(suv).g;
+    col.b = prev(vec2(fract(suv.x - s), suv.y)).b;
 
     // rolling VHS tracking bar
     float track = smoothstep(0.0, 0.03, abs(fract(uv.y - time * 0.2) - 0.5));

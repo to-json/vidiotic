@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -111,6 +112,11 @@ struct Loaded {
     clip_banks: Vec<ClipBank>,
     cue_banks: Vec<Bank>,
     auto_active: Vec<ClipId>,
+    /// Per-clip probe metadata retained for a faithful save; empty for the
+    /// `--clip`/`--clip-dir` path (raw files carry no baked metadata).
+    clip_meta: HashMap<ClipId, project::ClipMeta>,
+    /// The `.viproj` this was loaded from, if any (the default save target).
+    project_path: Option<PathBuf>,
     bpm: f64,
     phrase_len: u32,
     sync: SyncKind,
@@ -169,6 +175,8 @@ fn load_from_flags(cli: &RunArgs) -> anyhow::Result<Loaded> {
         clip_banks,
         cue_banks: Vec::new(),
         auto_active,
+        clip_meta: HashMap::new(),
+        project_path: None,
         bpm: cli.bpm,
         phrase_len: cli.phrase_len,
         sync: match cli.sync {
@@ -260,11 +268,32 @@ fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
         .or_else(|| cli.shader.clone())
         .ok_or_else(|| anyhow::anyhow!("project has no shader; pass --shader"))?;
 
+    // Retain per-clip probe metadata the runtime `Clip` drops, so a later save
+    // round-trips fps/frames/duration/provenance instead of blanking them.
+    let clip_meta: HashMap<ClipId, project::ClipMeta> = resolved
+        .project
+        .clips
+        .iter()
+        .map(|c| {
+            (
+                c.id,
+                project::ClipMeta {
+                    fps: c.fps,
+                    frames: c.frames,
+                    duration_sec: c.duration_sec,
+                    source: c.source.clone(),
+                },
+            )
+        })
+        .collect();
+
     Ok(Loaded {
         clips,
         clip_banks,
         cue_banks,
         auto_active: Vec::new(),
+        clip_meta,
+        project_path: Some(path.to_path_buf()),
         bpm: if d.bpm > 0.0 { d.bpm } else { cli.bpm },
         phrase_len: if d.phrase_len > 0 { d.phrase_len } else { cli.phrase_len },
         sync: match d.sync {
@@ -320,6 +349,8 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         clip_banks: loaded.clip_banks,
         cue_banks: loaded.cue_banks,
         auto_active: loaded.auto_active,
+        clip_meta: loaded.clip_meta,
+        project_path: loaded.project_path,
         preserve_playhead: loaded.preserve_playhead,
         loop_len: loaded.loop_len,
         advanced: loaded.advanced,

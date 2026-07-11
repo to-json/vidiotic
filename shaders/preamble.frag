@@ -23,6 +23,13 @@ layout(set = 1, binding = 2) uniform texture2D alphaTex;   // 1x1 white R8 dummy
 layout(set = 1, binding = 3) uniform texture2D audioTex;   // Shadertoy audio: 512x2 R8
 layout(set = 1, binding = 4) uniform sampler   audioSmp;   // clamp + linear
 
+// set = 2 is the per-pass / per-frame input set. binding 0/1 are the effect
+// chain's input texture: the previous stage's output (== the decoded source for
+// the first stage, via the renderer's seed pass). Binding numbers >= 2 are
+// reserved for future per-stage params and a feedback texture.
+layout(set = 2, binding = 0) uniform texture2D inputTex;
+layout(set = 2, binding = 1) uniform sampler   inputSmp;
+
 float fftBand(int i) { return uFreqs[i >> 2][i & 3]; }
 
 // Shadertoy audio convention: a 512x2 texture on iChannel0. Row 0 (y=0.25) is
@@ -32,6 +39,16 @@ float fftBand(int i) { return uFreqs[i >> 2][i & 3]; }
 #define iChannel0 sampler2D(audioTex, audioSmp)
 float fftAt(float x)  { return texture(sampler2D(audioTex, audioSmp), vec2(x, 0.25)).x; }
 float waveAt(float x) { return texture(sampler2D(audioTex, audioSmp), vec2(x, 0.75)).x; }
+
+// prev() = this effect's chain input (the previous stage's output). video() is
+// always the original decoded source, so an effect can blend against it. In the
+// first chain slot prev() == video() (the seed pass primes the input with the
+// decoded source). Outside a multi-stage chain prev() is unspecified — the bare
+// live shader should read video().
+vec4 prev(vec2 uv) {
+    vec2 st = vec2(uv.x, 1.0 - uv.y);                 // input stored top-down
+    return texture(sampler2D(inputTex, inputSmp), st);
+}
 
 vec4 video(vec2 uv) {
     vec2 st = vec2(uv.x, 1.0 - uv.y);                 // video rows stored top-down

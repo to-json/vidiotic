@@ -14,6 +14,32 @@ pub type ClipId = u32;
 /// A compiled shader pinned into the pool. A cue can reference one as an override.
 pub type ShaderId = u32;
 
+/// Which shader runs at one position in a cue's effect chain.
+///
+/// `Builtin` carries the effect's stable name — the persistable handle written
+/// into `.viproj`. `Pinned` is a runtime-only pool id (livecoded captures have
+/// no stable source, so they are not serialized). `Live` is the current
+/// livecoded shader, so it can sit anywhere in the stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotRef {
+    Live,
+    Builtin(Arc<str>),
+    Pinned(ShaderId),
+}
+
+/// One entry in a cue's effect chain. Per-stage parameters will hang off this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainSlot {
+    pub shader: SlotRef,
+}
+
+impl ChainSlot {
+    /// A slot referencing `shader` with default (no) parameters.
+    pub fn new(shader: SlotRef) -> Self {
+        Self { shader }
+    }
+}
+
 /// Resolution of the musical re-loop grid: 32 ticks per beat (quarter note), so
 /// an eighth note is 16 ticks and a 4/4 bar is 128. Lets `SetLoopLen` stay an
 /// integer while still expressing sub-beat divisions.
@@ -53,7 +79,7 @@ pub enum Command {
     SetCueInToPlayhead(CueId),         // snap in-point to the displayed playhead
     SetCueOutToPlayhead(CueId),        // snap out-point to the displayed playhead
     SetCuePreserve(CueId, Option<bool>), // per-cue preserve override; None = inherit global
-    SetCueShader(CueId, Option<ShaderId>), // per-cue shader override; None = the live shader
+    SetCueChain(CueId, Vec<ChainSlot>), // replace the cue's effect chain; empty = the live shader
     SetCueParam(CueId, CueParam),      // one advanced per-cue timing/speed knob
     MoveCue(CueId, usize),             // reorder within the edit bank to a target index (drag / ◀▶)
     SetClipBpm(ClipId, Option<f64>),   // source-clip tempo metadata; None clears it
@@ -72,6 +98,12 @@ pub enum Command {
     SetShaderPath(PathBuf),
     SetAudioDevice(Option<String>), // id key; None = default
     ToggleFullscreen,               // shell-intercepted
+    // Project persistence. `SaveProject` writes back to the loaded path (or opens
+    // the picker if none), `SaveProjectAs` always opens the picker; both resolve
+    // to a `SaveProjectTo` once a destination is known.
+    SaveProject,
+    SaveProjectAs,
+    SaveProjectTo(PathBuf),
     Quit,
 }
 
@@ -126,7 +158,7 @@ pub struct CueView {
     pub in_sec: f64,
     pub out_sec: Option<f64>,
     pub preserve: Option<bool>,
-    pub shader: Option<ShaderId>, // per-cue shader override; None = the live shader
+    pub chain: Vec<ChainSlot>, // per-cue effect chain; empty = the live shader
     pub role: ClipRole, // Playing/Armed if this cue is the live bank's current/next
     pub has_thumb: bool,
     // Advanced-mode timing/speed (see `crate::bank::Cue`). Ticks are 1/32-beat.
@@ -149,11 +181,14 @@ pub struct BankView {
     pub cue_count: usize,
 }
 
-/// A pinned shader in the pool, as shown in the shader picker / cue editor.
+/// A pool shader, as shown in the shader picker / cue editor. `builtin` entries
+/// are bundled effects addressable by stable name (and persistable); non-builtin
+/// entries are livecoded pins (runtime-only).
 #[derive(Clone, Debug)]
 pub struct ShaderPoolView {
     pub id: ShaderId,
     pub name: Arc<str>,
+    pub builtin: bool,
 }
 
 /// Read-only display state the engine republishes each tick for the control UI.

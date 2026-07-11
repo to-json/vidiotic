@@ -4,6 +4,7 @@
 //! compile -> pipeline, RGBA upload, BC1 upload + Metal block decode, and a
 //! live-reload-style shader swap. Run: `cargo run --bin spike_render`.
 
+use vidiotic::commands::{ChainSlot, SlotRef};
 use vidiotic::render::{Globals, Renderer};
 use vidiotic::shader::ShaderLang;
 use vidiotic::video::frame::{DecodedFrame, PixelData};
@@ -43,7 +44,7 @@ fn init_gpu() -> Gpu {
 
 /// Render the current renderer state into an offscreen RGBA8 target and read the
 /// center pixel back to the CPU.
-fn render_center_pixel(gpu: &Gpu, renderer: &Renderer) -> [u8; 4] {
+fn render_center_pixel(gpu: &Gpu, renderer: &mut Renderer) -> [u8; 4] {
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen"),
         size: wgpu::Extent3d {
@@ -71,7 +72,7 @@ fn render_center_pixel(gpu: &Gpu, renderer: &Renderer) -> [u8; 4] {
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    renderer.render(&mut encoder, &view);
+    renderer.render(&gpu.device, &mut encoder, &view, W, H);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,
@@ -142,7 +143,7 @@ fn main() {
         pts_sec: 0.0,
     };
     renderer.upload_frame(&gpu.device, &gpu.queue, &frame);
-    let p = render_center_pixel(&gpu, &renderer);
+    let p = render_center_pixel(&gpu, &mut renderer);
     let pass1 = close(p[0], 220, 6) && close(p[1], 20, 6) && close(p[2], 20, 6);
     println!("[{}] RGBA passthrough: center={p:?} (want ~[220,20,20,255])", if pass1 { " OK " } else { "FAIL" });
     ok &= pass1;
@@ -151,7 +152,7 @@ fn main() {
     let tint = "void main() { vec4 v = video(fragTexCoord); FragColor = vec4(0.0, v.r, 0.0, 1.0); }";
     renderer.set_shader(&gpu.device, tint, ShaderLang::Glsl);
     assert!(renderer.shader_error().is_none(), "tint shader should compile");
-    let p = render_center_pixel(&gpu, &renderer);
+    let p = render_center_pixel(&gpu, &mut renderer);
     // green channel should carry the red input (~220), red/blue ~0
     let pass2 = close(p[0], 0, 6) && p[1] > 180 && close(p[2], 0, 6);
     println!("[{}] shader swap (tint): center={p:?} (want green~=input red)", if pass2 { " OK " } else { "FAIL" });
@@ -160,7 +161,7 @@ fn main() {
     // 3. Broken shader -> keep last-good (green tint), error recorded.
     renderer.set_shader(&gpu.device, "void main() { FragColor = nope(); }", ShaderLang::Glsl);
     let has_err = renderer.shader_error().is_some();
-    let p = render_center_pixel(&gpu, &renderer);
+    let p = render_center_pixel(&gpu, &mut renderer);
     let pass3 = has_err && p[1] > 180;
     println!("[{}] broken shader kept last-good: err={} center={p:?}", if pass3 { " OK " } else { "FAIL" }, has_err);
     ok &= pass3;
@@ -187,11 +188,33 @@ fn main() {
         pts_sec: 0.0,
     };
     renderer.upload_frame(&gpu.device, &gpu.queue, &frame);
-    let p = render_center_pixel(&gpu, &renderer);
+    let p = render_center_pixel(&gpu, &mut renderer);
     // BC1 565 red decodes to ~ (255, 0, 0)
     let pass4 = p[0] > 230 && close(p[1], 0, 8) && close(p[2], 0, 8);
     println!("[{}] BC1 upload + GPU decode: center={p:?} (want ~[255,0,0])", if pass4 { " OK " } else { "FAIL" });
     ok &= pass4;
+
+    // 5. Effect chain: a seed pass primes prev() with the decoded source, then
+    // one Live stage reads prev() and tints green. Re-upload the RGBA red frame
+    // (test 4 left a BC1 frame), set a prev()-based live shader, run [Live].
+    let red: Vec<u8> = (0..(W * H)).flat_map(|_| [220u8, 20, 20, 255]).collect();
+    let frame = DecodedFrame {
+        pixels: PixelData::Rgba { data: red, stride: W * 4 },
+        w: W,
+        h: H,
+        pts_sec: 0.0,
+    };
+    renderer.upload_frame(&gpu.device, &gpu.queue, &frame);
+    let prev_tint = "void main() { FragColor = vec4(0.0, prev(fragTexCoord).r, 0.0, 1.0); }";
+    renderer.set_shader(&gpu.device, prev_tint, ShaderLang::Glsl);
+    assert!(renderer.shader_error().is_none(), "prev() tint should compile");
+    renderer.set_active_chain(vec![ChainSlot::new(SlotRef::Live)]);
+    let p = render_center_pixel(&gpu, &mut renderer);
+    // seed prev()==source (red 220) -> green channel ~220, red/blue ~0
+    let pass5 = close(p[0], 0, 6) && p[1] > 180 && close(p[2], 0, 6);
+    println!("[{}] chain seed+prev(): center={p:?} (want green~=source red)", if pass5 { " OK " } else { "FAIL" });
+    ok &= pass5;
+    renderer.set_active_chain(Vec::new());
 
     println!("\n{}", if ok { "SPIKE PASS" } else { "SPIKE FAIL" });
     std::process::exit(if ok { 0 } else { 1 });
