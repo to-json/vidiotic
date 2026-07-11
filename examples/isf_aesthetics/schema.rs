@@ -265,9 +265,9 @@ pub struct DemoState {
     pub ink_film: bool,
     /// Whether a nerd-patched mono loaded, so directions may use icon glyphs.
     pub nerd: bool,
-    /// Hybrid theme: Everforest dark (true) or light (false).
+    /// Everforest theme (Phosphor + Hybrid): dark (true) or light (false).
     pub dark: bool,
-    /// Hybrid theme: global hue rotation in degrees.
+    /// Everforest theme (Phosphor + Hybrid): global hue rotation in degrees.
     pub hue: f32,
 }
 

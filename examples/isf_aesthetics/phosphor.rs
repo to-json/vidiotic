@@ -1,19 +1,14 @@
-//! Direction 6 — **Hybrid**: the Terminal buffer grows hardware organs.
-//! Same character grid and statusline discipline as the Terminal direction,
-//! but floats and longs become Moog-style chickenhead knobs (drawn flat,
-//! 1-px strokes, mono skirt legends — as a terminal would draw them) and
-//! point2D becomes an oscilloscope XY: dot-glyph graticule, phosphor trace
-//! with persistence, glowing beam dot. Text keeps every control where text
-//! wins (bool, event, image, statusline, bind tags).
-//!
-//! The palette is Everforest, implemented in HSL: every role is an
-//! (h, s, l) anchor run through [`util::hsl`] with a global hue rotation,
-//! so the header's hue slider re-tints the whole scheme coherently. Dark
-//! and light are separate anchor sets; the scope screen and phosphor stay
-//! fixed-dark in both — a CRT is glass, not paper. The palette, theme bar,
-//! and grid helpers live in [`crate::everforest`], shared with Phosphor.
+//! Direction 5 — **Phosphor**: the midpoint between Terminal and Hybrid.
+//! Terminal's glyph discipline and density come back — every scalar control
+//! is a single 18-px buffer row — but the control *semantics* stay
+//! hardware: floats are faders (a cap sliding a tick-marked track), longs
+//! are detented slide switches, and point2D keeps the oscilloscope with its
+//! beam and persistence rasterized to shading blocks (`█▓▒░`), so even the
+//! phosphor decay lives on the character grid. Audio and FFT render as
+//! eighth-block traces. The Everforest HSL theme — dark/light anchors, hue
+//! rotation, theme bar — is shared with Hybrid via [`crate::everforest`].
 
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
 use crate::everforest::{Grid, Theme, mono, put, theme, theme_bar};
 use crate::nf;
@@ -24,12 +19,15 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-/// Grid rows a control spends (knobs and the scope buy taller rows).
+/// Eighth-block ramp for glyph traces.
+const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Grid rows a control spends — Terminal's budget: only the scope and the
+/// color triple buy extra rows.
 fn rows_of(kind: &MockKind) -> usize {
     match kind {
-        MockKind::Float { .. } | MockKind::Audio => 2,
-        MockKind::Long { .. } | MockKind::Color { .. } => 3,
-        MockKind::Point2D { .. } => 5,
+        MockKind::Point2D { .. } => 4,
+        MockKind::Color { .. } => 2,
         _ => 1,
     }
 }
@@ -43,8 +41,6 @@ pub fn show(ui: &mut Ui, st: &mut DemoState) {
     let th = theme(st.dark, st.hue);
     let width = ui.available_width().min(560.0);
     theme_bar(ui, &g, width, st, &th);
-    // The buffer title rides the frame's top border; keep its upper half
-    // clear of the theme bar.
     ui.add_space(10.0);
 
     let time = st.time;
@@ -57,9 +53,9 @@ pub fn show(ui: &mut Ui, st: &mut DemoState) {
     let painter = ui.painter();
     painter.rect_filled(frame, CornerRadius::same(2), th.bg);
     painter.rect_stroke(frame, CornerRadius::same(2), Stroke::new(1.0, th.frame), StrokeKind::Inside);
-    // Winbar-style title: break the border behind it so it reads as part
-    // of the frame in both modes.
-    let title = "─ kaleido-bloom.fs · hw ─";
+    // Winbar-style title with the border broken behind it (light mode needs
+    // the patch as much as dark).
+    let title = "─ kaleido-bloom.fs · crt ─";
     let galley = painter.layout_no_wrap(title.into(), mono(), th.dim);
     let title_pos = Pos2::new(frame.min.x + g.cw * 2.0, frame.min.y);
     painter.rect_filled(
@@ -136,19 +132,18 @@ pub fn show(ui: &mut Ui, st: &mut DemoState) {
         th.dim,
         ui.visuals().text_color(),
         &[
-            ("DENSITY", "Knobs spend 2 grid rows (~36 px) per float and longs 3 — half Terminal's density, spent exactly where rotary/detent semantics pay. Text rows stay 18 px."),
-            ("EPAINT COST", "Still light: a chickenhead is one convex polygon + a dozen strokes, the scope ~40 segments of trace. No textures, no gradients."),
-            ("MIDI", "Chickenheads are absolute, so soft pickup returns: bound knobs show a ghost tick at the incoming-CC angle. Everything else keeps Terminal's <cc74> tag + statusline learn mode."),
-            ("THEME", "Everforest in HSL: 13 role anchors as (h,s,l) tuples, so the hue slider rotates the whole scheme coherently. Dark/light are separate anchor sets; the scope glass + phosphor stay fixed-dark in both."),
-            ("FIT", "Reads as one idiom because the rendering rules never change — mono glyphs, 1-px strokes, one palette; only the *forms* are hardware."),
+            ("DENSITY", "Terminal's 18 px scalar rows are back: the fader and detent switch keep hardware semantics without buying height. Only the scope (4 rows) and color (2) spend more."),
+            ("EPAINT COST", "Glyphs almost everywhere — the scope adds two rects and ~25 text sprites for the beam. No polylines at all."),
+            ("MIDI", "Faders stay absolute, so soft pickup survives the diet: a hollow shaded cap marks the incoming-CC cell. Learn mode and the <cc74> tag are Terminal's, unchanged."),
+            ("THEME", "Same Everforest HSL anchors and hue bar as Hybrid (everforest.rs) — Terminal, Phosphor, and Hybrid are one palette at three hardware dosages."),
+            ("FIT", "The middle detent: pick this if Hybrid's knobs read as furniture but plain Terminal drops the rotary/detent semantics the hands expect."),
         ],
     );
 }
 
-/// The app's widget vocabulary in the hybrid idiom: Terminal's grid and
-/// text controls, hardware forms where they pay — jewel-lamp beat dots, a
-/// detented selector feel for cadence, scope-glass meters — all under the
-/// Everforest HSL theme.
+/// The app's widget vocabulary in the phosphor idiom: Terminal's buffer
+/// rows under the Everforest theme, with the level and spectrum as
+/// eighth-block glyph traces.
 pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
     let cw = ui.painter().layout_no_wrap("─".into(), mono(), Color32::WHITE).size().x;
     let g = Grid { cw, rh: 18.0 };
@@ -161,13 +156,13 @@ pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
     let nerd = st.nerd;
     let (beat, pulse) = util::beat(time);
 
-    let rows = 13.0;
+    let rows = 12.0;
     let height = rows * g.rh + 30.0;
     let (frame, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(frame, CornerRadius::same(2), th.bg);
     painter.rect_stroke(frame, CornerRadius::same(2), Stroke::new(1.0, th.frame), StrokeKind::Inside);
-    let title = "─ vidiotic · widgets · hw ─";
+    let title = "─ vidiotic · widgets · crt ─";
     let galley = painter.layout_no_wrap(title.into(), mono(), th.dim);
     let title_pos = Pos2::new(frame.min.x + g.cw * 2.0, frame.min.y);
     painter.rect_filled(
@@ -181,7 +176,7 @@ pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
     painter.text(title_pos, Align2::LEFT_CENTER, title, mono(), th.dim);
     let body = Rect::from_min_size(Pos2::new(frame.min.x + 4.0, frame.min.y + 8.0), vec2(frame.width() - 8.0, rows * g.rh));
 
-    // Row 0: taps + jewel-lamp beat dots + phrase strip + bpm.
+    // Row 0: taps + beat glyphs + phrase strip + bpm.
     put(ui, &g, body, 1.0, 0, "transport", th.dim);
     let mut col = 12.0;
     for label in ["▼", "⟲", "tap"] {
@@ -195,33 +190,25 @@ pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
         }
         col += text.chars().count() as f32 + 1.0;
     }
-    for k in 0..4 {
-        let c = Pos2::new(body.min.x + (col + 1.5 + k as f32 * 2.0) * g.cw, body.min.y + 0.5 * g.rh);
-        if k == beat {
-            ui.painter().circle_filled(c, 5.0, alpha(th.phosphor, 60));
-            ui.painter().circle_filled(c, 3.0 + pulse, th.phosphor);
-        } else {
-            ui.painter().circle_filled(c, 2.5, th.select);
-            ui.painter().circle_stroke(c, 2.5, Stroke::new(1.0, th.frame));
-        }
-    }
+    let beats: String = (0..4).map(|k| if k == beat { '●' } else { '○' }).collect();
+    put(ui, &g, body, col + 1.0, 0, &beats, alpha(th.phosphor, 120 + (pulse * 135.0) as u8));
     let pos = util::phrase(time);
     let strip: String = (0..16).map(|k| if k <= pos { '▰' } else { '▱' }).collect();
-    put(ui, &g, body, col + 10.0, 0, &strip, th.blue);
-    put(ui, &g, body, col + 27.0, 0, "120.0", th.fg);
+    put(ui, &g, body, col + 7.0, 0, &strip, th.blue);
+    put(ui, &g, body, col + 24.0, 0, "120.0", th.fg);
 
-    // Row 1: sync + cadence.
+    // Row 1: sync + cadence as bracket lists.
     put(ui, &g, body, 1.0, 1, "sync", th.dim);
     put(ui, &g, body, 12.0, 1, "[internal] link", th.yellow);
     put(ui, &g, body, 30.0, 1, "next  1 2 [4] 8", th.fg);
 
-    // Row 2: chips.
+    // Row 2: chips as parenthesized tags.
     put(ui, &g, body, 1.0, 2, "tags", th.dim);
     put(ui, &g, body, 12.0, 2, "(cue: intro)", th.dim);
     put(ui, &g, body, 26.0, 2, "(2 peers)", th.green);
     put(ui, &g, body, 37.0, 2, "(audio! ✕)", th.red);
 
-    // Rows 3–8: clip tiles, bordered cells with block art.
+    // Rows 3–8: clip tiles as bordered cells, block raster following the hue.
     put(ui, &g, body, 1.0, 3, "pool", th.dim);
     for (k, clip) in mock_clips().iter().enumerate() {
         let tile = Rect::from_min_size(
@@ -267,13 +254,13 @@ pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
         );
     }
 
-    // Rows 9–11: level as scope glass, spectrum in theme green.
-    let meter_row = Rect::from_min_size(Pos2::new(body.min.x, body.min.y + 8.6 * g.rh), vec2(body.width(), g.rh * 2.0));
+    // Rows 9–10: level + spectrum as eighth-block traces.
+    let meter_row = Rect::from_min_size(Pos2::new(body.min.x, body.min.y + 8.6 * g.rh), vec2(body.width(), g.rh));
     put(ui, &g, meter_row, 1.0, 0, "level", th.dim);
-    scope_wave(ui, &g, &th, meter_row, 12.0, time);
-    let fft_row = Rect::from_min_size(Pos2::new(body.min.x, body.min.y + 11.0 * g.rh), vec2(body.width(), g.rh));
+    glyph_wave(ui, &g, &th, meter_row, 12.0, time);
+    let fft_row = Rect::from_min_size(Pos2::new(body.min.x, body.min.y + 9.8 * g.rh), vec2(body.width(), g.rh));
     put(ui, &g, fft_row, 1.0, 0, "fft", th.dim);
-    phosphor_fft(ui, &g, &th, fft_row, 12.0, time);
+    glyph_fft(ui, &g, &th, fft_row, 12.0, time);
 
     // Statusline.
     let status = Rect::from_min_size(
@@ -295,7 +282,7 @@ pub fn show_widgets(ui: &mut Ui, st: &mut DemoState) {
         ui,
         th.dim,
         ui.visuals().text_color(),
-        &[("WIDGETS", "Terminal's grid everywhere text wins; hardware where it pays — jewel-lamp beat dots, scope glass for the level trace — all re-tinted live by the Everforest hue slider.")],
+        &[("WIDGETS", "Terminal's buffer rows under the Everforest theme; hardware survives only where it fits a cell — a fader cap, shading-block phosphor decay, eighth-block level and spectrum traces.")],
     );
 }
 
@@ -319,14 +306,10 @@ fn control(
     const CTL: f32 = 12.0;
     match (kind, val) {
         (MockKind::Float { min, max, .. }, Value::Float(v)) => {
-            let center = Pos2::new(row.min.x + (CTL + 3.0) * g.cw, row.center().y);
             let bipolar = *min < 0.0 && *max > 0.0;
             let ghost = midi.binding(i).and_then(|_| midi.incoming_pos(i, time));
-            chickenhead(ui, th, i, center, 13.0, (*v - min) / (max - min), bipolar, ghost, |t| {
-                *v = min + t * (max - min);
-            });
-            put(ui, g, row, CTL + 8.0, 0, &format!("{v:>7.2}"), th.fg);
-            put(ui, g, row, CTL + 8.0, 1, if bipolar { "-1 ·· +1" } else { "" }, alpha(th.dim, 140));
+            fader(ui, g, th, row, CTL, i, *min, *max, v, bipolar, ghost);
+            put(ui, g, row, CTL + 24.0, 0, &format!("{v:>7.2}"), th.fg);
         }
         (MockKind::Bool { .. }, Value::Bool(b)) => {
             let r = put(ui, g, row, CTL, 0, if *b { "[x]" } else { "[ ]" }, if *b { th.green } else { th.dim });
@@ -337,21 +320,20 @@ fn control(
             }
         }
         (MockKind::Long { values, labels, .. }, Value::LongIdx(sel)) => {
-            // The canonical chickenhead: a detented selector with radial
-            // mono legends. Center sits low in the block so the top legend
-            // stays inside this row.
-            let center = Pos2::new(row.min.x + (CTL + 3.0) * g.cw, row.min.y + 1.9 * g.rh);
-            let n = labels.len();
-            let mut t = *sel as f32 / (n - 1) as f32;
-            chickenhead(ui, th, i, center, 13.0, t, false, None, |nt| t = nt);
-            *sel = (t * (n - 1) as f32).round() as usize;
+            detent_switch(ui, g, th, row, CTL, i, labels.len(), sel);
+            let mut col = CTL + (labels.len() - 1) as f32 * 2.0 + 3.0;
             for (k, lab) in labels.iter().enumerate() {
-                let dir = util::knob_dir(k as f32 / (n - 1) as f32);
-                let pos = center + dir * 26.0;
-                let color = if k == *sel { th.yellow } else { th.dim };
-                ui.painter().text(pos, Align2::CENTER_CENTER, *lab, FontId::monospace(10.0), color);
+                let selected = k == *sel;
+                let text = if selected { format!("[{lab}]") } else { format!(" {lab} ") };
+                let color = if selected { th.yellow } else { th.dim };
+                let r = put(ui, g, row, col, 0, &text, color);
+                let resp = ui.interact(r, ui.id().with(("long", i, k)), Sense::click());
+                if resp.clicked() {
+                    *sel = k;
+                }
+                col += text.chars().count() as f32 + 1.0;
             }
-            put(ui, g, row, CTL + 10.0, 1, &format!("= {}", values[*sel]), th.dim);
+            put(ui, g, row, col + 1.0, 0, &format!("= {}", values[*sel]), th.dim);
         }
         (MockKind::Event, Value::EventAt(at)) => {
             let flash = util::event_flash(time, *at);
@@ -371,7 +353,7 @@ fn control(
             }
         }
         (MockKind::Point2D { min, max, .. }, Value::Point(p)) => {
-            scope_xy(ui, g, th, row, i, CTL, min, max, p);
+            glyph_scope(ui, g, th, row, i, CTL, min, max, p);
             put(ui, g, row, CTL + 29.0, 1, &format!("x {:>5.2}", p[0]), th.fg);
             put(ui, g, row, CTL + 29.0, 2, &format!("y {:>5.2}", p[1]), th.fg);
         }
@@ -380,18 +362,16 @@ fn control(
             let [r8, g8, b8, _] = color.to_array();
             put(ui, g, row, CTL, 0, "███", color);
             put(ui, g, row, CTL + 4.0, 0, &format!("#{r8:02x}{g8:02x}{b8:02x}"), th.fg);
-            // Mini chickenheads for the HSV triple, on their own line with
-            // labels clear of the skirt ticks.
+            let mut col = CTL;
             for (k, ch_label) in ["h", "s", "v"].iter().enumerate() {
                 let ch = match k {
                     0 => &mut c.h,
                     1 => &mut c.s,
                     _ => &mut c.v,
                 };
-                let x = row.min.x + (CTL + 1.5 + k as f32 * 8.0) * g.cw;
-                let center = Pos2::new(x, row.min.y + 2.0 * g.rh);
-                put(ui, g, row, CTL - 2.0 + k as f32 * 8.0, 2, ch_label, th.dim);
-                chickenhead(ui, th, i * 8 + k, center, 6.5, *ch, false, None, |t| *ch = t);
+                put(ui, g, row, col, 1, ch_label, th.dim);
+                minibar(ui, g, th, row, col + 1.0, 1, i, k, ch);
+                col += 9.0;
             }
         }
         (MockKind::Image, _) => {
@@ -405,78 +385,102 @@ fn control(
             if nerd {
                 put(ui, g, row, CTL - 3.0, 0, nf::check(nf::AUDIO), th.dim);
             }
-            scope_wave(ui, g, th, row, CTL, time);
+            glyph_wave(ui, g, th, row, CTL, time);
         }
         (MockKind::AudioFft, _) => {
             if nerd {
                 put(ui, g, row, CTL - 2.5, 0, nf::check(nf::FFT), th.dim);
             }
-            phosphor_fft(ui, g, th, row, CTL, time);
+            glyph_fft(ui, g, th, row, CTL, time);
         }
         _ => {}
     }
 }
 
-/// A chickenhead knob, drawn the way a terminal would: one flat convex
-/// teardrop, 1-px strokes, skirt ticks. `t` is the value in `0..=1`; drag
-/// vertically to edit. `ghost` paints a soft-pickup tick at the incoming-CC
-/// position.
+/// Fader: a solid cap sliding a tick-marked glyph track, one row tall.
+/// Click or drag along the track. A bipolar fader gets a bright center
+/// detent; `ghost` paints a hollow cap at the incoming-CC cell for soft
+/// pickup.
 #[allow(clippy::too_many_arguments)]
-fn chickenhead(
+fn fader(
     ui: &mut Ui,
+    g: &Grid,
     th: &Theme,
-    seed: usize,
-    center: Pos2,
-    r: f32,
-    t: f32,
+    row: Rect,
+    col: f32,
+    i: usize,
+    min: f32,
+    max: f32,
+    v: &mut f32,
     bipolar: bool,
     ghost: Option<f32>,
-    mut set: impl FnMut(f32),
 ) {
-    let hit = Rect::from_center_size(center, vec2(r * 3.2, r * 3.2));
-    let resp = ui.interact(hit, ui.id().with(("chicken", seed)), Sense::drag());
-    let mut nt = t;
-    if util::vdrag(&resp, &mut nt, 0.0, 1.0, 120.0) {
-        set(nt);
+    const N: usize = 20;
+    let span = Rect::from_min_size(
+        Pos2::new(row.min.x + col * g.cw, row.min.y),
+        vec2(g.cw * (N as f32 + 2.0), g.rh),
+    );
+    let resp = ui.interact(span, ui.id().with(("fader", i)), Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - span.min.x - g.cw) / (g.cw * N as f32)).clamp(0.0, 1.0);
+            *v = min + t * (max - min);
+        }
     }
-    let t = nt;
-    let painter = ui.painter();
-
-    // Skirt ticks: ends, middle (bright when it's the bipolar rest), quarters.
-    for (k, tick) in [0.0_f32, 0.25, 0.5, 0.75, 1.0].iter().enumerate() {
-        let dir = util::knob_dir(*tick);
-        let major = k % 2 == 0;
-        let color = if bipolar && k == 2 { th.fg } else { alpha(th.dim, if major { 200 } else { 110 }) };
-        painter.line_segment([center + dir * (r + 3.0), center + dir * (r + if major { 7.0 } else { 5.0 })], Stroke::new(1.0, color));
+    let t = (*v - min) / (max - min);
+    let mut s = String::with_capacity(N + 2);
+    s.push('├');
+    for k in 0..N {
+        s.push(if k == 5 || k == 10 || k == 15 { '┼' } else { '─' });
+    }
+    s.push('┤');
+    put(ui, g, row, col, 0, &s, alpha(th.dim, 170));
+    if bipolar {
+        // The rest position between the two center cells.
+        put(ui, g, row, col + 1.0 + (N - 1) as f32 * 0.5, 0, "┼", th.fg);
     }
     if let Some(gt) = ghost {
-        let dir = util::knob_dir(gt);
-        painter.line_segment([center + dir * (r + 3.0), center + dir * (r + 8.0)], Stroke::new(2.0, th.yellow));
+        let k = (gt * (N - 1) as f32).round();
+        put(ui, g, row, col + 1.0 + k, 0, "▒", alpha(th.yellow, 180));
     }
-
-    // Body: circle arc with a notch replaced by the pointer apex — one
-    // closed teardrop.
-    let dir = util::knob_dir(t);
-    let apex_angle = dir.angle();
-    let mut pts = Vec::with_capacity(26);
-    pts.push(center + dir * (r * 1.45));
-    let half_notch = 0.45_f32; // radians each side of the apex
-    for k in 0..=22 {
-        let a = apex_angle + half_notch + (std::f32::consts::TAU - 2.0 * half_notch) * (k as f32 / 22.0);
-        pts.push(center + egui::Vec2::angled(a) * r);
-    }
-    let stroke_color = if resp.dragged() || resp.hovered() { th.fg } else { th.frame };
-    painter.add(Shape::convex_polygon(pts, th.knob, Stroke::new(1.0, stroke_color)));
-    // Pointer line down the tip, in the value color.
-    painter.line_segment([center + dir * (r * 0.25), center + dir * (r * 1.35)], Stroke::new(1.5, th.green));
-    painter.circle_filled(center, 1.5, alpha(th.fg, 90));
+    let k = (t * (N - 1) as f32).round();
+    put(ui, g, row, col + 1.0 + k, 0, "█", if bipolar { th.magenta } else { th.green });
 }
 
-/// Oscilloscope XY for point2D: dot-glyph graticule, center axes with tick
-/// marks, phosphor beam with a persistence trail (drag history kept in egui
-/// temp memory).
+/// Detented slide switch for `long`: a cap snapping between `n` track
+/// detents two cells apart. Click or drag along the track (the labels
+/// beside it are clickable too).
 #[allow(clippy::too_many_arguments)]
-fn scope_xy(ui: &mut Ui, g: &Grid, th: &Theme, row: Rect, i: usize, col: f32, min: &[f32; 2], max: &[f32; 2], p: &mut [f32; 2]) {
+fn detent_switch(ui: &mut Ui, g: &Grid, th: &Theme, row: Rect, col: f32, i: usize, n: usize, sel: &mut usize) {
+    let track_cols = (n - 1) as f32 * 2.0;
+    let span = Rect::from_min_size(
+        Pos2::new(row.min.x + col * g.cw, row.min.y),
+        vec2(g.cw * (track_cols + 1.0), g.rh),
+    );
+    let resp = ui.interact(span, ui.id().with(("detent", i)), Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - span.min.x - g.cw * 0.5) / (g.cw * track_cols)).clamp(0.0, 1.0);
+            *sel = (t * (n - 1) as f32).round() as usize;
+        }
+    }
+    let mut s = String::new();
+    for k in 0..n {
+        if k > 0 {
+            s.push('─');
+        }
+        s.push('┼');
+    }
+    put(ui, g, row, col, 0, &s, alpha(th.dim, 170));
+    put(ui, g, row, col + *sel as f32 * 2.0, 0, "█", th.green);
+}
+
+/// Oscilloscope XY rasterized to the grid: a dot-glyph graticule with `┼`
+/// at the origin, and a beam whose persistence trail is shading blocks
+/// quantized to half-cell steps — phosphor decay as a character ramp
+/// (`█ → ▓ → ▒ → ░`).
+#[allow(clippy::too_many_arguments)]
+fn glyph_scope(ui: &mut Ui, g: &Grid, th: &Theme, row: Rect, i: usize, col: f32, min: &[f32; 2], max: &[f32; 2], p: &mut [f32; 2]) {
     let screen = Rect::from_min_size(
         Pos2::new(row.min.x + col * g.cw, row.min.y + 4.0),
         vec2(g.cw * 26.0, row.height() - 8.0),
@@ -494,100 +498,89 @@ fn scope_xy(ui: &mut Ui, g: &Grid, th: &Theme, row: Rect, i: usize, col: f32, mi
     painter.rect_filled(screen, CornerRadius::same(2), th.screen);
     painter.rect_stroke(screen, CornerRadius::same(2), Stroke::new(1.0, th.frame), StrokeKind::Inside);
 
-    // Graticule: dot glyphs off-axis, dim solid center axes with ticks.
+    // Interior-only graticule so nothing straddles the glass edge.
     let grat = alpha(util::hsl(150.0, 0.1, 0.6), 110);
-    const DX: usize = 8;
-    const DY: usize = 4;
-    for gy in 0..=DY {
-        for gx in 0..=DX {
-            if gx == DX / 2 || gy == DY / 2 {
-                continue;
-            }
+    for gy in 1..4 {
+        for gx in 1..8 {
             let pos = Pos2::new(
-                screen.min.x + gx as f32 / DX as f32 * screen.width(),
-                screen.min.y + gy as f32 / DY as f32 * screen.height(),
+                screen.min.x + gx as f32 / 8.0 * screen.width(),
+                screen.min.y + gy as f32 / 4.0 * screen.height(),
             );
-            painter.text(pos, Align2::CENTER_CENTER, "·", mono(), grat);
+            let ch = if gx == 4 && gy == 2 { "┼" } else { "·" };
+            painter.text(pos, Align2::CENTER_CENTER, ch, mono(), grat);
         }
     }
-    let mid = screen.center();
-    painter.line_segment([Pos2::new(screen.min.x, mid.y), Pos2::new(screen.max.x, mid.y)], Stroke::new(1.0, alpha(grat, 70)));
-    painter.line_segment([Pos2::new(mid.x, screen.min.y), Pos2::new(mid.x, screen.max.y)], Stroke::new(1.0, alpha(grat, 70)));
-    for gx in 0..=DX * 2 {
-        let x = screen.min.x + gx as f32 / (DX * 2) as f32 * screen.width();
-        painter.line_segment([Pos2::new(x, mid.y - 2.0), Pos2::new(x, mid.y + 2.0)], Stroke::new(1.0, grat));
-    }
-    for gy in 0..=DY * 2 {
-        let y = screen.min.y + gy as f32 / (DY * 2) as f32 * screen.height();
-        painter.line_segment([Pos2::new(mid.x - 2.0, y), Pos2::new(mid.x + 2.0, y)], Stroke::new(1.0, grat));
-    }
 
-    // Beam: persistence trail through recent positions, then the glow dot.
+    // Beam position, quantized to half-cell raster steps.
     let tx = (p[0] - min[0]) / (max[0] - min[0]);
     let ty = 1.0 - (p[1] - min[1]) / (max[1] - min[1]);
+    let q = |v: f32, origin: f32, step: f32| origin + ((v - origin) / step).round() * step;
     let dot = Pos2::new(
-        screen.min.x + screen.width() * tx,
-        screen.min.y + screen.height() * ty,
+        q(screen.min.x + screen.width() * tx, screen.min.x, g.cw * 0.5),
+        q(screen.min.y + screen.height() * ty, screen.min.y, g.rh * 0.5),
     );
-    let hist_id = ui.id().with(("scope-hist", i));
+    let hist_id = ui.id().with(("crt-hist", i));
     let mut hist: Vec<(f32, f32)> = ui.ctx().data_mut(|d| d.get_temp(hist_id)).unwrap_or_default();
-    hist.push((dot.x, dot.y));
-    if hist.len() > 32 {
-        let excess = hist.len() - 32;
+    if hist.last() != Some(&(dot.x, dot.y)) {
+        hist.push((dot.x, dot.y));
+    }
+    if hist.len() > 24 {
+        let excess = hist.len() - 24;
         hist.drain(..excess);
     }
     ui.ctx().data_mut(|d| d.insert_temp(hist_id, hist.clone()));
-    for (k, seg) in hist.windows(2).enumerate() {
-        let a = (k as f32 / hist.len() as f32 * 120.0) as u8;
-        painter.line_segment(
-            [Pos2::new(seg[0].0, seg[0].1), Pos2::new(seg[1].0, seg[1].1)],
-            Stroke::new(1.2, alpha(th.phosphor, a)),
-        );
+    let sprite = FontId::monospace(10.0);
+    let painter = painter.with_clip_rect(screen);
+    for (k, &(x, y)) in hist.iter().enumerate() {
+        let a = (k + 1) as f32 / hist.len() as f32;
+        let ch = if a > 0.66 { "▓" } else if a > 0.33 { "▒" } else { "░" };
+        painter.text(Pos2::new(x, y), Align2::CENTER_CENTER, ch, sprite.clone(), alpha(th.phosphor, 25 + (a * 110.0) as u8));
     }
-    painter.circle_filled(dot, 8.0, alpha(th.phosphor, 22));
-    painter.circle_filled(dot, 4.5, alpha(th.phosphor, 60));
-    painter.circle_filled(dot, 2.2, th.phosphor);
+    painter.text(dot, Align2::CENTER_CENTER, "█", sprite, th.phosphor);
 }
 
-/// Audio as a single-trace scope: dim centerline, phosphor waveform.
-fn scope_wave(ui: &Ui, g: &Grid, th: &Theme, row: Rect, col: f32, time: f64) {
-    let screen = Rect::from_min_size(
-        Pos2::new(row.min.x + col * g.cw, row.min.y + 3.0),
-        vec2(g.cw * 26.0, row.height() - 6.0),
+/// 6-cell mini bar for HSV channels.
+#[allow(clippy::too_many_arguments)]
+fn minibar(ui: &mut Ui, g: &Grid, th: &Theme, row: Rect, col: f32, line: usize, i: usize, k: usize, ch: &mut f32) {
+    const N: usize = 6;
+    let span = Rect::from_min_size(
+        Pos2::new(row.min.x + col * g.cw, row.min.y + line as f32 * g.rh),
+        vec2(g.cw * (N as f32 + 2.0), g.rh),
     );
-    let painter = ui.painter();
-    painter.rect_filled(screen, CornerRadius::same(2), th.screen);
-    painter.rect_stroke(screen, CornerRadius::same(2), Stroke::new(1.0, th.frame), StrokeKind::Inside);
-    painter.line_segment(
-        [Pos2::new(screen.min.x, screen.center().y), Pos2::new(screen.max.x, screen.center().y)],
-        Stroke::new(1.0, alpha(util::hsl(150.0, 0.1, 0.6), 70)),
-    );
-    const N: usize = 56;
-    let pts: Vec<Pos2> = (0..N)
-        .map(|k| {
-            let s = util::wave(time, k, N);
-            Pos2::new(
-                screen.min.x + 2.0 + (screen.width() - 4.0) * k as f32 / (N - 1) as f32,
-                screen.center().y - s * (screen.height() * 0.42),
-            )
-        })
-        .collect();
-    painter.add(Shape::line(pts, Stroke::new(1.2, th.phosphor)));
+    let resp = ui.interact(span, ui.id().with(("mini", i, k)), Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            *ch = ((pos.x - span.min.x - g.cw) / (g.cw * N as f32)).clamp(0.0, 1.0);
+        }
+    }
+    let mut s = String::new();
+    s.push('[');
+    for j in 0..N {
+        s.push(if (j as f32) < *ch * N as f32 - 0.5 { '█' } else { '░' });
+    }
+    s.push(']');
+    put(ui, g, row, col, line, &s, th.green);
 }
 
-/// Spectrum in the theme's green, cell style carried over from Terminal.
-fn phosphor_fft(ui: &Ui, g: &Grid, th: &Theme, row: Rect, col: f32, time: f64) {
-    let painter = ui.painter();
-    let n = 24;
-    for k in 0..n {
-        let mag = util::fft(time, k, n);
-        let h = (g.rh - 5.0) * mag;
-        let cell = Rect::from_min_max(
-            Pos2::new(row.min.x + (col + k as f32) * g.cw, row.min.y + g.rh - 2.0 - h),
-            Pos2::new(row.min.x + (col + k as f32) * g.cw + g.cw - 2.0, row.min.y + g.rh - 2.0),
-        );
+/// Audio as an eighth-block glyph trace in phosphor green, one row tall.
+fn glyph_wave(ui: &Ui, g: &Grid, th: &Theme, row: Rect, col: f32, time: f64) {
+    const N: usize = 24;
+    let mut s = String::with_capacity(N);
+    for k in 0..N {
+        let a = util::wave(time, k, N) * 0.5 + 0.5;
+        s.push(BLOCKS[((a * 7.99) as usize).min(7)]);
+    }
+    put(ui, g, row, col, 0, &s, th.phosphor);
+}
+
+/// Spectrum as per-column eighth blocks, red on clipping bins.
+fn glyph_fft(ui: &Ui, g: &Grid, th: &Theme, row: Rect, col: f32, time: f64) {
+    const N: usize = 24;
+    for k in 0..N {
+        let mag = util::fft(time, k, N);
+        let ch = BLOCKS[((mag * 7.99) as usize).min(7)];
         let color = if mag > 0.85 { th.red } else { th.green };
-        painter.rect_filled(cell, CornerRadius::ZERO, alpha(color, 90 + (mag * 165.0) as u8));
+        put(ui, g, row, col + k as f32, 0, &ch.to_string(), alpha(color, 120 + (mag * 135.0) as u8));
     }
 }
 

@@ -1,6 +1,7 @@
 //! Speculative aesthetics research for vidiotic's generated ISF param
-//! controls: six visual directions (Console baseline, Elektron, Moog,
-//! Make Noise, Terminal, and a Terminal/hardware Hybrid), each rendering
+//! controls: seven visual directions (Console baseline, Elektron, Moog,
+//! Make Noise, Terminal, a Terminal/hardware Hybrid, and Phosphor at the
+//! midpoint between those last two), each rendering
 //! the full set of ISF input types
 //! (<https://docs.isf.video/ref_json.html>) as live epaint widgets over one
 //! shared mock state, with MIDI bindability as a first-class affordance.
@@ -10,10 +11,12 @@
 
 mod console;
 mod elektron;
+mod everforest;
 mod hybrid;
 mod makenoise;
 mod moog;
 mod nf;
+mod phosphor;
 mod schema;
 mod terminal;
 mod util;
@@ -29,7 +32,7 @@ const CHROME_ACCENT: Color32 = Color32::from_rgb(82, 191, 255);
 const CHROME_ACCENT_DIM: Color32 = Color32::from_rgb(36, 63, 83);
 const LEARN_RED: Color32 = Color32::from_rgb(255, 99, 99);
 
-const DIRECTIONS: [&str; 6] = ["CONSOLE", "ELEKTRON", "MOOG", "MAKE NOISE", "TERMINAL", "HYBRID"];
+const DIRECTIONS: [&str; 7] = ["CONSOLE", "ELEKTRON", "MOOG", "MAKE NOISE", "TERMINAL", "PHOSPHOR", "HYBRID"];
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -77,8 +80,8 @@ impl App {
             .min(DIRECTIONS.len() - 1);
         let mut st = DemoState::new();
         st.nerd = nerd;
-        // A `light` arg anywhere starts the Hybrid theme in light mode; a
-        // `widgets` arg starts on the widgets view.
+        // A `light` arg anywhere starts the Everforest directions in light
+        // mode; a `widgets` arg starts on the widgets view.
         st.dark = !std::env::args().any(|a| a.eq_ignore_ascii_case("light"));
         let view = usize::from(std::env::args().any(|a| a.eq_ignore_ascii_case("widgets")));
         Self { st, direction, view }
@@ -162,12 +165,14 @@ impl eframe::App for App {
                         (0, 2) => moog::show(ui, &mut self.st),
                         (0, 3) => makenoise::show(ui, &mut self.st),
                         (0, 4) => terminal::show(ui, &mut self.st),
+                        (0, 5) => phosphor::show(ui, &mut self.st),
                         (0, _) => hybrid::show(ui, &mut self.st),
                         (_, 0) => console::show_widgets(ui, &mut self.st),
                         (_, 1) => elektron::show_widgets(ui, &mut self.st),
                         (_, 2) => moog::show_widgets(ui, &mut self.st),
                         (_, 3) => makenoise::show_widgets(ui, &mut self.st),
                         (_, 4) => terminal::show_widgets(ui, &mut self.st),
+                        (_, 5) => phosphor::show_widgets(ui, &mut self.st),
                         _ => hybrid::show_widgets(ui, &mut self.st),
                     }
                 });

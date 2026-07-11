@@ -2,7 +2,7 @@
 //! egui. One monospace grid; every control is text-first — bracket sliders,
 //! `[x]` toggles, a cell-block spectrum, a statusline that owns the
 //! MIDI-learn mode (nvim visual-mode style: arm, click a row, done).
-//! Performance is the best of the five directions: glyphs come from the
+//! Performance is the best of the seven directions: glyphs come from the
 //! existing font atlas, no polylines at all.
 //!
 //! Font note for production: OFL fonts are accepted, so this direction loads
@@ -148,8 +148,8 @@ pub fn show(ui: &mut Ui, st: &mut DemoState) {
         Color32::from_rgb(170, 174, 182),
         &[
             ("DENSITY", "~18 px per scalar row — tied with Console, and column alignment makes long chains scannable like a buffer."),
-            ("EPAINT COST", "Cheapest of the five: pure atlas glyphs plus a handful of rects. No polylines anywhere."),
-            ("MIDI", "Inline <cc74> tag costs 7 chars; learn as a statusline mode is the cleanest arming story of the five."),
+            ("EPAINT COST", "Cheapest of the seven: pure atlas glyphs plus a handful of rects. No polylines anywhere."),
+            ("MIDI", "Inline <cc74> tag costs 7 chars; learn as a statusline mode is the cleanest arming story of the seven."),
             ("FONT", "OFL accepted: loads your installed Iosevka Nerd Font Mono at runtime (falls back to Hack). Per-set constraint remains: Font Awesome + Codicons are CC-BY-4.0, Font Logos unlicensed — nf.rs bans those ranges, licenses/ holds the retained sets' texts, and a production embed must strip the banned ranges from the font file itself."),
             ("FIT", "Closest cousin to the app's flat chrome; adopting it is mostly a font embed plus discipline, not a repaint."),
         ],
