@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use crate::analysis::{AUDIO_TEX_LEN, AUDIO_TEX_W};
 use crate::commands::{ChainSlot, ShaderId, ShaderPoolView, SlotRef};
-use crate::isf::{self, IsfBuiltins, IsfInput, IsfPass, IsfTarget, IsfUbo, IsfValue};
+use crate::isf::{
+    self, IsfBuiltins, IsfInput, IsfPass, IsfTarget, IsfTexSource, IsfUbo, IsfValue,
+};
 use crate::shader::{self, ShaderError, ShaderLang};
 
 /// Format of ISF intermediate pass targets. Always float so `FLOAT`/feedback
@@ -118,6 +120,9 @@ struct IsfEntry {
     ubo: IsfUbo,
     passes: Vec<IsfPass>,
     targets: Vec<IsfTarget>,
+    /// Image bindings at set=3 after the targets (audio inputs, then IMPORTED
+    /// images), in the order [`isf::IsfProgram::tex_inputs`] declared them.
+    tex_bindings: Vec<IsfTexBinding>,
     /// 256-aligned stride of one parameter block in `params_buf` (one per pass).
     aligned: u64,
     params_buf: wgpu::Buffer,
@@ -143,6 +148,20 @@ struct IsfTargets {
 struct TargetTex {
     _tex: [wgpu::Texture; 2],
     view: [wgpu::TextureView; 2],
+}
+
+/// A resolved ISF `set=3` image binding (following the pass targets). Audio
+/// bindings point at the renderer's shared audio row textures; an IMPORTED image
+/// owns a decoded static texture, or falls back to the black dummy if its file
+/// couldn't be decoded.
+enum IsfTexBinding {
+    AudioWave,
+    AudioFft,
+    Owned {
+        _tex: wgpu::Texture,
+        view: wgpu::TextureView,
+    },
+    Missing,
 }
 
 /// A resolved chain stage for the draw phase: a plain single-pass pipeline, or an
@@ -196,6 +215,14 @@ pub struct Renderer {
     audio_tex: wgpu::Texture,
     audio_view: wgpu::TextureView,
     audio_sampler: wgpu::Sampler,
+    // Single-row (512x1 R8) views of the audio texture rows, bound into ISF
+    // `set=3` for `audio`/`audioFFT` inputs. Separate 1-tall textures so the
+    // ISF `IMG_*` Y-flip lands on the intended row regardless of the coordinate
+    // the shader passes (a 2-row texture would select the wrong row).
+    audio_fft_tex: wgpu::Texture,
+    audio_fft_view: wgpu::TextureView,
+    audio_wave_tex: wgpu::Texture,
+    audio_wave_view: wgpu::TextureView,
     color_format: wgpu::TextureFormat,
 
     video: Option<VideoTexture>,
@@ -398,6 +425,29 @@ impl Renderer {
             ..Default::default()
         });
 
+        // 512x1 R8 single-row textures for ISF audio/audioFFT inputs, rewritten
+        // each frame from the two rows of the packed audio texture.
+        let make_audio_row = |label| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: AUDIO_TEX_W as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (tex, view)
+        };
+        let (audio_fft_tex, audio_fft_view) = make_audio_row("audio-fft-row");
+        let (audio_wave_tex, audio_wave_view) = make_audio_row("audio-wave-row");
+
         // Built-in passthrough so the app always renders (startup / compile failure).
         let passthrough = {
             let module = shader::compile_glsl_to_module(
@@ -455,6 +505,10 @@ impl Renderer {
             audio_tex,
             audio_view,
             audio_sampler,
+            audio_fft_tex,
+            audio_fft_view,
+            audio_wave_tex,
+            audio_wave_view,
             color_format,
             video: None,
             pipeline: None,
@@ -549,12 +603,16 @@ impl Renderer {
 
     /// Compile an ISF shader source into the pool under `name` (its path key),
     /// returning the new pool id — or an existing entry's id if already loaded.
+    /// `IMPORTED` images are decoded (via ffmpeg) and uploaded here, resolved
+    /// relative to the shader file's directory; a missing/undecodable image is
+    /// logged and bound as black rather than failing the load.
     ///
     /// # Errors
     /// Returns [`ShaderError`] if the source is not ISF or fails to compile.
     pub fn load_isf(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         name: Arc<str>,
         src: &str,
     ) -> Result<ShaderId, ShaderError> {
@@ -584,14 +642,17 @@ impl Renderer {
             },
             count: None,
         }];
-        if !prog.targets.is_empty() {
+        // set=3 textures: the named pass targets first, then the audio inputs,
+        // sharing one sampler at binding 1.
+        let n_tex = prog.targets.len() + prog.tex_inputs.len();
+        if n_tex > 0 {
             bgl_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             });
-            for i in 0..prog.targets.len() {
+            for i in 0..n_tex {
                 bgl_entries.push(wgpu::BindGroupLayoutEntry {
                     binding: (i + 2) as u32,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -634,6 +695,35 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Resolve the set=3 image bindings: audio inputs point at the shared row
+        // textures; IMPORTED images are decoded and uploaded now, relative to the
+        // shader's own directory.
+        let base_dir = std::path::Path::new(name.as_ref())
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let tex_bindings: Vec<IsfTexBinding> = prog
+            .tex_inputs
+            .iter()
+            .map(|t| match &t.source {
+                IsfTexSource::AudioWave => IsfTexBinding::AudioWave,
+                IsfTexSource::AudioFft => IsfTexBinding::AudioFft,
+                IsfTexSource::Imported(rel) => {
+                    let path = if rel.is_absolute() { rel.clone() } else { base_dir.join(rel) };
+                    match crate::video::decoder::decode_still(&path) {
+                        Ok(frame) => {
+                            let (tex, view) = upload_still(device, queue, &frame);
+                            IsfTexBinding::Owned { _tex: tex, view }
+                        }
+                        Err(e) => {
+                            log::error!("ISF {name}: IMPORTED {}: {e:#}", path.display());
+                            IsfTexBinding::Missing
+                        }
+                    }
+                }
+            })
+            .collect();
+
         let id = self.next_pool_id;
         self.next_pool_id += 1;
         self.pool.push(PooledShader {
@@ -646,6 +736,7 @@ impl Renderer {
                 ubo: prog.ubo,
                 passes: prog.passes,
                 targets: prog.targets,
+                tex_bindings,
                 aligned,
                 params_buf,
                 bgl,
@@ -883,7 +974,8 @@ impl Renderer {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(g));
     }
 
-    /// Upload the packed 512x2 audio texture (row 0 FFT, row 1 waveform).
+    /// Upload the packed 512x2 audio texture (row 0 FFT, row 1 waveform), and the
+    /// two single-row copies ISF `audioFFT`/`audio` inputs sample.
     pub fn upload_audio(&self, queue: &wgpu::Queue, bytes: &[u8; AUDIO_TEX_LEN]) {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -904,6 +996,30 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        let row = wgpu::Extent3d {
+            width: AUDIO_TEX_W as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let write_row = |tex, src: &[u8]| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                src,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(AUDIO_TEX_W as u32),
+                    rows_per_image: Some(1),
+                },
+                row,
+            );
+        };
+        write_row(&self.audio_fft_tex, &bytes[..AUDIO_TEX_W]);
+        write_row(&self.audio_wave_tex, &bytes[AUDIO_TEX_W..]);
     }
 
     /// Draw the composite into `view` at `width`x`height`.
@@ -1155,7 +1271,7 @@ impl Renderer {
                 size: std::num::NonZeroU64::new(entry.ubo.size() as u64),
             }),
         }];
-        if !entry.targets.is_empty() {
+        if !entry.targets.is_empty() || !entry.tex_bindings.is_empty() {
             entries.push(wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(&self.sampler),
@@ -1167,6 +1283,19 @@ impl Renderer {
                     .unwrap_or(&self.dummy_input_view);
                 entries.push(wgpu::BindGroupEntry {
                     binding: (j + 2) as u32,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
+            // Audio inputs then IMPORTED images follow the targets, in order.
+            for (j, binding) in entry.tex_bindings.iter().enumerate() {
+                let view = match binding {
+                    IsfTexBinding::AudioWave => &self.audio_wave_view,
+                    IsfTexBinding::AudioFft => &self.audio_fft_view,
+                    IsfTexBinding::Owned { view, .. } => view,
+                    IsfTexBinding::Missing => &self.dummy_input_view,
+                };
+                entries.push(wgpu::BindGroupEntry {
+                    binding: (entry.targets.len() + j + 2) as u32,
                     resource: wgpu::BindingResource::TextureView(view),
                 });
             }
@@ -1264,6 +1393,66 @@ impl Renderer {
 
 fn round_up_u64(v: u64, align: u64) -> u64 {
     v.div_ceil(align) * align
+}
+
+/// Upload a decoded still (RGBA) to a static sampled texture for an ISF IMPORTED
+/// image. `decode_still` always yields [`PixelData::Rgba`]; a non-RGBA frame
+/// would be an internal contract violation, so it falls back to a 1×1 texture.
+fn upload_still(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    frame: &DecodedFrame,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let PixelData::Rgba { data, stride } = &frame.pixels else {
+        log::error!("ISF IMPORTED: decoded still was not RGBA");
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("isf-imported-fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        return (tex, view);
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("isf-imported"),
+        size: wgpu::Extent3d {
+            width: frame.w,
+            height: frame.h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(*stride),
+            rows_per_image: Some(frame.h),
+        },
+        wgpu::Extent3d {
+            width: frame.w,
+            height: frame.h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 /// A double-buffered [`ISF_MID_FORMAT`] render target for one ISF pass buffer.

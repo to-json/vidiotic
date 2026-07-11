@@ -188,6 +188,73 @@ fn guard_empty_playthrough(sent_any: bool) {
     }
 }
 
+/// Decode a still image file (PNG/JPG/etc.) to a single RGBA [`DecodedFrame`],
+/// synchronously. Used for ISF `IMPORTED` textures — one decode at load time,
+/// off the per-clip worker path. Reuses the same ffmpeg demux + swscale-to-RGBA
+/// pipeline as the software video fallback.
+///
+/// # Errors
+/// Returns an error if ffmpeg init/open fails, the file has no video (image)
+/// stream, or no frame decodes.
+pub fn decode_still(path: &Path) -> anyhow::Result<DecodedFrame> {
+    use ff::format::Pixel;
+    use ff::software::scaling;
+
+    ff::init()?;
+    let mut ictx = ff::format::input(path)?;
+    let stream = ictx
+        .streams()
+        .best(ff::media::Type::Video)
+        .ok_or_else(|| anyhow::anyhow!("no image stream in {}", path.display()))?;
+    let vid_idx = stream.index();
+    let params = stream.parameters();
+
+    let mut decoder = ff::codec::context::Context::from_parameters(params)?
+        .decoder()
+        .video()?;
+    let (w, h) = (decoder.width(), decoder.height());
+    let mut scaler = scaling::Context::get(
+        decoder.format(),
+        w,
+        h,
+        Pixel::RGBA,
+        w,
+        h,
+        scaling::Flags::BILINEAR,
+    )?;
+
+    let mut decoded = ff::frame::Video::empty();
+    let mut to_rgba = |decoded: &ff::frame::Video| -> anyhow::Result<DecodedFrame> {
+        let mut rgba = ff::frame::Video::empty();
+        scaler.run(decoded, &mut rgba)?;
+        Ok(DecodedFrame {
+            pixels: PixelData::Rgba {
+                data: rgba.data(0).to_vec(),
+                stride: rgba.stride(0) as u32,
+            },
+            w,
+            h,
+            pts_sec: 0.0,
+        })
+    };
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != vid_idx {
+            continue;
+        }
+        decoder.send_packet(&packet)?;
+        if decoder.receive_frame(&mut decoded).is_ok() {
+            return to_rgba(&decoded);
+        }
+    }
+    // Flush: single-frame images may only surface the frame at EOF.
+    decoder.send_eof()?;
+    if decoder.receive_frame(&mut decoded).is_ok() {
+        return to_rgba(&decoded);
+    }
+    anyhow::bail!("no frame decoded from {}", path.display())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_hap(
     ictx: &mut ff::format::context::Input,

@@ -655,7 +655,7 @@ impl App {
         };
         let name: Arc<str> = path.to_string_lossy().into();
         let result = if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
-            Some(r.load_isf(&g.device, name.clone(), &src))
+            Some(r.load_isf(&g.device, &g.queue, name.clone(), &src))
         } else {
             None
         };
@@ -694,7 +694,7 @@ impl App {
                 }
             };
             if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
-                if let Err(e) = r.load_isf(&g.device, p.clone(), &src) {
+                if let Err(e) = r.load_isf(&g.device, &g.queue, p.clone(), &src) {
                     log::error!("ISF {p}: {e}");
                 }
             }

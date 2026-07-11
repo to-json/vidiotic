@@ -121,6 +121,39 @@ fn close(a: u8, b: u8, tol: u8) -> bool {
     a.abs_diff(b) <= tol
 }
 
+/// Write a minimal uncompressed 24-bit BMP (`bgr` per pixel) so the IMPORTED
+/// test has a real image file for ffmpeg to decode — no image-encoder dep.
+fn write_bmp(path: &std::path::Path, w: u32, h: u32, bgr: [u8; 3]) {
+    let row_bytes = ((w * 3 + 3) & !3) as usize;
+    let data_size = row_bytes * h as usize;
+    let file_size = 54 + data_size;
+    let mut b = Vec::with_capacity(file_size);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(file_size as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    b.extend_from_slice(&54u32.to_le_bytes()); // pixel-data offset
+    b.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER size
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes()); // planes
+    b.extend_from_slice(&24u16.to_le_bytes()); // bpp
+    b.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    b.extend_from_slice(&(data_size as u32).to_le_bytes());
+    b.extend_from_slice(&2835i32.to_le_bytes()); // 72 DPI x
+    b.extend_from_slice(&2835i32.to_le_bytes()); // 72 DPI y
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..h {
+        let mut row = Vec::with_capacity(row_bytes);
+        for _ in 0..w {
+            row.extend_from_slice(&bgr);
+        }
+        row.resize(row_bytes, 0);
+        b.extend_from_slice(&row);
+    }
+    std::fs::write(path, b).expect("write test bmp");
+}
+
 fn main() {
     env_logger::init();
     let gpu = init_gpu();
@@ -228,7 +261,7 @@ void main() { gl_FragColor = IMG_THIS_NORM_PIXEL(inputImage) * gain; }
 "#;
     let name: std::sync::Arc<str> = "gain.fs".into();
     renderer
-        .load_isf(&gpu.device, name.clone(), isf_src)
+        .load_isf(&gpu.device, &gpu.queue, name.clone(), isf_src)
         .expect("ISF gain filter compiles");
     let mut slot = ChainSlot::new(SlotRef::Isf(name));
     slot.set_param("gain".into(), IsfValue::Float(0.5));
@@ -254,7 +287,7 @@ void main() {
 "#;
     let fbname: std::sync::Arc<str> = "feedback.fs".into();
     renderer
-        .load_isf(&gpu.device, fbname.clone(), fb_src)
+        .load_isf(&gpu.device, &gpu.queue, fbname.clone(), fb_src)
         .expect("feedback ISF compiles");
     renderer.set_active_chain(vec![ChainSlot::new(SlotRef::Isf(fbname))]);
     let f1 = render_center_pixel(&gpu, &mut renderer);
@@ -265,6 +298,73 @@ void main() {
     println!("[{}] ISF feedback accumulation: f1={f1:?} -> f4={f4:?} (red must rise)", if pass7 { " OK " } else { "FAIL" });
     ok &= pass7;
     renderer.set_active_chain(Vec::new());
+
+    // 8. ISF audioFFT input: a filter that multiplies the input by the FFT value
+    // under each column. Upload an audio texture whose FFT row is saturated (all
+    // 255 -> 1.0), so source red 220 * 1.0 stays ~220; a zeroed FFT would drop it
+    // toward 0. Proves the 512x1 audio row texture binds at set=3 and samples.
+    let mut audio = [0u8; vidiotic::analysis::AUDIO_TEX_LEN];
+    for a in &mut audio[..vidiotic::analysis::AUDIO_TEX_W] {
+        *a = 255; // FFT row fully lit
+    }
+    renderer.upload_audio(&gpu.queue, &audio);
+    let red: Vec<u8> = (0..(W * H)).flat_map(|_| [220u8, 20, 20, 255]).collect();
+    let frame = DecodedFrame {
+        pixels: PixelData::Rgba { data: red, stride: W * 4 },
+        w: W,
+        h: H,
+        pts_sec: 0.0,
+    };
+    renderer.upload_frame(&gpu.device, &gpu.queue, &frame);
+    let audio_src = r#"/*{
+        "ISFVSN": "2.0",
+        "INPUTS": [ { "NAME": "spectrum", "TYPE": "audioFFT" } ]
+    }*/
+void main() {
+    float fft = IMG_NORM_PIXEL(spectrum, vec2(isf_FragNormCoord.x, 0.0)).r;
+    gl_FragColor = IMG_THIS_NORM_PIXEL(inputImage) * fft;
+}
+"#;
+    let aname: std::sync::Arc<str> = "audio.fs".into();
+    renderer
+        .load_isf(&gpu.device, &gpu.queue, aname.clone(), audio_src)
+        .expect("ISF audioFFT filter compiles");
+    renderer.set_active_chain(vec![ChainSlot::new(SlotRef::Isf(aname))]);
+    let lit = render_center_pixel(&gpu, &mut renderer);
+    // Now a zeroed FFT row should darken the output toward black.
+    renderer.upload_audio(&gpu.queue, &[0u8; vidiotic::analysis::AUDIO_TEX_LEN]);
+    let dark = render_center_pixel(&gpu, &mut renderer);
+    let pass8 = close(lit[0], 220, 12) && dark[0] + 40 < lit[0];
+    println!("[{}] ISF audioFFT input: lit={lit:?} dark={dark:?} (FFT gates brightness)", if pass8 { " OK " } else { "FAIL" });
+    ok &= pass8;
+    renderer.set_active_chain(Vec::new());
+
+    // 9. ISF IMPORTED image: decode a solid-blue BMP via ffmpeg and sample it as
+    // a set=3 texture. Output should be that blue regardless of the video input.
+    let bmp = std::env::temp_dir().join("vidiotic_isf_imported.bmp");
+    write_bmp(&bmp, 4, 4, [255, 0, 0]); // BGR -> pure blue
+    let imp_src = format!(
+        r#"/*{{ "IMPORTED": {{ "tex": {{ "PATH": "{}" }} }} }}*/
+void main() {{ gl_FragColor = IMG_THIS_NORM_PIXEL(tex); }}
+"#,
+        bmp.display()
+    );
+    // A shader path with a directory, so relative IMPORTED paths would resolve
+    // against it (this one is absolute, so it's used directly).
+    let iname: std::sync::Arc<str> = std::env::temp_dir()
+        .join("vidiotic_imported.fs")
+        .to_string_lossy()
+        .into();
+    renderer
+        .load_isf(&gpu.device, &gpu.queue, iname.clone(), &imp_src)
+        .expect("IMPORTED ISF compiles");
+    renderer.set_active_chain(vec![ChainSlot::new(SlotRef::Isf(iname))]);
+    let p = render_center_pixel(&gpu, &mut renderer);
+    let pass9 = p[2] > 200 && close(p[0], 0, 20) && close(p[1], 0, 20);
+    println!("[{}] ISF IMPORTED image: center={p:?} (want ~[0,0,255])", if pass9 { " OK " } else { "FAIL" });
+    ok &= pass9;
+    renderer.set_active_chain(Vec::new());
+    let _ = std::fs::remove_file(&bmp);
 
     println!("\n{}", if ok { "SPIKE PASS" } else { "SPIKE FAIL" });
     std::process::exit(if ok { 0 } else { 1 });

@@ -327,8 +327,8 @@ fn isf_params_ui(
     inputs: &[IsfInput],
     tx: &Sender<Command>,
 ) {
-    if inputs.iter().all(|i| matches!(i.kind, IsfInputKind::Image)) {
-        return; // nothing tweakable
+    if inputs.iter().all(|i| i.kind.is_texture()) {
+        return; // nothing tweakable — every input is a texture (image/audio)
     }
     let send = |name: &str, value: IsfValue| {
         let _ = tx.send(Command::SetChainParam {
@@ -434,7 +434,8 @@ fn isf_params_ui(
                         send(&input.name, IsfValue::Bool(true));
                     }
                 }
-                IsfInputKind::Image => {}
+                // Texture inputs have no scalar widget.
+                IsfInputKind::Image | IsfInputKind::Audio | IsfInputKind::AudioFft => {}
             }
         }
     }

@@ -205,12 +205,17 @@ pub enum IsfInputKind {
     Point2D { min: [f32; 2], max: [f32; 2], default: [f32; 2] },
     /// A momentary trigger; treated as a bool in the uniform.
     Event,
-    /// An image input (input image / imported texture). Not a UBO field.
+    /// A generic image input; aliases to the effect's stage input (`inputImage`).
+    /// Not a UBO field.
     Image,
+    /// An `audio` waveform input, bound from the app's audio waveform row.
+    Audio,
+    /// An `audioFFT` spectrum input, bound from the app's audio FFT row.
+    AudioFft,
 }
 
 impl IsfInputKind {
-    /// The schema default as an [`IsfValue`] (image inputs have no scalar value).
+    /// The schema default as an [`IsfValue`] (texture inputs have no scalar value).
     pub fn default_value(&self) -> Option<IsfValue> {
         match self {
             Self::Float { default, .. } => Some(IsfValue::Float(*default)),
@@ -219,12 +224,13 @@ impl IsfInputKind {
             Self::Color { default } => Some(IsfValue::Color(*default)),
             Self::Point2D { default, .. } => Some(IsfValue::Point2D(*default)),
             Self::Event => Some(IsfValue::Bool(false)),
-            Self::Image => None,
+            Self::Image | Self::Audio | Self::AudioFft => None,
         }
     }
 
-    fn is_image(&self) -> bool {
-        matches!(self, Self::Image)
+    /// A texture input (image / audio / audioFFT) rather than a UBO scalar field.
+    pub fn is_texture(&self) -> bool {
+        matches!(self, Self::Image | Self::Audio | Self::AudioFft)
     }
 }
 
@@ -536,7 +542,9 @@ fn parse_input(v: &JVal) -> Option<IsfInput> {
             default: parse_vec2(v.get("DEFAULT")).unwrap_or([0.0, 0.0]),
         },
         "event" => IsfInputKind::Event,
-        "image" | "audio" | "audioFFT" => IsfInputKind::Image,
+        "image" => IsfInputKind::Image,
+        "audio" => IsfInputKind::Audio,
+        "audioFFT" => IsfInputKind::AudioFft,
         other => {
             log::warn!("ISF: unsupported input type {other:?} on {name:?}; skipping");
             return None;
@@ -612,7 +620,7 @@ pub fn detect(src: &str) -> Option<IsfHeader> {
     }
     // Require at least one ISF-identifying key so a stray leading comment that
     // happens to be a JSON object doesn't get mistaken for an ISF header.
-    let isf_ish = ["ISFVSN", "INPUTS", "PASSES", "CATEGORIES", "DESCRIPTION"]
+    let isf_ish = ["ISFVSN", "INPUTS", "PASSES", "CATEGORIES", "DESCRIPTION", "IMPORTED"]
         .iter()
         .any(|k| v.get(k).is_some());
     if !isf_ish {
@@ -728,7 +736,7 @@ impl IsfUbo {
                 IsfInputKind::Long { .. } => FieldShape::I32,
                 IsfInputKind::Color { .. } => FieldShape::Vec4,
                 IsfInputKind::Point2D { .. } => FieldShape::Vec2,
-                IsfInputKind::Image => continue,
+                IsfInputKind::Image | IsfInputKind::Audio | IsfInputKind::AudioFft => continue,
             };
             let offset = round_up(cursor, shape.align());
             offsets.push(offset);
@@ -798,15 +806,42 @@ pub struct IsfProgram {
     /// Named render targets (from `PASSES[].TARGET`), in binding order. Each is
     /// bound at `set=3, binding = 2 + index`.
     pub targets: Vec<IsfTarget>,
+    /// Image-like inputs backed by an app-provided texture (audio / audioFFT),
+    /// in schema order. Bound at `set=3` *after* the targets, so entry `j` is at
+    /// `binding = 2 + targets.len() + j`.
+    pub tex_inputs: Vec<IsfTexInput>,
     pub ubo: IsfUbo,
 }
 
 impl IsfProgram {
-    /// The non-image inputs in schema order — the fields the parameter buffer
+    /// The non-texture inputs in schema order — the fields the parameter buffer
     /// holds, and the order [`IsfUbo::pack`] expects `values` in.
     pub fn scalar_inputs(&self) -> impl Iterator<Item = &IsfInput> {
-        self.inputs.iter().filter(|i| !i.kind.is_image())
+        self.inputs.iter().filter(|i| !i.kind.is_texture())
     }
+}
+
+/// Which app-provided texture backs an ISF image-like binding at `set=3`.
+/// Generic `image` inputs are *not* here — they alias to the effect's stage
+/// input via a `#define`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IsfTexSource {
+    /// The audio waveform row (512×1, 0..1 centered on 0.5).
+    AudioWave,
+    /// The audio FFT spectrum row (512×1, normalized 0..1).
+    AudioFft,
+    /// An `IMPORTED` image file, resolved relative to the shader's directory and
+    /// decoded to a static RGBA texture at load time.
+    Imported(PathBuf),
+}
+
+/// One image-like binding at `set=3` from an app texture, in binding order
+/// (after the pass targets): the `audio`/`audioFFT` inputs then the `IMPORTED`
+/// images.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IsfTexInput {
+    pub name: String,
+    pub source: IsfTexSource,
 }
 
 /// Derive the named targets from the pass list, in first-appearance order. Each
@@ -837,8 +872,9 @@ pub fn transpile(src: &str) -> Option<IsfProgram> {
     let body = body_after_header(src);
     let ubo = IsfUbo::from_inputs(&header.inputs);
     let targets = targets_of(&header.passes);
+    let tex_inputs = tex_inputs_of(&header);
 
-    let additions = generate_additions(&header, &targets);
+    let additions = generate_additions(&header, &targets, &tex_inputs);
 
     let mut combined = String::new();
     combined.push_str(PREAMBLE);
@@ -855,14 +891,38 @@ pub fn transpile(src: &str) -> Option<IsfProgram> {
         inputs: header.inputs,
         passes: header.passes,
         targets,
+        tex_inputs,
         ubo,
     })
+}
+
+/// The image-like bindings backed by an app texture — the `set=3` textures that
+/// follow the named pass targets: the `audio`/`audioFFT` inputs (schema order)
+/// then the `IMPORTED` images (header order).
+fn tex_inputs_of(header: &IsfHeader) -> Vec<IsfTexInput> {
+    let audio = header.inputs.iter().filter_map(|i| {
+        let source = match i.kind {
+            IsfInputKind::Audio => IsfTexSource::AudioWave,
+            IsfInputKind::AudioFft => IsfTexSource::AudioFft,
+            _ => return None,
+        };
+        Some(IsfTexInput { name: i.name.clone(), source })
+    });
+    let imported = header.imported.iter().map(|(name, path)| IsfTexInput {
+        name: name.clone(),
+        source: IsfTexSource::Imported(path.clone()),
+    });
+    audio.chain(imported).collect()
 }
 
 /// The ISF prelude appended after the base `PREAMBLE`: built-in aliases, the
 /// `IMG_*` accessors, the parameter UBO, per-input `#define`s, and the named
 /// pass-target samplers.
-fn generate_additions(header: &IsfHeader, targets: &[IsfTarget]) -> String {
+fn generate_additions(
+    header: &IsfHeader,
+    targets: &[IsfTarget],
+    tex_inputs: &[IsfTexInput],
+) -> String {
     let mut s = String::new();
     s.push_str("// ---- ISF compatibility (auto-generated) ----\n");
     // Built-in aliases. RENDERSIZE is per-pass (from the ISF UBO so a downscaled
@@ -912,23 +972,30 @@ fn generate_additions(header: &IsfHeader, targets: &[IsfTarget]) -> String {
             IsfInputKind::Point2D { .. } => {
                 s.push_str(&format!("    vec2 in_{};\n", input.name));
             }
-            IsfInputKind::Image => {}
+            // Texture inputs are not UBO fields.
+            IsfInputKind::Image | IsfInputKind::Audio | IsfInputKind::AudioFft => {}
         }
     }
     s.push_str("} uISF;\n");
 
-    // Named pass targets: one texture each at set=3 binding 2.., sharing one
-    // sampler at binding 1. The shader samples them by name via the IMG_* macros.
-    if !targets.is_empty() {
+    // Named pass targets and audio texture inputs: one texture each at set=3
+    // binding 2.., sharing one sampler at binding 1. Targets come first (their
+    // binding index doubles as the render-side target index), then the audio
+    // inputs. The shader samples them by name via the IMG_* macros.
+    let tex_names = targets
+        .iter()
+        .map(|t| t.name.as_str())
+        .chain(tex_inputs.iter().map(|t| t.name.as_str()));
+    if targets.len() + tex_inputs.len() > 0 {
         s.push_str("layout(set = 3, binding = 1) uniform sampler isfSmp;\n");
-        for (i, t) in targets.iter().enumerate() {
+        for (i, name) in tex_names.enumerate() {
             let b = i + 2;
-            s.push_str(&format!(
-                "layout(set = 3, binding = {b}) uniform texture2D {}Tex;\n",
-                t.name
-            ));
+            s.push_str(&format!("layout(set = 3, binding = {b}) uniform texture2D {name}Tex;\n"));
         }
         for t in targets {
+            s.push_str(&format!("#define {0} sampler2D({0}Tex, isfSmp)\n", t.name));
+        }
+        for t in tex_inputs {
             s.push_str(&format!("#define {0} sampler2D({0}Tex, isfSmp)\n", t.name));
         }
     }
@@ -947,9 +1014,13 @@ fn generate_additions(header: &IsfHeader, targets: &[IsfTarget]) -> String {
                 s.push_str(&format!("#define {n} uISF.in_{n}\n"));
             }
             IsfInputKind::Image => {
-                // Extra image inputs alias to the stage input for now (Phase 3).
+                // Generic image inputs (no host source routing) alias to the
+                // effect's stage input.
                 s.push_str(&format!("#define {n} sampler2D(inputTex, inputSmp)\n"));
             }
+            // Audio inputs are set=3 textures; their `#define` is emitted with the
+            // rest of the `tex_inputs` above.
+            IsfInputKind::Audio | IsfInputKind::AudioFft => {}
         }
     }
     s.push_str("// ---- end ISF compatibility ----\n");
@@ -1126,6 +1197,62 @@ void main() { gl_FragColor = IMG_NORM_PIXEL(bufA, isf_FragNormCoord); }
         assert_eq!(prog.passes.len(), 2);
         assert!(prog.combined.contains("uniform texture2D bufATex"));
         assert!(prog.combined.contains("#define bufA sampler2D(bufATex, isfSmp)"));
+    }
+
+    #[test]
+    fn transpile_audio_inputs_bind_after_targets() {
+        let src = r#"/*{
+            "INPUTS": [
+                { "NAME": "gain", "TYPE": "float", "DEFAULT": 1.0 },
+                { "NAME": "wave", "TYPE": "audio" },
+                { "NAME": "spectrum", "TYPE": "audioFFT" }
+            ],
+            "PASSES": [ { "TARGET": "bufA" }, {} ]
+        }*/
+void main() { gl_FragColor = IMG_NORM_PIXEL(spectrum, vec2(isf_FragNormCoord.x, 0.0)); }
+"#;
+        let prog = transpile(src).unwrap();
+        // `gain` is a UBO field; the two audio inputs are set=3 textures.
+        assert_eq!(prog.scalar_inputs().count(), 1);
+        assert_eq!(
+            prog.tex_inputs,
+            vec![
+                IsfTexInput { name: "wave".into(), source: IsfTexSource::AudioWave },
+                IsfTexInput { name: "spectrum".into(), source: IsfTexSource::AudioFft },
+            ]
+        );
+        // Targets take bindings 2.., audio inputs follow: bufA@2, wave@3, spectrum@4.
+        assert!(prog.combined.contains("layout(set = 3, binding = 2) uniform texture2D bufATex;"));
+        assert!(prog.combined.contains("layout(set = 3, binding = 3) uniform texture2D waveTex;"));
+        assert!(prog
+            .combined
+            .contains("layout(set = 3, binding = 4) uniform texture2D spectrumTex;"));
+        assert!(prog.combined.contains("#define spectrum sampler2D(spectrumTex, isfSmp)"));
+    }
+
+    #[test]
+    fn transpile_imported_images_bind_as_textures() {
+        let src = r#"/*{
+            "IMPORTED": { "noise": { "PATH": "tex/noise.png" } },
+            "INPUTS": [ { "NAME": "wave", "TYPE": "audio" } ]
+        }*/
+void main() { gl_FragColor = IMG_THIS_NORM_PIXEL(noise) + IMG_THIS_NORM_PIXEL(wave); }
+"#;
+        let prog = transpile(src).unwrap();
+        // Audio inputs come first, then IMPORTED images.
+        assert_eq!(
+            prog.tex_inputs,
+            vec![
+                IsfTexInput { name: "wave".into(), source: IsfTexSource::AudioWave },
+                IsfTexInput {
+                    name: "noise".into(),
+                    source: IsfTexSource::Imported(PathBuf::from("tex/noise.png")),
+                },
+            ]
+        );
+        // wave@2, noise@3; both get a sampler #define.
+        assert!(prog.combined.contains("layout(set = 3, binding = 3) uniform texture2D noiseTex;"));
+        assert!(prog.combined.contains("#define noise sampler2D(noiseTex, isfSmp)"));
     }
 
     #[test]
