@@ -20,6 +20,7 @@ use nanoserde::{DeRon, SerRon};
 use crate::bank::{Bank, Cue, CueId, Toggle};
 use crate::clippool::{Clip, ClipBank};
 use crate::commands::{ChainSlot, ClipId, SlotRef};
+use crate::isf::IsfValue;
 
 /// Bumped on any breaking change to the on-disk shape; [`load`] routes older
 /// files through [`migrate`].
@@ -27,7 +28,7 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// A whole saved session: a flat clip pool, named clip-bank groupings over it,
 /// and the cue banks the sequencer plays.
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct Project {
     #[nserde(default)]
     pub version: u32,
@@ -64,7 +65,7 @@ pub struct SessionDefaults {
 
 /// One source clip. `path` is relative to the `.viproj`'s directory, or
 /// absolute; [`resolve`] turns it into a concrete path and flags misses.
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct ClipSpec {
     pub id: ClipId,
     pub path: String,
@@ -84,7 +85,7 @@ pub struct ClipSpec {
 
 /// How a baked clip was carved out of its pre-transcode original — informational
 /// and enough to re-bake. `out_frame` is exclusive.
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct SpanProvenance {
     pub original_path: String,
     pub in_frame: u64,
@@ -94,27 +95,66 @@ pub struct SpanProvenance {
 }
 
 /// A named group of clips, referenced by id. Purely a pool-grid filter.
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct ClipBankSpec {
     pub name: String,
     pub clip_ids: Vec<ClipId>,
 }
 
 /// A named, ordered set of cues — the on-disk form of a [`crate::bank::Bank`].
-#[derive(SerRon, DeRon, Clone, Debug)]
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct CueBankSpec {
     pub name: String,
     pub cues: Vec<CueSpec>,
 }
 
 /// One serialized entry in a cue's effect chain. Built-ins are referenced by
-/// stable name; the live (livecoded) shader is a tagged position. Pinned
-/// livecode captures have no stable source and are not serialized (dropped on
-/// save), so there is no `Pinned` variant here.
-#[derive(SerRon, DeRon, Clone, Debug, PartialEq, Eq)]
+/// stable name; the live (livecoded) shader is a tagged position; ISF shaders by
+/// file path (relative to the project dir where possible) plus their dialed-in
+/// input values. Pinned livecode captures have no stable source and are not
+/// serialized (dropped on save), so there is no `Pinned` variant here.
+///
+/// Not `Eq` because an ISF value can carry an `f32`.
+#[derive(SerRon, DeRon, Clone, Debug, PartialEq)]
 pub enum CueEffectSpec {
     Live,
     Builtin(String),
+    Isf {
+        path: String,
+        params: Vec<(String, IsfValueSpec)>,
+    },
+}
+
+/// Serialized ISF input value (mirrors [`crate::isf::IsfValue`]). Colors/points
+/// are stored as tuples for nanoserde compatibility.
+#[derive(SerRon, DeRon, Clone, Debug, PartialEq)]
+pub enum IsfValueSpec {
+    Float(f32),
+    Bool(bool),
+    Long(i32),
+    Color(f32, f32, f32, f32),
+    Point2D(f32, f32),
+}
+
+impl IsfValueSpec {
+    fn from_runtime(v: &IsfValue) -> Self {
+        match v {
+            IsfValue::Float(f) => Self::Float(*f),
+            IsfValue::Bool(b) => Self::Bool(*b),
+            IsfValue::Long(i) => Self::Long(*i),
+            IsfValue::Color([r, g, b, a]) => Self::Color(*r, *g, *b, *a),
+            IsfValue::Point2D([x, y]) => Self::Point2D(*x, *y),
+        }
+    }
+    fn to_runtime(&self) -> IsfValue {
+        match self {
+            Self::Float(f) => IsfValue::Float(*f),
+            Self::Bool(b) => IsfValue::Bool(*b),
+            Self::Long(i) => IsfValue::Long(*i),
+            Self::Color(r, g, b, a) => IsfValue::Color([*r, *g, *b, *a]),
+            Self::Point2D(x, y) => IsfValue::Point2D([*x, *y]),
+        }
+    }
 }
 
 /// A cue placement. Runtime `Toggle<T>` advanced knobs are flattened to
@@ -413,15 +453,24 @@ impl ClipSpec {
 impl CueSpec {
     /// Snapshot a runtime cue. Drops the runtime `id` (reassigned on load) and
     /// maps each `Toggle` to `Some(val)` only when on. Chain slots serialize by
-    /// stable name; pinned livecode captures have no stable source, so they are
-    /// dropped (with a warning).
-    pub fn from_cue(c: &Cue) -> Self {
+    /// stable name (built-ins) or file path relative to `dir` (ISF, with their
+    /// param overrides); pinned livecode captures have no stable source, so they
+    /// are dropped (with a warning).
+    pub fn from_cue(c: &Cue, dir: &Path) -> Self {
         let chain = c
             .chain
             .iter()
             .filter_map(|slot| match &slot.shader {
                 SlotRef::Live => Some(CueEffectSpec::Live),
                 SlotRef::Builtin(name) => Some(CueEffectSpec::Builtin(name.to_string())),
+                SlotRef::Isf(path) => Some(CueEffectSpec::Isf {
+                    path: relativize(dir, &absolutize(Path::new(path.as_ref()))),
+                    params: slot
+                        .params
+                        .iter()
+                        .map(|(n, v)| (n.to_string(), IsfValueSpec::from_runtime(v)))
+                        .collect(),
+                }),
                 SlotRef::Pinned(id) => {
                     log::warn!("dropping pinned shader {id} from saved cue chain (not persistable)");
                     None
@@ -447,17 +496,25 @@ impl CueSpec {
     }
 
     /// Rebuild a runtime cue with the caller-assigned `id`. Absent toggles come
-    /// back off, carrying the same retained defaults as [`Cue::new`].
-    pub fn to_cue(&self, id: CueId) -> Cue {
+    /// back off, carrying the same retained defaults as [`Cue::new`]. ISF paths
+    /// resolve against `dir` back to absolute, so the pool can load them.
+    pub fn to_cue(&self, id: CueId, dir: &Path) -> Cue {
         let chain = self
             .chain
             .iter()
-            .map(|e| {
-                let shader = match e {
-                    CueEffectSpec::Live => SlotRef::Live,
-                    CueEffectSpec::Builtin(name) => SlotRef::Builtin(name.as_str().into()),
-                };
-                ChainSlot::new(shader)
+            .map(|e| match e {
+                CueEffectSpec::Live => ChainSlot::new(SlotRef::Live),
+                CueEffectSpec::Builtin(name) => ChainSlot::new(SlotRef::Builtin(name.as_str().into())),
+                CueEffectSpec::Isf { path, params } => {
+                    let abs = resolve_path(dir, path);
+                    ChainSlot {
+                        shader: SlotRef::Isf(abs.to_string_lossy().as_ref().into()),
+                        params: params
+                            .iter()
+                            .map(|(n, v)| (n.as_str().into(), v.to_runtime()))
+                            .collect(),
+                    }
+                }
             })
             .collect();
         Cue {
@@ -493,10 +550,11 @@ impl ClipBankSpec {
 
 impl CueBankSpec {
     /// Snapshot a runtime cue bank, converting each cue via [`CueSpec::from_cue`].
-    pub fn from_bank(b: &Bank) -> Self {
+    /// `dir` (the save directory) relativizes ISF shader paths.
+    pub fn from_bank(b: &Bank, dir: &Path) -> Self {
         Self {
             name: b.name.to_string(),
-            cues: b.cues.iter().map(CueSpec::from_cue).collect(),
+            cues: b.cues.iter().map(|c| CueSpec::from_cue(c, dir)).collect(),
         }
     }
 }
@@ -532,7 +590,7 @@ impl Project {
                 })
                 .collect(),
             clip_banks: clip_banks.iter().map(ClipBankSpec::from_bank).collect(),
-            cue_banks: cue_banks.iter().map(CueBankSpec::from_bank).collect(),
+            cue_banks: cue_banks.iter().map(|b| CueBankSpec::from_bank(b, dir)).collect(),
         }
     }
 }
@@ -624,15 +682,51 @@ mod tests {
     #[test]
     fn cue_toggle_round_trip() {
         let cue = sample().cue_banks[0].cues[0].clone();
-        let runtime = cue.to_cue(7);
+        let dir = Path::new("/proj");
+        let runtime = cue.to_cue(7, dir);
         assert_eq!(runtime.id, 7);
         assert!(runtime.loop_phase.on && runtime.loop_phase.val == -4);
         assert!(!runtime.start_nudge.on && runtime.start_nudge.val == 0.0);
         assert!(runtime.speed_mul.on && runtime.speed_mul.val == 1.5);
-        let back = CueSpec::from_cue(&runtime);
+        let back = CueSpec::from_cue(&runtime, dir);
         assert_eq!(back.loop_phase, Some(-4));
         assert_eq!(back.start_nudge, None);
         assert_eq!(back.speed_mul, Some(1.5));
+    }
+
+    #[test]
+    fn isf_effect_spec_round_trips() {
+        let dir = Path::new("/proj");
+        let spec = CueSpec {
+            clip: 0,
+            chain: vec![CueEffectSpec::Isf {
+                path: "fx/hue.fs".into(),
+                params: vec![
+                    ("gain".into(), IsfValueSpec::Float(1.5)),
+                    ("tint".into(), IsfValueSpec::Color(0.1, 0.2, 0.3, 1.0)),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        // to runtime: path resolves to absolute (so the pool can load it),
+        // params come back as runtime values.
+        let runtime = spec.to_cue(9, dir);
+        match &runtime.chain[0].shader {
+            SlotRef::Isf(p) => assert_eq!(p.as_ref(), "/proj/fx/hue.fs"),
+            other => panic!("expected ISF slot, got {other:?}"),
+        }
+        assert_eq!(runtime.chain[0].param("gain"), Some(&IsfValue::Float(1.5)));
+
+        // back to spec: absolute path relativizes against the save dir; params
+        // preserved.
+        let back = CueSpec::from_cue(&runtime, dir);
+        assert_eq!(back.chain, spec.chain);
+
+        // And the on-disk RON text round-trips.
+        let text = spec.serialize_ron();
+        let parsed = CueSpec::deserialize_ron(&text).expect("parse");
+        assert_eq!(parsed.chain, spec.chain);
     }
 
     #[test]
@@ -654,7 +748,7 @@ mod tests {
             dir: None,
             clip_ids: vec![0],
         }];
-        let cue = sample().cue_banks[0].cues[0].clone().to_cue(1);
+        let cue = sample().cue_banks[0].cues[0].clone().to_cue(1, &dir);
         let cue_banks = vec![Bank {
             name: "A".into(),
             cues: vec![cue],

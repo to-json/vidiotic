@@ -6,11 +6,22 @@
 //! pipeline is built, so a bad live-reload keeps the last-good pipeline.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::analysis::{AUDIO_TEX_LEN, AUDIO_TEX_W};
-use crate::commands::{ChainSlot, ShaderId, SlotRef};
+use crate::commands::{ChainSlot, ShaderId, ShaderPoolView, SlotRef};
+use crate::isf::{self, IsfBuiltins, IsfInput, IsfPass, IsfTarget, IsfUbo, IsfValue};
 use crate::shader::{self, ShaderError, ShaderLang};
+
+/// Format of ISF intermediate pass targets. Always float so `FLOAT`/feedback
+/// passes keep precision; the final (untargeted) pass writes `color_format`.
+const ISF_MID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Minimum alignment for a non-dynamic uniform buffer binding offset (wgpu's
+/// default `min_uniform_buffer_offset_alignment`), used to pack one parameter
+/// block per ISF pass into a single buffer.
+const ISF_UBO_ALIGN: u64 = 256;
 use crate::video::frame::{DecodedFrame, PixelData};
 use crate::video::hap::HapTextureFormat;
 
@@ -92,6 +103,53 @@ struct PooledShader {
     name: Arc<str>,
     builtin: bool,
     pipeline: wgpu::RenderPipeline,
+    /// Present for ISF pool entries: the input schema + the `set=3` parameter
+    /// buffer/bind group the pipeline expects.
+    isf: Option<IsfEntry>,
+}
+
+/// The extra GPU state an ISF pool entry carries beyond a plain pipeline: the
+/// input schema, the pass/target metadata, the `set=3` layout, the per-pass
+/// parameter buffer, and the intermediate-format pipeline variant for targeted
+/// passes. The untargeted final pass uses the entry's `PooledShader::pipeline`
+/// (which writes `color_format`).
+struct IsfEntry {
+    inputs: Vec<IsfInput>,
+    ubo: IsfUbo,
+    passes: Vec<IsfPass>,
+    targets: Vec<IsfTarget>,
+    /// 256-aligned stride of one parameter block in `params_buf` (one per pass).
+    aligned: u64,
+    params_buf: wgpu::Buffer,
+    bgl: wgpu::BindGroupLayout,
+    /// Pipeline writing [`ISF_MID_FORMAT`]; `None` when the shader has no targets.
+    pipeline_mid: Option<wgpu::RenderPipeline>,
+}
+
+/// Per-instance render targets for an ISF effect's named passes, double-buffered
+/// for feedback and kept across frames. Sized to the effect's stage output;
+/// reallocated when that size changes.
+struct IsfTargets {
+    base: (u32, u32),
+    /// Which buffer index the current frame writes (toggled each frame). The
+    /// previous frame's content is in `1 - parity`.
+    parity: usize,
+    /// One entry per `IsfEntry::targets`, in the same order.
+    bufs: Vec<TargetTex>,
+}
+
+/// A double-buffered ISF target texture (`[write/current, previous]` selected by
+/// parity). The textures are kept alive alongside their views.
+struct TargetTex {
+    _tex: [wgpu::Texture; 2],
+    view: [wgpu::TextureView; 2],
+}
+
+/// A resolved chain stage for the draw phase: a plain single-pass pipeline, or an
+/// ISF effect (by pool id) rendered via [`Renderer::draw_isf`].
+enum Stage<'a> {
+    Plain(&'a wgpu::RenderPipeline),
+    Isf(ShaderId),
 }
 
 /// The bundled effect shaders loaded into the pool at startup, addressable by
@@ -121,6 +179,7 @@ pub struct Renderer {
     globals_bg: wgpu::BindGroup,
     bgl_video: wgpu::BindGroupLayout,
     bgl_input: wgpu::BindGroupLayout,
+    bgl_globals: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vs_glsl: wgpu::ShaderModule, // paired with GLSL fragment shaders
     vs_wgsl: wgpu::ShaderModule, // paired with WGSL fragment shaders
@@ -152,6 +211,11 @@ pub struct Renderer {
     next_pool_id: ShaderId,
     // The playing cue's effect chain (set by the app). Empty = the live shader.
     active_chain: Vec<ChainSlot>,
+    // Monotonic frame counter, exposed to ISF shaders as FRAMEINDEX.
+    frame_index: u32,
+    // Per-ISF-entry named-pass render targets (keyed by pool id), kept across
+    // frames for feedback.
+    isf_targets: HashMap<ShaderId, IsfTargets>,
 }
 
 impl Renderer {
@@ -367,6 +431,7 @@ impl Renderer {
                         name: (*name).into(),
                         builtin: true,
                         pipeline,
+                        isf: None,
                     });
                     next_pool_id += 1;
                 }
@@ -379,6 +444,7 @@ impl Renderer {
             globals_bg,
             bgl_video,
             bgl_input,
+            bgl_globals,
             pipeline_layout,
             vs_glsl,
             vs_wgsl,
@@ -398,6 +464,8 @@ impl Renderer {
             pool,
             next_pool_id,
             active_chain: Vec::new(),
+            frame_index: 0,
+            isf_targets: HashMap::new(),
         }
     }
 
@@ -440,6 +508,7 @@ impl Renderer {
                     name: name.into(),
                     builtin: false,
                     pipeline,
+                    isf: None,
                 });
                 Some(id)
             }
@@ -464,26 +533,179 @@ impl Renderer {
         self.active_chain = chain;
     }
 
-    /// (id, name, builtin) of each pool shader, built-ins first (load order).
-    pub fn pool_view(&self) -> Vec<(ShaderId, Arc<str>, bool)> {
+    /// Each pool shader as a `ShaderPoolView`, built-ins first (load order). ISF
+    /// entries carry their input schema for the parameter editor.
+    pub fn pool_view(&self) -> Vec<ShaderPoolView> {
         self.pool
             .iter()
-            .map(|p| (p.id, p.name.clone(), p.builtin))
+            .map(|p| ShaderPoolView {
+                id: p.id,
+                name: p.name.clone(),
+                builtin: p.builtin,
+                inputs: p.isf.as_ref().map(|e| e.inputs.clone()).unwrap_or_default(),
+            })
             .collect()
     }
 
-    /// Resolve a chain slot to its pipeline, or `None` if it no longer exists
-    /// (a removed pin, or a built-in name absent from this build).
-    fn resolve_slot(&self, slot: &SlotRef) -> Option<&wgpu::RenderPipeline> {
-        match slot {
-            SlotRef::Live => Some(self.pipeline.as_ref().unwrap_or(&self.passthrough)),
-            SlotRef::Builtin(name) => self
+    /// Compile an ISF shader source into the pool under `name` (its path key),
+    /// returning the new pool id — or an existing entry's id if already loaded.
+    ///
+    /// # Errors
+    /// Returns [`ShaderError`] if the source is not ISF or fails to compile.
+    pub fn load_isf(
+        &mut self,
+        device: &wgpu::Device,
+        name: Arc<str>,
+        src: &str,
+    ) -> Result<ShaderId, ShaderError> {
+        if let Some(p) = self.pool.iter().find(|p| p.isf.is_some() && p.name == name) {
+            return Ok(p.id);
+        }
+        let prog = isf::transpile(src).ok_or_else(|| ShaderError::Parse {
+            msg: "not an ISF shader (no ISF header found)".into(),
+            line: None,
+        })?;
+        let module = shader::compile_isf_program(&prog)?;
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("isf-fs"),
+            source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+        });
+
+        // set=3 layout: the parameter UBO at binding 0; when the shader has named
+        // targets, a shared sampler at binding 1 and one target texture at 2.. .
+        let ubo_size = prog.ubo.size() as u64;
+        let mut bgl_entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZeroU64::new(ubo_size),
+            },
+            count: None,
+        }];
+        if !prog.targets.is_empty() {
+            bgl_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+            for i in 0..prog.targets.len() {
+                bgl_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: (i + 2) as u32,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+            }
+        }
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("isf-set3-bgl"),
+            entries: &bgl_entries,
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("isf-layout"),
+            bind_group_layouts: &[
+                Some(&self.bgl_globals),
+                Some(&self.bgl_video),
+                Some(&self.bgl_input),
+                Some(&bgl),
+            ],
+            immediate_size: 0,
+        });
+        // The final (untargeted) pass writes color_format; targeted passes write
+        // the float intermediate format.
+        let pipeline_out =
+            build_pipeline(device, &layout, &self.vs_glsl, &fs, self.color_format);
+        let pipeline_mid = (!prog.targets.is_empty())
+            .then(|| build_pipeline(device, &layout, &self.vs_glsl, &fs, ISF_MID_FORMAT));
+
+        let aligned = round_up_u64(ubo_size, ISF_UBO_ALIGN);
+        let n_pass = prog.passes.len().max(1) as u64;
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("isf-params"),
+            size: aligned * n_pass,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let id = self.next_pool_id;
+        self.next_pool_id += 1;
+        self.pool.push(PooledShader {
+            id,
+            name,
+            builtin: false,
+            pipeline: pipeline_out,
+            isf: Some(IsfEntry {
+                inputs: prog.inputs,
+                ubo: prog.ubo,
+                passes: prog.passes,
+                targets: prog.targets,
+                aligned,
+                params_buf,
+                bgl,
+                pipeline_mid,
+            }),
+        });
+        Ok(id)
+    }
+
+    /// Pack and upload every ISF slot's per-pass parameter blocks (one block per
+    /// pass, differing in `PASSINDEX`/`RENDERSIZE`) from the slot's overrides,
+    /// falling back to schema defaults. Call once per frame from [`Renderer::render`]
+    /// after ISF targets are sized.
+    ///
+    /// Limitation: parameters live on the pool entry, so if the same ISF appears
+    /// more than once in one chain, the last instance's values win for all.
+    fn pack_isf_params(&self, queue: &wgpu::Queue, width: u32, height: u32) {
+        for slot in &self.active_chain {
+            let SlotRef::Isf(name) = &slot.shader else { continue };
+            let Some(entry) = self
                 .pool
                 .iter()
-                .find(|p| p.builtin && p.name.as_ref() == name.as_ref())
-                .map(|p| &p.pipeline),
-            SlotRef::Pinned(id) => {
-                self.pool.iter().find(|p| p.id == *id).map(|p| &p.pipeline)
+                .find(|p| p.isf.is_some() && p.name.as_ref() == name.as_ref())
+                .and_then(|p| p.isf.as_ref())
+            else {
+                continue;
+            };
+            // Non-image inputs in schema order — aligned 1:1 with the UBO offsets.
+            let values: Vec<IsfValue> = entry
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    let default = input.kind.default_value()?; // None => image input, skip
+                    Some(slot.param(&input.name).cloned().unwrap_or(default))
+                })
+                .collect();
+            let n_pass = entry.passes.len().max(1);
+            for i in 0..n_pass {
+                // RENDERSIZE = this pass's target size (the stage size for the
+                // final untargeted pass).
+                let (rw, rh) = entry
+                    .passes
+                    .get(i)
+                    .and_then(|p| p.target.as_ref())
+                    .and_then(|tname| entry.targets.iter().find(|t| &t.name == tname))
+                    .map(|t| {
+                        (
+                            isf::eval_size(&t.width, width, height, width),
+                            isf::eval_size(&t.height, width, height, height),
+                        )
+                    })
+                    .unwrap_or((width, height));
+                let builtins = IsfBuiltins {
+                    frame_index: self.frame_index as i32,
+                    pass_index: i as i32,
+                    render_size: [rw as f32, rh as f32],
+                    ..Default::default()
+                };
+                let buf = entry.ubo.pack(&values, &builtins);
+                queue.write_buffer(&entry.params_buf, i as u64 * entry.aligned, &buf);
             }
         }
     }
@@ -699,6 +921,7 @@ impl Renderer {
     pub fn render(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         width: u32,
@@ -725,21 +948,42 @@ impl Renderer {
             return;
         }
 
+        self.frame_index = self.frame_index.wrapping_add(1);
+
+        // --- mutable pre-pass: size ISF targets + toggle feedback parity ---
+        let isf_ids: Vec<ShaderId> = self
+            .active_chain
+            .iter()
+            .filter_map(|slot| match &slot.shader {
+                SlotRef::Isf(name) => self
+                    .pool
+                    .iter()
+                    .find(|p| p.isf.is_some() && p.name.as_ref() == name.as_ref())
+                    .map(|p| p.id),
+                _ => None,
+            })
+            .collect();
+        for id in isf_ids {
+            self.ensure_isf_targets(device, id, width, height);
+        }
         if !self.active_chain.is_empty() {
             self.ensure_ping(device, width, height);
         }
+        // Params depend on the target sizes just computed, so pack after.
+        self.pack_isf_params(queue, width, height);
 
+        // --- immutable draw phase ---
         let v = self.video.as_ref().expect("video present (checked above)");
-        // Resolve the chain to pipelines, skipping slots that no longer exist.
-        let passes: Vec<&wgpu::RenderPipeline> = self
+        // Resolve the chain to stages, skipping slots that no longer exist.
+        let stages: Vec<Stage> = self
             .active_chain
             .iter()
-            .filter_map(|slot| self.resolve_slot(&slot.shader))
+            .filter_map(|slot| self.resolve_stage(&slot.shader))
             .collect();
 
-        // Empty (or fully-unresolved) chain: today's single-pass fast path — the
-        // live shader (or passthrough) straight to `view`, input = dummy.
-        if passes.is_empty() {
+        // Empty (or fully-unresolved) chain: single-pass fast path — the live
+        // shader (or passthrough) straight to `view`, input = dummy.
+        if stages.is_empty() {
             let pipeline = self.pipeline.as_ref().unwrap_or(&self.passthrough);
             let input_bg = self.make_input_bg(device, &self.dummy_input_view);
             self.draw_pass(encoder, pipeline, &v.bind_group, &input_bg, view);
@@ -750,19 +994,51 @@ impl Renderer {
         // Pre-build the set=2 input bind groups: the seed reads the dummy (it
         // uses `video()`), each effect reads the buffer the prior stage wrote.
         let seed_input = self.make_input_bg(device, &self.dummy_input_view);
-        let input_bgs: Vec<wgpu::BindGroup> = (0..passes.len())
+        let input_bgs: Vec<wgpu::BindGroup> = (0..stages.len())
             .map(|i| self.make_input_bg(device, &ping.views[i % 2]))
             .collect();
 
         // Seed: decoded source → buffer 0.
         self.draw_pass(encoder, &self.passthrough, &v.bind_group, &seed_input, &ping.views[0]);
-        for (i, pipeline) in passes.iter().enumerate() {
-            let target = if i + 1 == passes.len() {
+        for (i, stage) in stages.iter().enumerate() {
+            let target = if i + 1 == stages.len() {
                 view
             } else {
                 &ping.views[(i + 1) % 2]
             };
-            self.draw_pass(encoder, pipeline, &v.bind_group, &input_bgs[i], target);
+            match stage {
+                Stage::Plain(pipeline) => {
+                    self.draw_pass(encoder, pipeline, &v.bind_group, &input_bgs[i], target);
+                }
+                Stage::Isf(id) => {
+                    self.draw_isf(encoder, device, *id, &v.bind_group, &input_bgs[i], target);
+                }
+            }
+        }
+    }
+
+    /// Resolve a chain slot to a draw-phase stage, or `None` if it no longer
+    /// exists (removed pin, absent built-in, or unloaded ISF).
+    fn resolve_stage(&self, slot: &SlotRef) -> Option<Stage<'_>> {
+        match slot {
+            SlotRef::Live => Some(Stage::Plain(
+                self.pipeline.as_ref().unwrap_or(&self.passthrough),
+            )),
+            SlotRef::Builtin(name) => self
+                .pool
+                .iter()
+                .find(|p| p.builtin && p.name.as_ref() == name.as_ref())
+                .map(|p| Stage::Plain(&p.pipeline)),
+            SlotRef::Pinned(id) => self
+                .pool
+                .iter()
+                .find(|p| p.id == *id)
+                .map(|p| Stage::Plain(&p.pipeline)),
+            SlotRef::Isf(name) => self
+                .pool
+                .iter()
+                .find(|p| p.name.as_ref() == name.as_ref() && p.isf.is_some())
+                .map(|p| Stage::Isf(p.id)),
         }
     }
 
@@ -797,6 +1073,144 @@ impl Renderer {
         pass.set_bind_group(1, video_bg, &[]);
         pass.set_bind_group(2, input_bg, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    /// Render one ISF effect stage: run each of its passes in order, targeted
+    /// passes into the effect's named buffers (feedback-aware) and the final
+    /// untargeted pass into `stage_out`. `input_bg` (set 2) is `inputImage` for
+    /// every pass.
+    fn draw_isf(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        id: ShaderId,
+        video_bg: &wgpu::BindGroup,
+        input_bg: &wgpu::BindGroup,
+        stage_out: &wgpu::TextureView,
+    ) {
+        let Some(p) = self.pool.iter().find(|p| p.id == id) else { return };
+        let Some(entry) = p.isf.as_ref() else { return };
+        let targets = self.isf_targets.get(&id);
+        let parity = targets.map_or(0, |t| t.parity);
+        let n_pass = entry.passes.len().max(1);
+
+        for i in 0..n_pass {
+            let named = entry.passes.get(i).and_then(|pass| pass.target.as_ref());
+            // Write target + pipeline variant: named targets use the float mid
+            // pipeline; the untargeted pass writes stage_out with the out pipeline.
+            let (target_view, pipeline) = match named {
+                Some(tname) => {
+                    let idx = entry.targets.iter().position(|t| &t.name == tname);
+                    match (idx, targets, entry.pipeline_mid.as_ref()) {
+                        (Some(idx), Some(tg), Some(mid)) => (&tg.bufs[idx].view[parity], mid),
+                        _ => continue,
+                    }
+                }
+                None => (stage_out, &p.pipeline),
+            };
+
+            let set3 = self.build_isf_set3(device, entry, targets, i, parity);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("isf-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, video_bg, &[]);
+            pass.set_bind_group(2, input_bg, &[]);
+            pass.set_bind_group(3, &set3, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Build the `set=3` bind group for ISF pass `pass_i`: the parameter block at
+    /// this pass's offset, plus each named target's read view. A target reads its
+    /// previous-frame buffer until the pass that writes it (so a feedback pass
+    /// reads last frame while writing this one), and the current buffer after.
+    fn build_isf_set3(
+        &self,
+        device: &wgpu::Device,
+        entry: &IsfEntry,
+        targets: Option<&IsfTargets>,
+        pass_i: usize,
+        parity: usize,
+    ) -> wgpu::BindGroup {
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &entry.params_buf,
+                offset: pass_i as u64 * entry.aligned,
+                size: std::num::NonZeroU64::new(entry.ubo.size() as u64),
+            }),
+        }];
+        if !entry.targets.is_empty() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&self.sampler),
+            });
+            for (j, t) in entry.targets.iter().enumerate() {
+                let read_parity = if pass_i > t.writer_pass { parity } else { 1 - parity };
+                let view = targets
+                    .map(|tg| &tg.bufs[j].view[read_parity])
+                    .unwrap_or(&self.dummy_input_view);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: (j + 2) as u32,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("isf-set3-bg"),
+            layout: &entry.bgl,
+            entries: &entries,
+        })
+    }
+
+    /// (Re)allocate an ISF effect's named-pass targets when its stage size
+    /// changes, and toggle its feedback parity for this frame.
+    fn ensure_isf_targets(&mut self, device: &wgpu::Device, id: ShaderId, w: u32, h: u32) {
+        let sizes: Vec<(u32, u32)> = {
+            let Some(entry) = self.pool.iter().find(|p| p.id == id).and_then(|p| p.isf.as_ref())
+            else {
+                return;
+            };
+            if entry.targets.is_empty() {
+                return;
+            }
+            entry
+                .targets
+                .iter()
+                .map(|t| {
+                    (
+                        isf::eval_size(&t.width, w, h, w),
+                        isf::eval_size(&t.height, w, h, h),
+                    )
+                })
+                .collect()
+        };
+        let need_alloc = self.isf_targets.get(&id).is_none_or(|t| t.base != (w, h));
+        if need_alloc {
+            let bufs = sizes
+                .iter()
+                .map(|(tw, th)| make_target_tex(device, *tw, *th))
+                .collect();
+            self.isf_targets.insert(id, IsfTargets { base: (w, h), parity: 0, bufs });
+        }
+        if let Some(t) = self.isf_targets.get_mut(&id) {
+            t.parity ^= 1;
+        }
     }
 
     /// Build a set=2 input bind group pointing at `input`.
@@ -845,6 +1259,38 @@ impl Renderer {
             h,
             views: [make("chain-buf-0"), make("chain-buf-1")],
         });
+    }
+}
+
+fn round_up_u64(v: u64, align: u64) -> u64 {
+    v.div_ceil(align) * align
+}
+
+/// A double-buffered [`ISF_MID_FORMAT`] render target for one ISF pass buffer.
+fn make_target_tex(device: &wgpu::Device, w: u32, h: u32) -> TargetTex {
+    let mk = |label| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ISF_MID_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    };
+    let (t0, v0) = mk("isf-target-0");
+    let (t1, v1) = mk("isf-target-1");
+    TargetTex {
+        _tex: [t0, t1],
+        view: [v0, v1],
     }
 }
 

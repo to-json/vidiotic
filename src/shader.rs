@@ -339,6 +339,20 @@ fn parse_and_validate_glsl(pre: &Preprocessed) -> Result<naga::Module, ShaderErr
     Ok(module)
 }
 
+/// Parse + validate a transpiled ISF program (see [`crate::isf`]). The program
+/// already carries the combined source (base preamble + ISF additions + body)
+/// and the preamble line offset for error remapping.
+///
+/// # Errors
+/// Returns [`ShaderError`] if the source fails to parse or validate.
+pub fn compile_isf_program(prog: &crate::isf::IsfProgram) -> Result<naga::Module, ShaderError> {
+    let pre = Preprocessed {
+        combined: prog.combined.clone(),
+        preamble_lines: prog.preamble_lines,
+    };
+    parse_and_validate_glsl(&pre)
+}
+
 /// Parse + validate a fixed built-in GLSL vertex shader (the fullscreen triangle).
 /// No preamble/preprocessing; used so GLSL fragment shaders get a stage whose
 /// varying interpolation matches naga's GLSL convention.
@@ -457,6 +471,54 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 1, "expected at least one bundled .frag");
+    }
+
+    #[test]
+    fn isf_program_compiles_through_naga() {
+        // The critical de-risk: naga's GLSL preprocessor must accept the
+        // function-like IMG_* macros and the set=3 parameter UBO the ISF
+        // transpiler emits, and the whole thing must validate.
+        let src = r#"/*{
+            "ISFVSN": "2.0",
+            "INPUTS": [
+                { "NAME": "gain", "TYPE": "float", "MIN": 0.0, "MAX": 2.0, "DEFAULT": 1.0 },
+                { "NAME": "invert", "TYPE": "bool", "DEFAULT": false },
+                { "NAME": "tint", "TYPE": "color", "DEFAULT": [1.0, 1.0, 1.0, 1.0] }
+            ]
+        }*/
+void main() {
+    vec4 c = IMG_THIS_NORM_PIXEL(inputImage) * gain * tint;
+    vec2 sz = IMG_SIZE(inputImage);
+    if (invert) c.rgb = 1.0 - c.rgb;
+    gl_FragColor = c + vec4(TIME * 0.0) + vec4(RENDERSIZE, 0.0, 0.0) * 0.0;
+}
+"#;
+        let prog = crate::isf::transpile(src).expect("is ISF");
+        if let Err(e) = compile_isf_program(&prog) {
+            panic!("ISF program failed to compile through naga:\n{e}");
+        }
+    }
+
+    #[test]
+    fn bundled_isf_shaders_compile() {
+        // Every shipped `.fs` ISF example must survive header parse, transpile,
+        // and naga parse+validate.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("shaders dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("fs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let prog = crate::isf::transpile(&src)
+                .unwrap_or_else(|| panic!("{} is not a valid ISF shader", path.display()));
+            if let Err(e) = compile_isf_program(&prog) {
+                panic!("ISF {} failed to compile:\n{e}", path.display());
+            }
+            checked += 1;
+        }
+        assert!(checked >= 1, "expected at least one bundled .fs ISF example");
     }
 
     #[test]

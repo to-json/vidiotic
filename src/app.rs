@@ -22,8 +22,8 @@ use crate::bank::{Bank, Cue, CueId};
 use crate::clippool::{self, Clip, ClipBank, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{
-    BankView, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView,
-    ShaderPoolView, SyncKind, UiMirror, LOOP_TICKS_PER_BEAT,
+    BankView, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView,
+    SlotRef, SyncKind, UiMirror, LOOP_TICKS_PER_BEAT,
 };
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -638,6 +638,69 @@ impl App {
         }
     }
 
+    /// Compile an ISF `.fs` into the shader pool and append it to the selected
+    /// cue's effect chain. No-op (logged) if no cue is selected or the file can't
+    /// be read/compiled.
+    fn load_isf(&mut self, path: PathBuf) {
+        let Some(cue) = self.selected_cue else {
+            log::warn!("Load ISF: no cue selected");
+            return;
+        };
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Load ISF: read {}: {e}", path.display());
+                return;
+            }
+        };
+        let name: Arc<str> = path.to_string_lossy().into();
+        let result = if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
+            Some(r.load_isf(&g.device, name.clone(), &src))
+        } else {
+            None
+        };
+        match result {
+            Some(Ok(_)) => {
+                log::info!("loaded ISF {}", path.display());
+                self.edit_cue(cue, |c| c.chain.push(ChainSlot::new(SlotRef::Isf(name))));
+            }
+            Some(Err(e)) => log::error!("Load ISF {}: {e}", path.display()),
+            None => {}
+        }
+    }
+
+    /// Compile every ISF shader referenced by a cue chain into the pool, so
+    /// project-loaded `SlotRef::Isf` slots resolve. Called once the renderer
+    /// exists; missing/broken files are logged and the slot renders as a no-op.
+    fn load_referenced_isf(&mut self) {
+        let mut paths: Vec<Arc<str>> = Vec::new();
+        for bank in &self.banks {
+            for cue in &bank.cues {
+                for slot in &cue.chain {
+                    if let SlotRef::Isf(p) = &slot.shader {
+                        if !paths.iter().any(|q| q == p) {
+                            paths.push(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for p in paths {
+            let src = match std::fs::read_to_string(p.as_ref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("ISF {p}: {e}");
+                    continue;
+                }
+            };
+            if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
+                if let Err(e) = r.load_isf(&g.device, p.clone(), &src) {
+                    log::error!("ISF {p}: {e}");
+                }
+            }
+        }
+    }
+
     /// Replace the entire pool with a single clip bank scanned from `dir`. Cues
     /// referenced the old pool, so they are cleared. (The `＋` in the clip-bank
     /// bar appends instead — see [`Self::add_clip_dir_as_bank`].)
@@ -831,6 +894,14 @@ impl App {
             }
             Command::SetCuePreserve(id, v) => self.edit_cue(id, |c| c.preserve = v),
             Command::SetCueChain(id, chain) => self.edit_cue(id, |c| c.chain = chain),
+            Command::SetChainParam { cue, slot, name, value } => {
+                self.edit_cue(cue, |c| {
+                    if let Some(s) = c.chain.get_mut(slot) {
+                        s.set_param(name, value);
+                    }
+                });
+            }
+            Command::LoadIsf(path) => self.load_isf(path),
             Command::SetCueParam(id, p) => self.set_cue_param(id, p),
             Command::MoveCue(id, to) => self.move_cue(id, to),
             Command::SetClipBpm(id, bpm) => self.set_clip_bpm(id, bpm),
@@ -1120,12 +1191,7 @@ impl App {
         self.mirror.shader_pool = self
             .renderer
             .as_ref()
-            .map(|r| {
-                r.pool_view()
-                    .into_iter()
-                    .map(|(id, name, builtin)| ShaderPoolView { id, name, builtin })
-                    .collect()
-            })
+            .map(|r| r.pool_view())
             .unwrap_or_default();
         self.mirror.playhead_sec = self.current_pts;
         // Locals captured by the map so it borrows only disjoint fields of `self`
@@ -1199,7 +1265,7 @@ impl App {
             let mut encoder = g
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            r.render(&g.device, &mut encoder, &view, w, h);
+            r.render(&g.device, &g.queue, &mut encoder, &view, w, h);
             g.queue.submit([encoder.finish()]);
             frame.present();
         }
@@ -1405,6 +1471,7 @@ impl ApplicationHandler for App {
         self.egui = Some(egui);
         self.watcher = ShaderWatcher::new(&self.shader_path).ok();
         self.load_shader();
+        self.load_referenced_isf();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {

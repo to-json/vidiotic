@@ -11,6 +11,7 @@ use crate::bank::Toggle;
 use crate::commands::{
     ChainSlot, ClipRole, Command, CueParam, CueView, SlotRef, UiMirror, LOOP_TICKS_PER_BEAT,
 };
+use crate::isf::{IsfInput, IsfInputKind, IsfValue};
 
 /// Ticks per beat, as a float for beat↔tick conversions in the advanced rows.
 const TPB: f64 = LOOP_TICKS_PER_BEAT as f64;
@@ -202,6 +203,13 @@ fn slot_label(slot: &SlotRef, m: &UiMirror) -> String {
             .find(|s| s.id == *id)
             .map(|s| s.name.to_string())
             .unwrap_or_else(|| format!("pin #{id}")),
+        SlotRef::Isf(path) => {
+            let stem = std::path::Path::new(path.as_ref())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path.as_ref());
+            format!("ISF: {stem}")
+        }
     }
 }
 
@@ -256,9 +264,17 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
                 }
             });
         });
+
+        // ISF slots expose their declared inputs as inline controls.
+        if let SlotRef::Isf(path) = &slot.shader {
+            if let Some(entry) = m.shader_pool.iter().find(|s| s.name.as_ref() == path.as_ref()) {
+                isf_params_ui(ui, cue, i, slot, &entry.inputs, tx);
+            }
+        }
     }
 
-    // Append control: Live shader, then each pool shader (built-ins + pins).
+    // Append control: Live shader, each pool shader (built-ins + pins), and a
+    // file picker for loading an ISF `.fs`.
     let append = |slot: SlotRef| {
         let mut c = cue.chain.clone();
         c.push(ChainSlot::new(slot));
@@ -271,8 +287,20 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
                 let _ = tx.send(append(SlotRef::Live));
             }
             for s in &m.shader_pool {
-                if ui.selectable_label(false, s.name.as_ref()).clicked() {
-                    let slot = if s.builtin {
+                let label = if s.inputs.is_empty() {
+                    s.name.to_string()
+                } else {
+                    // ISF pool entries carry a schema; show a friendly stem.
+                    let stem = std::path::Path::new(s.name.as_ref())
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(s.name.as_ref());
+                    format!("ISF: {stem}")
+                };
+                if ui.selectable_label(false, label).clicked() {
+                    let slot = if !s.inputs.is_empty() {
+                        SlotRef::Isf(s.name.clone())
+                    } else if s.builtin {
                         SlotRef::Builtin(s.name.clone())
                     } else {
                         SlotRef::Pinned(s.id)
@@ -280,7 +308,136 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
                     let _ = tx.send(append(slot));
                 }
             }
+            ui.separator();
+            if ui.selectable_label(false, "＋ Load ISF file…").clicked() {
+                crate::ui::pick_file(tx.clone(), crate::ui::PickKind::Isf);
+            }
         });
+}
+
+/// Inline controls for one ISF slot's declared inputs. Each edit sends a
+/// [`Command::SetChainParam`] targeting `(cue, slot_index)` so a drag doesn't
+/// replace the whole chain. Current values come from the slot's overrides,
+/// falling back to each input's schema default.
+fn isf_params_ui(
+    ui: &mut Ui,
+    cue: &CueView,
+    slot_index: usize,
+    slot: &ChainSlot,
+    inputs: &[IsfInput],
+    tx: &Sender<Command>,
+) {
+    if inputs.iter().all(|i| matches!(i.kind, IsfInputKind::Image)) {
+        return; // nothing tweakable
+    }
+    let send = |name: &str, value: IsfValue| {
+        let _ = tx.send(Command::SetChainParam {
+            cue: cue.id,
+            slot: slot_index,
+            name: name.into(),
+            value,
+        });
+    };
+    // Rendered directly on `ui` (no ui.indent/push_id, which can break
+    // ScrollArea wheel input — see memory `egui-push-id-breaks-scroll`).
+    {
+        for input in inputs {
+            let label = input.label.as_deref().unwrap_or(&input.name);
+            match &input.kind {
+                IsfInputKind::Float { min, max, default } => {
+                    let mut v = match slot.param(&input.name) {
+                        Some(IsfValue::Float(f)) => *f,
+                        _ => *default,
+                    };
+                    if ui.add(egui::Slider::new(&mut v, *min..=*max).text(label)).changed() {
+                        send(&input.name, IsfValue::Float(v));
+                    }
+                }
+                IsfInputKind::Bool { default } => {
+                    let mut v = match slot.param(&input.name) {
+                        Some(IsfValue::Bool(b)) => *b,
+                        _ => *default,
+                    };
+                    if ui.checkbox(&mut v, label).changed() {
+                        send(&input.name, IsfValue::Bool(v));
+                    }
+                }
+                IsfInputKind::Long { values, labels, default } => {
+                    let cur = match slot.param(&input.name) {
+                        Some(IsfValue::Long(i)) => *i,
+                        _ => *default,
+                    };
+                    let cur_label = values
+                        .iter()
+                        .position(|v| *v == cur)
+                        .and_then(|idx| labels.get(idx))
+                        .map(String::as_str)
+                        .unwrap_or("—");
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        egui::ComboBox::from_id_salt(("isf_long", slot_index, input.name.as_str()))
+                            .selected_text(cur_label)
+                            .show_ui(ui, |ui| {
+                                for (idx, val) in values.iter().enumerate() {
+                                    let lbl = labels.get(idx).map(String::as_str).unwrap_or("?");
+                                    if ui.selectable_label(cur == *val, lbl).clicked() {
+                                        send(&input.name, IsfValue::Long(*val));
+                                    }
+                                }
+                            });
+                    });
+                }
+                IsfInputKind::Color { default } => {
+                    let cur = match slot.param(&input.name) {
+                        Some(IsfValue::Color(c)) => *c,
+                        _ => *default,
+                    };
+                    let mut rgba = egui::Rgba::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        let resp = egui::color_picker::color_edit_button_rgba(
+                            ui,
+                            &mut rgba,
+                            egui::color_picker::Alpha::OnlyBlend,
+                        );
+                        if resp.changed() {
+                            let c = rgba.to_rgba_unmultiplied();
+                            send(&input.name, IsfValue::Color([c[0], c[1], c[2], c[3]]));
+                        }
+                    });
+                }
+                IsfInputKind::Point2D { min, max, default } => {
+                    let mut cur = match slot.param(&input.name) {
+                        Some(IsfValue::Point2D(p)) => *p,
+                        _ => *default,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        let dx = ui.add(
+                            egui::DragValue::new(&mut cur[0])
+                                .speed(0.005)
+                                .range(min[0]..=max[0]),
+                        );
+                        let dy = ui.add(
+                            egui::DragValue::new(&mut cur[1])
+                                .speed(0.005)
+                                .range(min[1]..=max[1]),
+                        );
+                        if dx.changed() || dy.changed() {
+                            send(&input.name, IsfValue::Point2D(cur));
+                        }
+                    });
+                }
+                IsfInputKind::Event => {
+                    // A momentary trigger: send true on click (it latches for one frame).
+                    if ui.button(label).clicked() {
+                        send(&input.name, IsfValue::Bool(true));
+                    }
+                }
+                IsfInputKind::Image => {}
+            }
+        }
+    }
 }
 
 /// The advanced per-cue sections: dwell, loop rate, timing offsets, and speed.

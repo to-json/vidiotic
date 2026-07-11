@@ -5,6 +5,7 @@
 //! live-reload-style shader swap. Run: `cargo run --bin spike_render`.
 
 use vidiotic::commands::{ChainSlot, SlotRef};
+use vidiotic::isf::IsfValue;
 use vidiotic::render::{Globals, Renderer};
 use vidiotic::shader::ShaderLang;
 use vidiotic::video::frame::{DecodedFrame, PixelData};
@@ -72,7 +73,7 @@ fn render_center_pixel(gpu: &Gpu, renderer: &mut Renderer) -> [u8; 4] {
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    renderer.render(&gpu.device, &mut encoder, &view, W, H);
+    renderer.render(&gpu.device, &gpu.queue, &mut encoder, &view, W, H);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,
@@ -214,6 +215,55 @@ fn main() {
     let pass5 = close(p[0], 0, 6) && p[1] > 180 && close(p[2], 0, 6);
     println!("[{}] chain seed+prev(): center={p:?} (want green~=source red)", if pass5 { " OK " } else { "FAIL" });
     ok &= pass5;
+    renderer.set_active_chain(Vec::new());
+
+    // 6. ISF effect: a gain filter reading inputImage, with a param override of
+    // gain=0.5. Exercises the set=3 parameter UBO on a real device; source red
+    // 220 * 0.5 ~= 110.
+    let isf_src = r#"/*{
+        "ISFVSN": "2.0",
+        "INPUTS": [ { "NAME": "gain", "TYPE": "float", "MIN": 0.0, "MAX": 2.0, "DEFAULT": 1.0 } ]
+    }*/
+void main() { gl_FragColor = IMG_THIS_NORM_PIXEL(inputImage) * gain; }
+"#;
+    let name: std::sync::Arc<str> = "gain.fs".into();
+    renderer
+        .load_isf(&gpu.device, name.clone(), isf_src)
+        .expect("ISF gain filter compiles");
+    let mut slot = ChainSlot::new(SlotRef::Isf(name));
+    slot.set_param("gain".into(), IsfValue::Float(0.5));
+    renderer.set_active_chain(vec![slot]);
+    let p = render_center_pixel(&gpu, &mut renderer);
+    let pass6 = close(p[0], 110, 12) && close(p[1], 10, 8) && close(p[2], 10, 8);
+    println!("[{}] ISF gain=0.5: center={p:?} (want ~[110,10,10])", if pass6 { " OK " } else { "FAIL" });
+    ok &= pass6;
+    renderer.set_active_chain(Vec::new());
+
+    // 7. Multi-pass feedback ISF: a persistent buffer accumulates the input each
+    // frame (pass 0 reads its own previous content + input; pass 1 outputs it).
+    // Rendering repeatedly must raise the output — proof the feedback buffer
+    // survives across frames and PASSINDEX drives per-pass behavior.
+    let fb_src = r#"/*{ "PASSES": [ {"TARGET":"bufA","PERSISTENT":true}, {} ] }*/
+void main() {
+    if (PASSINDEX == 0) {
+        gl_FragColor = clamp(IMG_THIS_NORM_PIXEL(bufA) + IMG_THIS_NORM_PIXEL(inputImage) * 0.25, 0.0, 1.0);
+    } else {
+        gl_FragColor = IMG_THIS_NORM_PIXEL(bufA);
+    }
+}
+"#;
+    let fbname: std::sync::Arc<str> = "feedback.fs".into();
+    renderer
+        .load_isf(&gpu.device, fbname.clone(), fb_src)
+        .expect("feedback ISF compiles");
+    renderer.set_active_chain(vec![ChainSlot::new(SlotRef::Isf(fbname))]);
+    let f1 = render_center_pixel(&gpu, &mut renderer);
+    let _ = render_center_pixel(&gpu, &mut renderer);
+    let _ = render_center_pixel(&gpu, &mut renderer);
+    let f4 = render_center_pixel(&gpu, &mut renderer);
+    let pass7 = f1[0] > 0 && f4[0] > f1[0] + 40;
+    println!("[{}] ISF feedback accumulation: f1={f1:?} -> f4={f4:?} (red must rise)", if pass7 { " OK " } else { "FAIL" });
+    ok &= pass7;
     renderer.set_active_chain(Vec::new());
 
     println!("\n{}", if ok { "SPIKE PASS" } else { "SPIKE FAIL" });

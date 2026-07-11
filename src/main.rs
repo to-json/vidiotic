@@ -250,7 +250,7 @@ fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
                 .map(|cs| {
                     let id = next_cue;
                     next_cue += 1;
-                    cs.to_cue(id)
+                    cs.to_cue(id, project_dir)
                 })
                 .collect();
             Bank {

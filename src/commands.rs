@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::bank::{CueId, Toggle};
+use crate::isf::IsfValue;
 
 /// Identifies a source clip in the pool (its scan index).
 pub type ClipId = u32;
@@ -19,24 +20,44 @@ pub type ShaderId = u32;
 /// `Builtin` carries the effect's stable name — the persistable handle written
 /// into `.viproj`. `Pinned` is a runtime-only pool id (livecoded captures have
 /// no stable source, so they are not serialized). `Live` is the current
-/// livecoded shader, so it can sit anywhere in the stack.
+/// livecoded shader, so it can sit anywhere in the stack. `Isf` carries the ISF
+/// shader's file path (project-relative or absolute) — a persistable handle the
+/// pool compiles on demand.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotRef {
     Live,
     Builtin(Arc<str>),
     Pinned(ShaderId),
+    Isf(Arc<str>),
 }
 
-/// One entry in a cue's effect chain. Per-stage parameters will hang off this.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One entry in a cue's effect chain. `params` holds per-slot ISF input
+/// overrides (empty for non-ISF slots, or for ISF inputs left at their schema
+/// default); an input value carries an `f32`, so this is `PartialEq` but not `Eq`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChainSlot {
     pub shader: SlotRef,
+    pub params: Vec<(Arc<str>, IsfValue)>,
 }
 
 impl ChainSlot {
     /// A slot referencing `shader` with default (no) parameters.
     pub fn new(shader: SlotRef) -> Self {
-        Self { shader }
+        Self { shader, params: Vec::new() }
+    }
+
+    /// The current value of an ISF input on this slot, if overridden.
+    pub fn param(&self, name: &str) -> Option<&IsfValue> {
+        self.params.iter().find(|(n, _)| n.as_ref() == name).map(|(_, v)| v)
+    }
+
+    /// Set (or replace) an ISF input override on this slot.
+    pub fn set_param(&mut self, name: Arc<str>, value: IsfValue) {
+        if let Some(slot) = self.params.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = value;
+        } else {
+            self.params.push((name, value));
+        }
     }
 }
 
@@ -80,6 +101,10 @@ pub enum Command {
     SetCueOutToPlayhead(CueId),        // snap out-point to the displayed playhead
     SetCuePreserve(CueId, Option<bool>), // per-cue preserve override; None = inherit global
     SetCueChain(CueId, Vec<ChainSlot>), // replace the cue's effect chain; empty = the live shader
+    // Set one ISF input on one chain slot of a cue, without replacing the whole
+    // chain (so a slider drag doesn't clobber the rest of the stack).
+    SetChainParam { cue: CueId, slot: usize, name: Arc<str>, value: IsfValue },
+    LoadIsf(PathBuf),                  // compile an ISF `.fs` into the pool and append it to the selected cue's chain
     SetCueParam(CueId, CueParam),      // one advanced per-cue timing/speed knob
     MoveCue(CueId, usize),             // reorder within the edit bank to a target index (drag / ◀▶)
     SetClipBpm(ClipId, Option<f64>),   // source-clip tempo metadata; None clears it
@@ -189,6 +214,9 @@ pub struct ShaderPoolView {
     pub id: ShaderId,
     pub name: Arc<str>,
     pub builtin: bool,
+    /// ISF input schema (min/max/default/labels) for the param editor; empty for
+    /// non-ISF pool entries.
+    pub inputs: Vec<crate::isf::IsfInput>,
 }
 
 /// Read-only display state the engine republishes each tick for the control UI.

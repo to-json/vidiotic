@@ -187,6 +187,8 @@ pub(crate) enum PickKind {
     ClipDir,
     ClipBankDir,
     Shader,
+    /// Pick an ISF `.fs` to add to the selected cue's effect chain.
+    Isf,
     /// Save the project. The payload is the currently-loaded path, used to
     /// pre-fill the dialog's directory and file name (`None` = a fresh session).
     SaveProject(Option<PathBuf>),
@@ -219,6 +221,16 @@ pub(crate) fn pick_file(tx: Sender<Command>, kind: PickKind) {
             std::thread::spawn(move || {
                 if let Some(h) = pollster::block_on(fut) {
                     let _ = tx.send(Command::SetShaderPath(h.path().to_path_buf()));
+                }
+            });
+        }
+        PickKind::Isf => {
+            let fut = rfd::AsyncFileDialog::new()
+                .add_filter("ISF shader", &["fs", "frag", "glsl"])
+                .pick_file();
+            std::thread::spawn(move || {
+                if let Some(h) = pollster::block_on(fut) {
+                    let _ = tx.send(Command::LoadIsf(h.path().to_path_buf()));
                 }
             });
         }
