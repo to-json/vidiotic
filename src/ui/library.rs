@@ -1,11 +1,12 @@
-//! The clip pool, bank tabs, and the edit bank's cue list.
+//! The clip pool, bank tabs, and the edit bank's cue list, in the phosphor
+//! idiom: bracket-text tabs, paren metadata tags, and square bordered tiles.
 
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use egui::{Color32, CornerRadius, FontId, Rect, Sense, TextStyle, Ui};
+use egui::{Align2, Rect, Sense, Ui};
 
-use super::theme::{self, PALETTE, SP_MD, SP_SM};
+use super::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
 use super::widgets::{self, TileSpec};
 use super::{pick_file, PickKind};
 use crate::commands::{BankView, ClipBankView, ClipEntry, ClipId, Command, CueView, UiMirror};
@@ -17,26 +18,30 @@ pub(super) fn show(
     tx: &Sender<Command>,
     thumbs: &HashMap<ClipId, egui::TextureHandle>,
 ) {
-    // Drives the playing tile's beat-synced pulse stroke; brightest right on
+    let p = palette();
+    // Drives the playing tile's beat-synced pulse border; brightest right on
     // the beat, decaying toward the next.
     let beat_pulse = 1.0 - m.phase.fract() as f32;
 
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             widgets::section_label(ui, "clips");
-            if ui
-                .button("Folder…")
+            if widgets::bracket_button(ui, "folder…", None, 0.0)
                 .on_hover_text("Pick a folder of video clips to fill the pool")
                 .clicked()
             {
                 pick_file(tx.clone(), PickKind::ClipDir);
             }
             if let Some(d) = &m.clip_dir {
-                ui.add(egui::Label::new(egui::RichText::new(d).small().color(PALETTE.fg_muted)).truncate());
+                ui.add(egui::Label::new(egui::RichText::new(d).small().color(p.fg_muted)).truncate());
             }
         });
         clip_bank_bar(ui, m, tx);
-        ui.weak("double-click a clip to add it as a cue to the edit bank");
+        ui.label(
+            egui::RichText::new("double-click a clip to add it as a cue to the edit bank")
+                .small()
+                .color(p.fg_muted),
+        );
         egui::ScrollArea::vertical()
             .id_salt("clip_pool")
             .max_height(190.0)
@@ -76,16 +81,16 @@ pub(super) fn show(
 }
 
 /// Centered muted two-line prompt for an empty pool or bank; when
-/// `folder_pick` is given, a real "Folder…" button follows.
+/// `folder_pick` is given, a real "folder…" button follows.
 fn empty_state(ui: &mut Ui, headline: &str, sub: &str, folder_pick: Option<(&Sender<Command>, PickKind)>) {
+    let p = palette();
     ui.vertical_centered(|ui| {
         ui.add_space(SP_MD * 3.0);
-        ui.label(egui::RichText::new(headline).color(PALETTE.fg_muted));
-        ui.label(egui::RichText::new(sub).small().color(PALETTE.fg_muted));
+        ui.label(egui::RichText::new(headline).color(p.fg_secondary));
+        ui.label(egui::RichText::new(sub).small().color(p.fg_muted));
         if let Some((tx, kind)) = folder_pick {
             ui.add_space(SP_SM);
-            if ui
-                .button("Folder…")
+            if widgets::bracket_button(ui, "folder…", None, 0.0)
                 .on_hover_text("Pick a folder of video clips to fill the pool")
                 .clicked()
             {
@@ -124,19 +129,47 @@ fn clip_tile(
     }
 }
 
+/// One bracket-text tab: `[name (3)]` accent when selected, dim otherwise,
+/// with an optional `●` live dot before the name. Returns the click response.
+fn glyph_tab(ui: &mut Ui, id: egui::Id, name: &str, count: usize, selected: bool, live: bool) -> egui::Response {
+    let p = palette();
+    let body = format!("{name} ({count})");
+    let text = if selected { format!("[{body}]") } else { format!(" {body} ") };
+    let dot_w = if live { 2.0 } else { 0.0 };
+    let cw = widgets::cell_width(ui);
+    let galley = ui.painter().layout_no_wrap(text.clone(), mono(), p.fg_muted);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + dot_w * cw, ROW), Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click());
+    let painter = ui.painter();
+    let mut x = rect.min.x;
+    if live {
+        painter.text(egui::pos2(x + cw * 0.5, rect.center().y), Align2::LEFT_CENTER, "●", mono(), p.phosphor);
+        x += dot_w * cw;
+    }
+    let color = if selected {
+        p.accent
+    } else if resp.hovered() {
+        p.fg_primary
+    } else {
+        p.fg_secondary
+    };
+    painter.text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, text, mono(), color);
+    resp
+}
+
 /// The clip-bank bar: pick which clip bank (source folder) the pool grid shows,
-/// plus `＋` to add another folder as a new bank. Hidden until at least one bank
-/// exists. The clip-dir "Folder…" button replaces the pool; `＋` here appends.
+/// plus `+` to add another folder as a new bank. Hidden until at least one bank
+/// exists. The clip-dir "folder…" button replaces the pool; `+` here appends.
 fn clip_bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     if m.clip_banks.is_empty() {
         return;
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (i, b) in m.clip_banks.iter().enumerate() {
             clip_bank_tab(ui, m, i, b, tx);
         }
-        if ui
-            .button("＋")
+        if widgets::bracket_button(ui, "+", None, 0.0)
             .on_hover_text("add a folder as another clip bank")
             .clicked()
         {
@@ -145,127 +178,54 @@ fn clip_bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     });
 }
 
-/// One clip-bank tab: name + muted clip count, accent underline when active.
+/// One clip-bank tab: name + clip count, bracketed when active.
 fn clip_bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &ClipBankView, tx: &Sender<Command>) {
-    let p = &PALETTE;
     let selected = i == m.active_clip_bank;
-    let base_id = ui.id().with(("clip_bank_tab", i));
-
-    let name_font = TextStyle::Body.resolve(ui.style());
-    let count_font = TextStyle::Small.resolve(ui.style());
-    let name_color = if selected { p.fg_primary } else { p.fg_secondary };
-    let name_galley = ui.painter().layout_no_wrap(bank.name.to_string(), name_font, name_color);
-    let count_galley =
-        ui.painter().layout_no_wrap(format!("({})", bank.clip_count), count_font, p.fg_muted);
-
-    let content_w = name_galley.size().x + SP_SM + count_galley.size().x;
-    let size = egui::vec2(content_w + SP_MD * 2.0, 24.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let resp = ui
-        .interact(rect, base_id, Sense::click())
+    let id = ui.id().with(("clip_bank_tab", i));
+    let resp = glyph_tab(ui, id, &bank.name, bank.clip_count, selected, false)
         .on_hover_text("show this clip bank in the pool");
-
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(4), p.bg_elevated);
-    }
-
-    let mut x = rect.min.x + SP_MD;
-    let name_y = rect.center().y - name_galley.size().y * 0.5;
-    ui.painter().galley(egui::pos2(x, name_y), name_galley.clone(), name_color);
-    x += name_galley.size().x + SP_SM;
-    let count_y = rect.center().y - count_galley.size().y * 0.5;
-    ui.painter().galley(egui::pos2(x, count_y), count_galley, p.fg_muted);
-
-    if selected {
-        let underline = Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.max.y - 2.0),
-            egui::pos2(rect.max.x, rect.max.y),
-        );
-        ui.painter().rect_filled(underline, CornerRadius::ZERO, p.accent);
-    }
-
     if resp.clicked() {
         let _ = tx.send(Command::SetActiveClipBank(i));
     }
 }
 
-/// The bank bar: custom-painted underline tabs to pick the edit bank, plus
-/// `＋` to add one. The live bank shows a small dot before its name; the
-/// edit bank (shown in the list below) gets an accent underline.
+/// The bank bar: bracket-text tabs to pick the edit bank, plus `+` to add
+/// one. The live bank shows a `●` dot before its name; the edit bank (shown
+/// in the list below) wears the brackets.
 fn bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         widgets::section_label(ui, "banks");
         for (i, b) in m.banks.iter().enumerate() {
             bank_tab(ui, m, i, b, tx);
         }
-        if ui.button("＋").on_hover_text("add a bank").clicked() {
+        if widgets::bracket_button(ui, "+", None, 0.0).on_hover_text("add a bank").clicked() {
             let _ = tx.send(Command::AddBank);
         }
     });
 }
 
-/// One bank tab: live dot, name, muted cue count, accent underline when this
-/// is the edit bank, and a hover-only `▶` (on non-live tabs) to send it live.
+/// One bank tab: live dot, bracketed name + cue count, and a hover-only `▶`
+/// (on non-live tabs) to send it live.
 fn bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &BankView, tx: &Sender<Command>) {
-    let p = &PALETTE;
+    let p = palette();
     let live = i == m.live_bank;
     let selected = i == m.edit_bank;
     let base_id = ui.id().with(("bank_tab", i));
 
-    let name_font = TextStyle::Body.resolve(ui.style());
-    let count_font = TextStyle::Small.resolve(ui.style());
-    let name_color = if selected { p.fg_primary } else { p.fg_secondary };
-    let name_galley = ui.painter().layout_no_wrap(bank.name.to_string(), name_font, name_color);
-    let count_galley =
-        ui.painter().layout_no_wrap(format!("({})", bank.cue_count), count_font, p.fg_muted);
-
-    let dot_w = if live { 10.0 } else { 0.0 };
-    let play_w = if live { 0.0 } else { 20.0 };
-    let content_w = dot_w + name_galley.size().x + SP_SM + count_galley.size().x + play_w;
-    let size = egui::vec2(content_w + SP_MD * 2.0, 26.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let resp =
-        ui.interact(rect, base_id, Sense::click()).on_hover_text("edit this bank (shown below)");
-
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(4), p.bg_elevated);
-    }
-
-    let mut x = rect.min.x + SP_MD;
-    if live {
-        ui.painter().circle_filled(egui::pos2(x + 3.0, rect.center().y), 2.5, p.playing);
-        x += dot_w;
-    }
-    let name_y = rect.center().y - name_galley.size().y * 0.5;
-    ui.painter().galley(egui::pos2(x, name_y), name_galley.clone(), name_color);
-    x += name_galley.size().x + SP_SM;
-    let count_y = rect.center().y - count_galley.size().y * 0.5;
-    ui.painter().galley(egui::pos2(x, count_y), count_galley, p.fg_muted);
-
-    if selected {
-        let underline = Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.max.y - 2.0),
-            egui::pos2(rect.max.x, rect.max.y),
-        );
-        ui.painter().rect_filled(underline, CornerRadius::ZERO, p.accent);
-    }
+    let resp = glyph_tab(ui, base_id, &bank.name, bank.cue_count, selected, live)
+        .on_hover_text("edit this bank (shown below)");
 
     if !live && resp.hovered() {
+        let cw = widgets::cell_width(ui);
         let play_rect = Rect::from_min_size(
-            egui::pos2(rect.max.x - play_w - SP_SM, rect.min.y + 3.0),
-            egui::vec2(play_w, 20.0),
+            egui::pos2(resp.rect.max.x, resp.rect.min.y),
+            egui::vec2(cw * 2.0, resp.rect.height()),
         );
         let play_resp = ui
             .interact(play_rect, base_id.with("play"), Sense::click())
             .on_hover_text("play this bank (it takes over at the next phrase). Keys: , / . cycle live bank");
-        let color = if play_resp.hovered() { p.fg_primary } else { p.fg_secondary };
-        ui.painter().text(
-            play_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "▶",
-            FontId::proportional(11.0),
-            color,
-        );
+        let color = if play_resp.hovered() { p.accent } else { p.fg_secondary };
+        ui.painter().text(play_rect.center(), Align2::CENTER_CENTER, "▶", mono(), color);
         if play_resp.clicked() {
             let _ = tx.send(Command::SetLiveBank(i));
         }
@@ -276,7 +236,7 @@ fn bank_tab(ui: &mut Ui, m: &UiMirror, i: usize, bank: &BankView, tx: &Sender<Co
     }
 }
 
-/// A cue tile in the edit bank's list, plus a metadata chip row (trim,
+/// A cue tile in the edit bank's list, plus a metadata tag row (trim,
 /// keep/cut, fx) and a hover-only remove button. Click selects it for the editor.
 fn cue_chip(
     ui: &mut Ui,
@@ -287,6 +247,7 @@ fn cue_chip(
     tx: &Sender<Command>,
     beat_pulse: f32,
 ) {
+    let p = palette();
     let selected = m.selected_cue == Some(cue.id);
     ui.allocate_ui(egui::vec2(146.0, 122.0), |ui| {
         ui.vertical(|ui| {
@@ -319,8 +280,8 @@ fn cue_chip(
                 if dr.dragged() {
                     ui.painter().rect_filled(
                         resp.rect,
-                        egui::CornerRadius::same(4),
-                        theme::with_alpha(Color32::BLACK, 90),
+                        egui::CornerRadius::ZERO,
+                        theme::with_alpha(egui::Color32::BLACK, 90),
                     );
                 }
                 if let Some(dragged) = dr.dnd_release_payload::<crate::bank::CueId>() {
@@ -344,16 +305,14 @@ fn cue_chip(
                 let cross_resp = ui
                     .interact(cross_rect, cross_id, egui::Sense::click())
                     .on_hover_text("remove cue");
-                let color = if cross_resp.hovered() { PALETTE.error } else { PALETTE.fg_primary };
+                let color = if cross_resp.hovered() { p.error } else { p.fg_primary };
                 let painter = ui.painter();
-                painter.circle_filled(cross_rect.center(), 9.0, theme::with_alpha(Color32::BLACK, 170));
-                painter.text(
-                    cross_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "✕",
-                    egui::FontId::proportional(11.0),
-                    color,
+                painter.rect_filled(
+                    cross_rect,
+                    egui::CornerRadius::ZERO,
+                    theme::with_alpha(p.bg_inset, 200),
                 );
+                painter.text(cross_rect.center(), Align2::CENTER_CENTER, "×", mono(), color);
                 if cross_resp.clicked() {
                     let _ = tx.send(Command::RemoveCue(cue.id));
                 }
@@ -362,22 +321,22 @@ fn cue_chip(
             ui.horizontal(|ui| {
                 if m.advanced {
                     ui.spacing_mut().item_spacing.x = SP_SM;
-                    ui.spacing_mut().button_padding = egui::vec2(4.0, 0.0);
-                    if ui.small_button("◀").on_hover_text("move earlier").clicked() && index > 0 {
+                    if widgets::bracket_button(ui, "◀", None, 0.0).on_hover_text("move earlier").clicked()
+                        && index > 0
+                    {
                         let _ = tx.send(Command::MoveCue(cue.id, index - 1));
                     }
-                    if ui.small_button("▶").on_hover_text("move later").clicked() {
+                    if widgets::bracket_button(ui, "▶", None, 0.0).on_hover_text("move later").clicked() {
                         let _ = tx.send(Command::MoveCue(cue.id, index + 1));
                     }
                 }
                 widgets::chip(ui, &trim_label(cue), None, false);
-                if let Some(p) = cue.preserve {
-                    let (text, tint) =
-                        if p { ("keep", PALETTE.playing) } else { ("cut", PALETTE.fg_muted) };
+                if let Some(pv) = cue.preserve {
+                    let (text, tint) = if pv { ("keep", p.playing) } else { ("cut", p.fg_muted) };
                     widgets::chip(ui, text, Some(tint), false);
                 }
                 if !cue.chain.is_empty() {
-                    widgets::chip(ui, "fx", Some(PALETTE.accent), false);
+                    widgets::chip(ui, "fx", Some(p.blue), false);
                 }
                 if m.advanced {
                     advanced_badges(ui, cue);
@@ -387,10 +346,11 @@ fn cue_chip(
     });
 }
 
-/// Compact advanced-mode metadata chips: dwell, loop rate, active offsets, and
+/// Compact advanced-mode metadata tags: dwell, loop rate, active offsets, and
 /// a non-unity playback speed. Only the set/non-default knobs show, to keep the
-/// tile's chip row from overflowing.
+/// tile's tag row from overflowing.
 fn advanced_badges(ui: &mut Ui, cue: &CueView) {
+    let p = palette();
     if let Some(ticks) = cue.dwell {
         widgets::chip(ui, &format!("⌛{}b", fmt_beats(ticks)), None, false);
     }
@@ -404,10 +364,10 @@ fn advanced_badges(ui: &mut Ui, cue: &CueView) {
         None => {}
     }
     if cue.loop_phase.on || cue.start_nudge.on || cue.trig_delay.on {
-        widgets::chip(ui, "offset", Some(PALETTE.armed), false);
+        widgets::chip(ui, "offset", Some(p.armed), false);
     }
     if (cue.speed - 1.0).abs() > 1e-3 {
-        widgets::chip(ui, &format!("{:.2}×", cue.speed), Some(PALETTE.accent), false);
+        widgets::chip(ui, &format!("{:.2}×", cue.speed), Some(p.blue), false);
     }
 }
 

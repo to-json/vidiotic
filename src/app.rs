@@ -1438,14 +1438,17 @@ impl ApplicationHandler for App {
         if self.graphics.is_some() {
             return;
         }
-        let make = |title: &str, w: f64, h: f64| {
+        let make = |title: &str, w: f64, h: f64, min_w: f64, min_h: f64| {
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title(title)
-                    .with_inner_size(winit::dpi::LogicalSize::new(w, h)),
+                    .with_inner_size(winit::dpi::LogicalSize::new(w, h))
+                    .with_min_inner_size(winit::dpi::LogicalSize::new(min_w, min_h)),
             )
         };
-        let (output_win, control_win) = if let (Ok(o), Ok(c)) = (make("vidiotic output", 1280.0, 720.0), make("vidiotic control", 1000.0, 720.0)) { (Arc::new(o), Arc::new(c)) } else {
+        // The control layout is designed to stack down to ~420 px wide;
+        // below that, rows would clip rather than wrap.
+        let (output_win, control_win) = if let (Ok(o), Ok(c)) = (make("vidiotic output", 1280.0, 720.0, 160.0, 90.0), make("vidiotic control", 1000.0, 720.0, 420.0, 480.0)) { (Arc::new(o), Arc::new(c)) } else {
             log::error!("failed to create windows");
             event_loop.exit();
             return;

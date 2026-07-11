@@ -95,6 +95,9 @@ impl EguiCtl {
         mirror: &UiMirror,
         cmd_tx: &Sender<Command>,
     ) {
+        // Re-derive the palette/style if the statusline's theme controls
+        // (dark/light, hue) changed last frame.
+        theme::sync(&self.ctx);
         let raw_input = self.state.take_egui_input(&ws.window);
         let ctx = self.ctx.clone();
         let thumbs = &self.thumbs;
@@ -126,7 +129,7 @@ impl EguiCtl {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(theme::wgpu_clear_color(theme::PALETTE.bg_base)),
+                                load: wgpu::LoadOp::Clear(theme::wgpu_clear_color(theme::palette().bg_base)),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -151,16 +154,17 @@ impl EguiCtl {
 
 /// "Loop every" cadence choices shared by the transport (global) and the cue
 /// editor (per-cue): (label, ticks) at 32 ticks/beat (`LOOP_TICKS_PER_BEAT`).
-/// A beat is a quarter note (32), so an eighth note is 16 and a 4/4 bar is 128.
+/// A beat is a quarter note (32), so an eighth note is 16 and a 4/4 bar is
+/// 128. Whole numbers label bars; fractions label sub-bar note values.
 pub(super) const LOOP_CADENCE: [(&str, u32); 8] = [
     ("1/8", 16),
     ("1/4", 32),
     ("1/2", 64),
-    ("1 bar", 128),
-    ("2 bars", 256),
-    ("4 bars", 512),
-    ("8 bars", 1024),
-    ("16 bars", 2048),
+    ("1", 128),
+    ("2", 256),
+    ("4", 512),
+    ("8", 1024),
+    ("16", 2048),
 ];
 
 fn control_ui(

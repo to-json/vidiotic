@@ -1,23 +1,28 @@
 //! Transport panel: BPM readout/entry, tap controls, the beat/bar indicator,
-//! sync source, and the auto-advance/re-loop cadence controls.
+//! sync source, and the auto-advance/re-loop cadence controls — all in the
+//! phosphor buffer idiom: bracket-button taps, `●○○○` beat glyphs, and a
+//! `▰▱` phrase strip. The tempo / taps+beat / sync clusters share one line
+//! on a wide window and stack as rows on a narrow one.
 
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{PALETTE, SP_MD, SP_SM, SP_XS};
+use super::theme::{self, palette, SP_MD, SP_SM};
 use super::widgets;
 use crate::commands::{Command, SyncKind, UiMirror};
 
-/// Uniform square size for the downbeat/reset/tempo tap buttons.
-const TAP_BUTTON_SIZE: egui::Vec2 = egui::Vec2::splat(46.0);
+/// Below this available width the transport clusters stack as rows.
+const STACK_BELOW: f32 = 800.0;
 
-/// Bar-based cadence choices for the "Next every" (sequencer) grid: (label, bars).
+/// Bar-based cadence choices for the "Next every" (sequencer) grid:
+/// (label, bars). Labels are bare bar counts — the "next every" section
+/// label carries the unit.
 const CADENCE_BARS: [(&str, u32); 5] = [
-    ("1 bar", 1),
-    ("2 bars", 2),
-    ("4 bars", 4),
-    ("8 bars", 8),
-    ("16 bars", 16),
+    ("1", 1),
+    ("2", 2),
+    ("4", 4),
+    ("8", 8),
+    ("16", 16),
 ];
 
 use super::LOOP_CADENCE;
@@ -37,8 +42,7 @@ fn tap_button(
 ) -> bool {
     let id = ui.id().with(id_salt);
     let mut flash: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0) * 0.85;
-    let resp = widgets::transport_button(ui, label, TAP_BUTTON_SIZE, 24.0, text_color, flash)
-        .on_hover_text(hover);
+    let resp = widgets::bracket_button(ui, label, Some(text_color), flash).on_hover_text(hover);
     let triggered = resp.clicked() || extra_trigger;
     if triggered {
         flash = 1.0;
@@ -47,55 +51,200 @@ fn tap_button(
     triggered
 }
 
-/// One dot per beat in the bar: the current beat is brightest and fades
-/// toward the next; the downbeat (index 0) is tinted `playing` instead of
-/// `accent` so bar starts read at a glance.
-fn beat_dots(ui: &mut Ui, m: &UiMirror) {
+/// One glyph per beat in the bar (`●` current, `○` rest): the current beat is
+/// brightest and fades toward the next; the downbeat (index 0) is tinted
+/// `phosphor` instead of `accent` so bar starts read at a glance.
+fn beat_glyphs(ui: &mut Ui, m: &UiMirror) {
+    let p = palette();
     let n = m.quantum.round().max(1.0) as usize;
     let current = m.phase.floor() as usize % n;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = SP_XS;
-        for i in 0..n {
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
-            let color = if i == current {
-                let bright = (1.0 - m.phase.fract() as f32).powi(2).clamp(0.0, 1.0);
-                let base = if i == 0 { PALETTE.playing } else { PALETTE.accent };
-                PALETTE.bg_elevated.lerp_to_gamma(base, bright)
-            } else {
-                PALETTE.bg_elevated
-            };
-            ui.painter().circle_filled(rect.center(), 4.0, color);
-        }
-    });
+    let cw = widgets::cell_width(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(cw * n as f32, theme::ROW), egui::Sense::hover());
+    let painter = ui.painter();
+    for i in 0..n {
+        let (ch, color) = if i == current {
+            let bright = (1.0 - m.phase.fract() as f32).powi(2).clamp(0.0, 1.0);
+            let base = if i == 0 { p.phosphor } else { p.accent };
+            ("●", theme::with_alpha(base, 120 + (bright * 135.0) as u8))
+        } else {
+            ("○", p.fg_muted)
+        };
+        painter.text(
+            egui::pos2(rect.min.x + i as f32 * cw, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            ch,
+            theme::mono(),
+            color,
+        );
+    }
 }
 
-/// Time-to-next-cut, as a 3px full-width strip: `accent_dim` fill up to the
-/// phrase fraction with an `accent` head, tick marks at each bar boundary.
+/// Time-to-next-cut as a `▰▱` glyph strip: one cell per beat (pooled down
+/// past 32 beats), filled up to the phrase fraction.
 fn phrase_strip(ui: &mut Ui, m: &UiMirror) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 3.0), egui::Sense::hover());
+    let p = palette();
     let phrase_len = m.phrase_len.max(1) as f64;
     let quantum = m.quantum.max(1.0);
     let progressed = m.bar_in_phrase as f64 * quantum + m.phase;
     let frac = (progressed / phrase_len).clamp(0.0, 1.0) as f32;
 
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, PALETTE.bg_inset);
-    let fill_w = rect.width() * frac;
-    if fill_w > 0.0 {
-        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
-        painter.rect_filled(fill, egui::CornerRadius::ZERO, PALETTE.accent_dim);
-        let head_x = (rect.min.x + fill_w - 1.5).min(rect.max.x - 1.5).max(rect.min.x);
-        let head = egui::Rect::from_min_size(egui::pos2(head_x, rect.min.y), egui::vec2(1.5, rect.height()));
-        painter.rect_filled(head, egui::CornerRadius::ZERO, PALETTE.accent);
-    }
-    let bars = (phrase_len / quantum).round().max(1.0) as usize;
-    for i in 1..bars {
-        let x = rect.min.x + rect.width() * (i as f32 / bars as f32);
-        painter.line_segment(
-            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-            egui::Stroke::new(1.0, PALETTE.border),
+    let cells = (m.phrase_len.max(1) as usize).min(32);
+    let filled = (frac * cells as f32).floor() as usize;
+    let strip: String = (0..cells).map(|k| if k < filled { '▰' } else { '▱' }).collect();
+    ui.label(egui::RichText::new(strip).monospace().color(p.blue));
+}
+
+/// BPM hero (or the keyboard-entry readout) plus the drag/nudge stack.
+fn bpm_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    if let Some(entry) = &m.bpm_entry {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{entry}▏"))
+                    .monospace()
+                    .size(32.0)
+                    .color(p.accent),
+            );
+            ui.label(egui::RichText::new("enter to set").small().color(p.fg_muted));
+        });
+    } else {
+        ui.label(
+            egui::RichText::new(format!("{:6.1}", m.bpm))
+                .monospace()
+                .size(32.0)
+                .color(p.fg_primary),
         );
+        // Tempo edits are disabled for listen-only sources (Link): the
+        // readout above still tracks the followed tempo, but nothing here
+        // can write back to the session.
+        ui.add_enabled_ui(m.can_set_tempo, |ui| {
+            ui.vertical(|ui| {
+                let mut bpm = m.bpm;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut bpm)
+                            .speed(0.1)
+                            .range(20.0..=300.0)
+                            .fixed_decimals(1),
+                    )
+                    .changed()
+                {
+                    let _ = tx.send(Command::SetBpm(bpm));
+                }
+                ui.horizontal(|ui| {
+                    if widgets::bracket_button(ui, "−.1%", None, 0.0)
+                        .on_hover_text("Nudge tempo down for beat-matching drift. Key: [")
+                        .clicked()
+                    {
+                        let _ = tx.send(Command::NudgeBpm(-0.001));
+                    }
+                    if widgets::bracket_button(ui, "+.1%", None, 0.0)
+                        .on_hover_text("Nudge tempo up for beat-matching drift. Key: ]")
+                        .clicked()
+                    {
+                        let _ = tx.send(Command::NudgeBpm(0.001));
+                    }
+                });
+            });
+        });
+    }
+}
+
+/// The four tap buttons: downbeat, soft/hard reset, tap tempo.
+fn tap_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    // Downbeat is a phase edit: greyed out (and the Space shortcut inert)
+    // when the source is listen-only, e.g. Link.
+    let downbeat_key = m.can_set_phase
+        && !ui.ctx().egui_wants_keyboard_input()
+        && ui.input(|i| i.key_pressed(egui::Key::Space));
+    if ui
+        .add_enabled_ui(m.can_set_phase, |ui| {
+            tap_button(
+                ui,
+                "downbeat",
+                "▼1",
+                p.fg_primary,
+                "Downbeat: snap to now (phase only, nearest bar). Key: t / Space",
+                downbeat_key,
+            )
+        })
+        .inner
+    {
+        let _ = tx.send(Command::TapDownbeat);
+    }
+    if tap_button(
+        ui,
+        "soft_reset",
+        "⟲",
+        p.fg_primary,
+        "Soft reset: clock to bar 1, beat 1. Playlist position and playhead unchanged. Key: r",
+        false,
+    ) {
+        let _ = tx.send(Command::SoftReset);
+    }
+    if tap_button(
+        ui,
+        "hard_reset",
+        "⏮",
+        p.error,
+        "Hard reset: soft reset, AND jump the playlist back to its first cue \
+         and restart its playhead from the in-point. Key: Shift+r",
+        false,
+    ) {
+        let _ = tx.send(Command::HardReset);
+    }
+    // Tap tempo sets BPM: disabled for listen-only sources (Link).
+    if ui
+        .add_enabled_ui(m.can_set_tempo, |ui| {
+            tap_button(
+                ui,
+                "tempo",
+                "tap",
+                p.fg_primary,
+                "Tap tempo: tap 2+ times to set BPM from the interval. Key: b",
+                false,
+            )
+        })
+        .inner
+    {
+        let _ = tx.send(Command::TapTempo);
+    }
+}
+
+/// The bar-in-phrase readout over the per-beat glyphs.
+fn bar_beat(ui: &mut Ui, m: &UiMirror) {
+    let p = palette();
+    ui.vertical(|ui| {
+        widgets::unit_label(
+            ui,
+            egui::RichText::new(format!(
+                "bar {}/{}",
+                m.bar_in_phrase + 1,
+                m.bars_per_phrase.max(1)
+            ))
+            .color(p.fg_secondary),
+        );
+        beat_glyphs(ui, m);
+    });
+}
+
+/// Sync source selector plus the Link peers tag.
+fn sync_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    widgets::section_label(ui, "sync")
+        .on_hover_text("Sync source: free-running Internal clock, or follow Ableton Link");
+    let sync_idx = match m.sync.unwrap_or(SyncKind::Internal) {
+        SyncKind::Internal => 0,
+        SyncKind::Link => 1,
+    };
+    if let Some(i) = widgets::segmented(ui, "sync", &["internal", "link"], Some(sync_idx)) {
+        let kind = if i == 0 { SyncKind::Internal } else { SyncKind::Link };
+        let _ = tx.send(Command::SetSyncSource(kind));
+    }
+    if m.sync == Some(SyncKind::Link) && m.peers > 0 {
+        ui.add_space(SP_SM);
+        widgets::chip(ui, &format!("{} peers", m.peers), Some(p.playing), false);
     }
 }
 
@@ -103,153 +252,31 @@ fn phrase_strip(ui: &mut Ui, m: &UiMirror) {
 pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     egui::Panel::top(egui::Id::new("transport")).show(ui, |ui| {
         ui.add_space(SP_SM);
-        ui.horizontal(|ui| {
-            if let Some(entry) = &m.bpm_entry {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{entry}▏"))
-                            .monospace()
-                            .size(40.0)
-                            .strong()
-                            .color(PALETTE.accent),
-                    );
-                    ui.label(egui::RichText::new("Enter to set").small().color(PALETTE.fg_muted));
-                });
-            } else {
-                ui.label(
-                    egui::RichText::new(format!("{:6.1}", m.bpm))
-                        .monospace()
-                        .size(40.0)
-                        .strong(),
-                );
-                // Tempo edits are disabled for listen-only sources (Link): the
-                // readout above still tracks the followed tempo, but nothing here
-                // can write back to the session.
-                ui.add_enabled_ui(m.can_set_tempo, |ui| {
-                    ui.vertical(|ui| {
-                        let mut bpm = m.bpm;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut bpm)
-                                    .speed(0.1)
-                                    .range(20.0..=300.0)
-                                    .fixed_decimals(1),
-                            )
-                            .changed()
-                        {
-                            let _ = tx.send(Command::SetBpm(bpm));
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button("−0.1%")
-                                .on_hover_text("Nudge tempo down for beat-matching drift. Key: [")
-                                .clicked()
-                            {
-                                let _ = tx.send(Command::NudgeBpm(-0.001));
-                            }
-                            if ui
-                                .button("+0.1%")
-                                .on_hover_text("Nudge tempo up for beat-matching drift. Key: ]")
-                                .clicked()
-                            {
-                                let _ = tx.send(Command::NudgeBpm(0.001));
-                            }
-                        });
-                    });
-                });
-            }
-
-            // Downbeat is a phase edit: greyed out (and the Space shortcut inert)
-            // when the source is listen-only, e.g. Link.
-            let downbeat_key = m.can_set_phase
-                && !ui.ctx().egui_wants_keyboard_input()
-                && ui.input(|i| i.key_pressed(egui::Key::Space));
-            if ui
-                .add_enabled_ui(m.can_set_phase, |ui| {
-                    tap_button(
-                        ui,
-                        "downbeat",
-                        "1",
-                        PALETTE.fg_primary,
-                        "Downbeat: snap to now (phase only, nearest bar). Key: t / Space",
-                        downbeat_key,
-                    )
-                })
-                .inner
-            {
-                let _ = tx.send(Command::TapDownbeat);
-            }
-            if tap_button(
-                ui,
-                "soft_reset",
-                "↺",
-                PALETTE.fg_primary,
-                "Soft reset: clock to bar 1, beat 1. Playlist position and playhead unchanged. Key: r",
-                false,
-            ) {
-                let _ = tx.send(Command::SoftReset);
-            }
-            if tap_button(
-                ui,
-                "hard_reset",
-                "⏮",
-                PALETTE.error,
-                "Hard reset: soft reset, AND jump the playlist back to its first cue \
-                 and restart its playhead from the in-point. Key: Shift+r",
-                false,
-            ) {
-                let _ = tx.send(Command::HardReset);
-            }
-            // Tap tempo sets BPM: disabled for listen-only sources (Link).
-            if ui
-                .add_enabled_ui(m.can_set_tempo, |ui| {
-                    tap_button(
-                        ui,
-                        "tempo",
-                        "♩",
-                        PALETTE.fg_primary,
-                        "Tap tempo: tap 2+ times to set BPM from the interval. Key: b",
-                        false,
-                    )
-                })
-                .inner
-            {
-                let _ = tx.send(Command::TapTempo);
-            }
-
-            ui.add_space(SP_MD);
-            ui.vertical(|ui| {
-                ui.label(format!(
-                    "bar {}/{}",
-                    m.bar_in_phrase + 1,
-                    m.bars_per_phrase.max(1)
-                ));
-                beat_dots(ui, m);
+        // The clusters hold `ui.vertical` groups, which a wrapped row would
+        // place past the right edge rather than wrap — so stacking is an
+        // explicit width check, not `horizontal_wrapped`.
+        if ui.available_width() >= STACK_BELOW {
+            ui.horizontal(|ui| {
+                bpm_cluster(ui, m, tx);
+                tap_cluster(ui, m, tx);
+                ui.add_space(SP_MD);
+                bar_beat(ui, m);
+                ui.add_space(SP_MD);
+                sync_cluster(ui, m, tx);
             });
-
-            ui.add_space(SP_MD);
-            let sync_idx = match m.sync.unwrap_or(SyncKind::Internal) {
-                SyncKind::Internal => 0,
-                SyncKind::Link => 1,
-            };
-            let sync_group =
-                ui.horizontal(|ui| widgets::segmented(ui, "sync", &["Internal", "Link"], Some(sync_idx)));
-            ui.interact(sync_group.response.rect, ui.id().with("sync_hover"), egui::Sense::hover())
-                .on_hover_text("Sync source: free-running Internal clock, or follow Ableton Link");
-            if let Some(i) = sync_group.inner {
-                let kind = if i == 0 { SyncKind::Internal } else { SyncKind::Link };
-                let _ = tx.send(Command::SetSyncSource(kind));
-            }
-            if m.sync == Some(SyncKind::Link) && m.peers > 0 {
-                ui.add_space(SP_SM);
-                widgets::chip(ui, &format!("{} peers", m.peers), Some(PALETTE.playing), false);
-            }
-        });
+        } else {
+            ui.horizontal(|ui| bpm_cluster(ui, m, tx));
+            ui.horizontal(|ui| {
+                tap_cluster(ui, m, tx);
+                ui.add_space(SP_MD);
+                bar_beat(ui, m);
+            });
+            ui.horizontal_wrapped(|ui| sync_cluster(ui, m, tx));
+        }
         ui.add_space(SP_SM);
         // Cadence controls, in bars. `Next` = how often the sequencer advances to
         // the next active clip; `Loop` = how often the current clip restarts.
-        // Wrapped so this row folds before the tap-button row above it clips
-        // on a narrow window.
+        // Wrapped: the bracket lists break between items on a narrow window.
         ui.horizontal_wrapped(|ui| {
             widgets::section_label(ui, "next every")
                 .on_hover_text("Beats between auto-transitions to the next active clip");
@@ -274,8 +301,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
 
             ui.add_space(SP_MD);
             let mut preserve = m.preserve_playhead;
-            if ui
-                .checkbox(&mut preserve, "preserve playhead")
+            if widgets::glyph_checkbox(ui, &mut preserve, "preserve playhead")
                 .on_hover_text(
                     "On a cut, carry the playhead into the next clip (it comes in \
                      already running). Off: the next clip restarts from its start.",
@@ -287,8 +313,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
 
             ui.add_space(SP_MD);
             let mut advanced = m.advanced;
-            if ui
-                .checkbox(&mut advanced, "advanced")
+            if widgets::glyph_checkbox(ui, &mut advanced, "advanced")
                 .on_hover_text(
                     "Advanced sequencer: each cue gets its own dwell length, loop \
                      rate, timing offsets, and playback speed (edited per cue on the \
@@ -299,7 +324,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 let _ = tx.send(Command::SetAdvancedMode(advanced));
             }
         });
-        ui.add_space(SP_SM);
         phrase_strip(ui, m);
+        ui.add_space(SP_SM);
     });
 }

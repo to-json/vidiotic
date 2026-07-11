@@ -1,36 +1,40 @@
-//! Bottom panel: shader picker/pin controls, pinned-shader chips, the audio
-//! device combo, the spectrum + level meters, and the shader compile-error
-//! drawer.
+//! Bottom panel: shader picker/pin controls, pinned-shader tags, the audio
+//! device combo, glyph spectrum + level meters, the shader compile-error
+//! drawer, and the statusline — mode word, session summary, and the theme
+//! switchboard (dark/light + hue rotation).
 
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{PALETTE, SP_MD, SP_SM};
+use super::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
 use super::widgets;
 use super::{pick_file, PickKind};
 use crate::commands::{Command, UiMirror};
 
 /// The bottom panel: a left cluster (shader controls) and a right cluster
-/// (audio device + meters) on one row, plus an animated error drawer below.
+/// (audio device + meters) on one row, an animated error drawer below, and
+/// the statusline at the very bottom.
 pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
     egui::Panel::bottom(egui::Id::new("io")).show(ui, |ui| {
         ui.add_space(SP_SM);
-        ui.horizontal(|ui| {
-            if ui
-                .button("Shader…")
+        ui.horizontal_wrapped(|ui| {
+            if widgets::bracket_button(ui, "shader…", None, 0.0)
                 .on_hover_text("Load a GLSL/WGSL shader file to livecode")
                 .clicked()
             {
                 pick_file(tx.clone(), PickKind::Shader);
             }
-            let name_color = if m.shader_error.is_some() { PALETTE.error } else { PALETTE.fg_primary };
-            ui.label(
-                egui::RichText::new(m.shader_name.as_deref().unwrap_or("<none>"))
-                    .monospace()
-                    .color(name_color),
+            let name_color = if m.shader_error.is_some() { p.error } else { p.fg_primary };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(m.shader_name.as_deref().unwrap_or("<none>"))
+                        .monospace()
+                        .color(name_color),
+                )
+                .truncate(),
             );
-            if ui
-                .button("📌 Pin")
+            if widgets::bracket_button(ui, "pin", None, 0.0)
                 .on_hover_text(
                     "Pin the current shader's last good compile into the pool so a \
                      cue can use it while you keep livecoding this one. Key: c",
@@ -44,7 +48,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             for s in &m.shader_pool {
                 let resp = widgets::chip(ui, s.name.as_ref(), None, true);
                 ui.interact(resp.rect, ui.id().with(("pinned_shader_hover", s.id)), egui::Sense::hover())
-                    .on_hover_text("Pinned shader — available to any cue's shader override. Hover, then ✕ to unpin.");
+                    .on_hover_text("Pinned shader — available to any cue's shader override. ✕ to unpin.");
                 if resp.removed {
                     unpinned = Some(s.id);
                 }
@@ -55,8 +59,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             }
 
             ui.add_space(SP_MD);
-            if ui
-                .button("💾 Save")
+            if widgets::bracket_button(ui, "save", None, 0.0)
                 .on_hover_text(
                     "Save the project (⌘/Ctrl+S). Writes back to the loaded file, or \
                      asks where to put it for a fresh session.",
@@ -65,82 +68,90 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             {
                 let _ = tx.send(Command::SaveProject);
             }
-            if ui
-                .button("Save As…")
+            if widgets::bracket_button(ui, "save as…", None, 0.0)
                 .on_hover_text("Save the project to a new .viproj file")
                 .clicked()
             {
                 let _ = tx.send(Command::SaveProjectAs);
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(err) = &m.audio_error {
-                    let resp = widgets::chip(ui, "audio ⚠", Some(PALETTE.error), false);
-                    ui.interact(resp.rect, ui.id().with("audio_error_hover"), egui::Sense::hover())
-                        .on_hover_text(err.as_str());
-                }
-                level_bar(ui, m.level);
-                spectrum(ui, m);
-                egui::ComboBox::from_id_salt("audio")
-                    .selected_text(m.current_device.as_deref().unwrap_or("default"))
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(false, "Default")
-                            .on_hover_text("system default input")
-                            .clicked()
-                        {
-                            let _ = tx.send(Command::SetAudioDevice(None));
-                        }
-                        for name in &m.audio_devices {
-                            if ui
-                                .selectable_label(m.current_device.as_ref() == Some(name), name.as_ref())
-                                .clicked()
-                            {
-                                let _ = tx.send(Command::SetAudioDevice(Some(name.to_string())));
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text("Audio input device");
-            });
         });
+
+        // Meters and audio input on their own row: right-justified against
+        // the panel edge when they fit on one line, stacking left-to-right
+        // (wrapped) on a narrow window.
+        if ui.available_width() >= 480.0 {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    audio_error_tag(ui, m);
+                    widgets::glyph_level(ui, compress(m.level), 8);
+                    spectrum(ui, m);
+                    device_combo(ui, m, tx);
+                });
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                device_combo(ui, m, tx);
+                spectrum(ui, m);
+                widgets::glyph_level(ui, compress(m.level), 8);
+                audio_error_tag(ui, m);
+            });
+        }
 
         error_drawer(ui, m);
         ui.add_space(SP_SM);
+        statusline(ui, m);
     });
 }
 
-/// A vertical bar next to the spectrum, fed by `m.level`: `playing` under
-/// half scale, `armed` past it, `error` near clipping.
-fn level_bar(ui: &mut Ui, level: f32) {
-    let p = &PALETTE;
-    let height = 36.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, height), egui::Sense::hover());
-    let mag = ((1.0 + level).ln() / 12.0).clamp(0.0, 1.0);
-    let color = if mag > 0.85 {
-        p.error
-    } else if mag > 0.5 {
-        p.armed
-    } else {
-        p.playing
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(1), p.bg_inset);
-    let h = rect.height() * mag;
-    let bar = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - h), rect.max);
-    painter.rect_filled(bar, egui::CornerRadius::same(1), color);
+/// Log-compress a raw FFT magnitude / level into `0..=1` for display.
+fn compress(v: f32) -> f32 {
+    ((1.0 + v).ln() / 12.0).clamp(0.0, 1.0)
+}
+
+/// Error tag shown while audio capture is failing; hover for the message.
+fn audio_error_tag(ui: &mut Ui, m: &UiMirror) {
+    if let Some(err) = &m.audio_error {
+        let resp = widgets::chip(ui, "audio!", Some(palette().error), false);
+        ui.interact(resp.rect, ui.id().with("audio_error_hover"), egui::Sense::hover())
+            .on_hover_text(err.as_str());
+    }
+}
+
+/// The audio input device picker.
+fn device_combo(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    egui::ComboBox::from_id_salt("audio")
+        .selected_text(m.current_device.as_deref().unwrap_or("default"))
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(false, "default")
+                .on_hover_text("system default input")
+                .clicked()
+            {
+                let _ = tx.send(Command::SetAudioDevice(None));
+            }
+            for name in &m.audio_devices {
+                if ui
+                    .selectable_label(m.current_device.as_ref() == Some(name), name.as_ref())
+                    .clicked()
+                {
+                    let _ = tx.send(Command::SetAudioDevice(Some(name.to_string())));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Audio input device");
 }
 
 /// Audio meter with a view toggle: the native 21 perceptual log bands (what
 /// `fftBand`/the shaders react to) or the 512 linear bins the Shadertoy
-/// `iChannel0` FFT row exposes. Toggle state lives in egui memory (display-only).
+/// `iChannel0` FFT row exposes, pooled to 48 columns. Toggle state lives in
+/// egui memory (display-only).
 fn spectrum(ui: &mut Ui, m: &UiMirror) {
     let id = egui::Id::new("spectrum_linear_view");
     let mut linear = ui.data_mut(|d| d.get_temp::<bool>(id).unwrap_or(false));
-    let col = PALETTE.accent;
 
     ui.horizontal(|ui| {
-        let toggle = widgets::chip(ui, if linear { "512·lin" } else { "21·log" }, Some(col), false);
+        let toggle = widgets::chip(ui, if linear { "512·lin" } else { "21·log" }, Some(palette().blue), false);
         ui.interact(toggle.rect, ui.id().with("spectrum_toggle_hover"), egui::Sense::hover())
             .on_hover_text(
                 "spectrum view — 21 perceptual log bands (fftBand) \
@@ -151,40 +162,25 @@ fn spectrum(ui: &mut Ui, m: &UiMirror) {
             ui.data_mut(|d| d.insert_temp(id, linear));
         }
 
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(21.0 * 8.0, 36.0), egui::Sense::hover());
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, egui::CornerRadius::same(2), PALETTE.bg_inset);
         if linear {
             // 512-bin linear spectrum (iChannel0 row 0), already 0..1. One
-            // vertical line per pixel column, taking the max bin it covers.
+            // glyph column per pooled cell, taking the max bin it covers.
+            const COLS: usize = 48;
             let spec = &m.spectrum_linear;
             let n = spec.len();
-            let cols = rect.width() as usize;
-            if n > 0 && cols > 0 {
-                for cx in 0..cols {
-                    let lo = cx * n / cols;
-                    let hi = ((cx + 1) * n / cols).clamp(lo + 1, n);
-                    let v = spec[lo..hi].iter().copied().fold(0.0_f32, f32::max);
-                    let h = rect.height() * v.clamp(0.0, 1.0);
-                    let x = rect.min.x + cx as f32;
-                    p.line_segment(
-                        [egui::pos2(x, rect.max.y), egui::pos2(x, rect.max.y - h)],
-                        egui::Stroke::new(1.0, col),
-                    );
+            let mut mags = [0.0_f32; COLS];
+            if n > 0 {
+                for (cx, mag) in mags.iter_mut().enumerate() {
+                    let lo = cx * n / COLS;
+                    let hi = ((cx + 1) * n / COLS).clamp(lo + 1, n);
+                    *mag = spec[lo..hi].iter().copied().fold(0.0_f32, f32::max);
                 }
             }
+            widgets::glyph_fft(ui, &mags);
         } else {
-            let w = rect.width() / 21.0;
-            for (i, v) in m.levels.iter().enumerate() {
-                // bands are large FFT magnitudes; log-compress for display
-                let mag = (1.0 + v).ln() / 12.0;
-                let h = rect.height() * mag.clamp(0.0, 1.0);
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x + i as f32 * w + 1.0, rect.max.y - h),
-                    egui::pos2(rect.min.x + (i as f32 + 1.0) * w - 1.0, rect.max.y),
-                );
-                p.rect_filled(bar, egui::CornerRadius::ZERO, col);
-            }
+            // Bands are large FFT magnitudes; log-compress for display.
+            let mags: Vec<f32> = m.levels.iter().map(|v| compress(*v)).collect();
+            widgets::glyph_fft(ui, &mags);
         }
     });
 }
@@ -193,6 +189,7 @@ fn spectrum(ui: &mut Ui, m: &UiMirror) {
 /// fill, a 2px `error` left border, monospace `fg_primary` text (the border
 /// alone carries the red — a red-on-dark error wall was unreadable).
 fn error_drawer(ui: &mut Ui, m: &UiMirror) {
+    let p = palette();
     let openness = ui.ctx().animate_bool(egui::Id::new("shader_err_drawer"), m.shader_error.is_some());
     if openness <= 0.001 {
         return;
@@ -207,13 +204,141 @@ fn error_drawer(ui: &mut Ui, m: &UiMirror) {
     let text = ui.data_mut(|d| d.get_temp::<String>(text_id)).unwrap_or_default();
 
     let frame = egui::Frame::new()
-        .fill(PALETTE.error.linear_multiply(0.08))
+        .fill(p.error.linear_multiply(0.08))
         .inner_margin(egui::Margin::symmetric(SP_MD as i8, SP_SM as i8));
     let outer = frame.show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("shader_err").max_height(96.0 * openness).show(ui, |ui| {
-            ui.label(egui::RichText::new(&text).monospace().color(PALETTE.fg_primary));
+            ui.label(egui::RichText::new(&text).monospace().color(p.fg_primary));
         });
     });
     let border = egui::Rect::from_min_size(outer.response.rect.min, egui::vec2(2.0, outer.response.rect.height()));
-    ui.painter().rect_filled(border, egui::CornerRadius::ZERO, PALETTE.error);
+    ui.painter().rect_filled(border, egui::CornerRadius::ZERO, p.error);
+}
+
+/// The statusline: a full-width `select`-filled strip with the mode word
+/// (NORMAL / ENTRY while typing a BPM / ERROR on a failed compile), the
+/// loaded shader, a session summary, and the theme switchboard on the right.
+fn statusline(ui: &mut Ui, m: &UiMirror) {
+    let p = palette();
+    let cw = widgets::cell_width(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, p.accent_dim);
+
+    // Mode segment: its own fill when something is happening.
+    let (mode, mode_bg) = if m.shader_error.is_some() {
+        ("ERROR", Some(p.error))
+    } else if m.bpm_entry.is_some() {
+        ("ENTRY", Some(p.accent))
+    } else {
+        ("NORMAL", None)
+    };
+    let mode_cells = mode.chars().count() as f32 + 2.0;
+    if let Some(bg) = mode_bg {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(cw * mode_cells, rect.height())),
+            egui::CornerRadius::ZERO,
+            bg,
+        );
+    }
+    let mode_fg = if mode_bg.is_some() { p.bg_inset } else { p.fg_primary };
+    painter.text(
+        egui::pos2(rect.min.x + cw, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        mode,
+        mono(),
+        mode_fg,
+    );
+
+    let summary = format!(
+        "{}   {} clips · {} cues · {:.1} bpm",
+        m.shader_name.as_deref().unwrap_or("—"),
+        m.clips.len(),
+        m.cues.len(),
+        m.bpm,
+    );
+    // Clip the summary short of the theme switchboard so a narrow window
+    // truncates it instead of running the two together.
+    let summary_clip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.max.x - cw * THEME_CELLS, rect.max.y),
+    );
+    painter.with_clip_rect(summary_clip).text(
+        egui::pos2(rect.min.x + cw * (mode_cells + 2.0), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        summary,
+        mono(),
+        p.fg_secondary,
+    );
+
+    theme_controls(ui, rect);
+}
+
+/// Statusline cells reserved on the right for the theme switchboard:
+/// `[dark] light` (13) + the hue strip (14) + margins.
+const THEME_CELLS: f32 = 31.0;
+
+/// Right-aligned theme switchboard inside the statusline: `[dark] light` and
+/// the hue-rotation strip, in the buffer's own idiom. Mutations land next
+/// frame (the engine repaints the control window every tick).
+fn theme_controls(ui: &mut Ui, rect: egui::Rect) {
+    let p = palette();
+    let cw = widgets::cell_width(ui);
+    let mut st = theme::state(ui.ctx());
+    let painter = ui.painter();
+
+    // Hue strip at the right edge.
+    const STRIP_CELLS: f32 = 14.0;
+    let strip = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - cw * (STRIP_CELLS + 1.0), rect.min.y + 4.0),
+        egui::vec2(cw * STRIP_CELLS, rect.height() - 8.0),
+    );
+    let resp = ui.interact(strip, ui.id().with("theme_hue"), egui::Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            // Hue is circular: the strip's right edge wraps back to 0.
+            st.hue = (((pos.x - strip.min.x) / strip.width()).clamp(0.0, 1.0) * 360.0).rem_euclid(360.0);
+        }
+    }
+    const N: usize = 28;
+    for k in 0..N {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(strip.min.x + strip.width() * k as f32 / N as f32, strip.min.y),
+            egui::vec2(strip.width() / N as f32 + 0.5, strip.height()),
+        );
+        painter.rect_filled(cell, egui::CornerRadius::ZERO, theme::hsl(k as f32 / N as f32 * 360.0, 0.5, 0.5));
+    }
+    let x = strip.min.x + strip.width() * st.hue / 360.0;
+    painter.line_segment(
+        [egui::pos2(x, strip.min.y - 2.0), egui::pos2(x, strip.max.y + 2.0)],
+        egui::Stroke::new(2.0, p.fg_primary),
+    );
+
+    // `[dark] light` selector to the strip's left.
+    let mut col = strip.min.x / cw - 15.0;
+    for (lab, dark) in [("dark", true), ("light", false)] {
+        let selected = st.dark == dark;
+        let text = if selected { format!("[{lab}]") } else { format!(" {lab} ") };
+        let w = text.chars().count() as f32;
+        let r = egui::Rect::from_min_size(
+            egui::pos2(col * cw, rect.min.y),
+            egui::vec2(w * cw, rect.height()),
+        );
+        let resp = ui.interact(r, ui.id().with(("theme_mode", lab)), egui::Sense::click());
+        let color = if selected {
+            p.accent
+        } else if resp.hovered() {
+            p.fg_primary
+        } else {
+            p.fg_secondary
+        };
+        painter.text(egui::pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, text, mono(), color);
+        if resp.clicked() {
+            st.dark = dark;
+        }
+        col += w + 1.0;
+    }
+
+    theme::set_state(ui.ctx(), st);
 }

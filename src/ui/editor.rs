@@ -1,10 +1,12 @@
 //! The cue editor: the right-hand panel showing the selected cue's in/out
-//! trim, preserve-playhead override, and shader override.
+//! trim, preserve-playhead override, and effect chain. ISF parameters render
+//! in the phosphor idiom — floats are glyph faders, longs are bracket lists,
+//! bools are `[x]` checkboxes.
 
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{PALETTE, SP_LG, SP_MD, SP_SM};
+use super::theme::{palette, SP_LG, SP_MD, SP_SM};
 use super::widgets;
 use super::{fmt_time, LOOP_CADENCE};
 use crate::bank::Toggle;
@@ -35,26 +37,28 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
 /// Centered muted two-line prompt shown when no cue is selected, matching
 /// the clip pool / cue list empty states.
 fn empty_state(ui: &mut Ui) {
+    let p = palette();
     ui.vertical_centered(|ui| {
         ui.add_space(SP_MD * 3.0);
-        ui.label(egui::RichText::new("No cue selected").color(PALETTE.fg_muted));
+        ui.label(egui::RichText::new("No cue selected").color(p.fg_secondary));
         ui.label(
             egui::RichText::new("Double-click a clip to add a cue, then click it here to edit")
                 .small()
-                .color(PALETTE.fg_muted),
+                .color(p.fg_muted),
         );
         ui.add_space(SP_MD * 3.0);
     });
 }
 
-/// The fields for one cue: header, in/out trim, per-cue preserve, shader
-/// override, and a bottom-anchored remove button.
+/// The fields for one cue: header, in/out trim, per-cue preserve, effect
+/// chain, and a bottom-anchored remove button.
 fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
-    ui.horizontal(|ui| {
-        ui.strong(cue.name.as_ref());
+    let p = palette();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(cue.name.as_ref()).color(p.fg_primary));
         let (role_text, role_tint) = match cue.role {
-            ClipRole::Playing => ("playing", Some(PALETTE.playing)),
-            ClipRole::Armed => ("armed", Some(PALETTE.armed)),
+            ClipRole::Playing => ("playing", Some(p.playing)),
+            ClipRole::Armed => ("armed", Some(p.armed)),
             ClipRole::None => ("idle", None),
         };
         widgets::chip(ui, role_text, role_tint, false);
@@ -63,7 +67,7 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     ui.label(
         egui::RichText::new(format!("⏱ {}", fmt_time(m.playhead_sec)))
             .monospace()
-            .color(PALETTE.fg_secondary),
+            .color(p.fg_secondary),
     );
     ui.add_space(SP_MD);
 
@@ -75,12 +79,13 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         .show(ui, |ui| cue_fields(ui, m, cue, tx));
 }
 
-/// The scrollable field stack: trim, preserve, shader, the advanced sections
+/// The scrollable field stack: trim, preserve, chain, the advanced sections
 /// (when enabled), and the remove button.
 fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    let p = palette();
     egui::Grid::new("cue_trim").num_columns(2).spacing(egui::vec2(SP_SM, SP_SM)).show(ui, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new("In").color(PALETTE.fg_muted));
+            ui.label(egui::RichText::new("in").color(p.fg_muted));
         });
         ui.horizontal(|ui| {
             let mut v = cue.in_sec;
@@ -96,8 +101,7 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             {
                 let _ = tx.send(Command::SetCueIn(cue.id, v));
             }
-            if ui
-                .button(egui::RichText::new("⏺").color(PALETTE.accent))
+            if widgets::bracket_button(ui, "⏺", Some(p.accent), 0.0)
                 .on_hover_text("set in-point to the current playhead")
                 .clicked()
             {
@@ -107,12 +111,11 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         ui.end_row();
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new("Out").color(PALETTE.fg_muted));
+            ui.label(egui::RichText::new("out").color(p.fg_muted));
         });
         ui.horizontal(|ui| {
             let mut trimmed = cue.out_sec.is_some();
-            if ui
-                .checkbox(&mut trimmed, "")
+            if widgets::glyph_checkbox(ui, &mut trimmed, "")
                 .on_hover_text("trim the end (off = play to the clip's natural end)")
                 .changed()
             {
@@ -134,8 +137,7 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
                     {
                         let _ = tx.send(Command::SetCueOut(cue.id, Some(v)));
                     }
-                    if ui
-                        .button(egui::RichText::new("⏺").color(PALETTE.accent))
+                    if widgets::bracket_button(ui, "⏺", Some(p.accent), 0.0)
                         .on_hover_text("set out-point to the current playhead")
                         .clicked()
                     {
@@ -143,7 +145,7 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
                     }
                 }
                 None => {
-                    ui.label(egui::RichText::new("clip end").color(PALETTE.fg_muted));
+                    ui.label(egui::RichText::new("clip end").color(p.fg_muted));
                 }
             }
         });
@@ -159,7 +161,7 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         Some(true) => 1,
         Some(false) => 2,
     };
-    if let Some(i) = widgets::segmented(ui, "cue_preserve", &["Inherit", "On", "Off"], Some(preserve_idx))
+    if let Some(i) = widgets::segmented(ui, "cue_preserve", &["inherit", "on", "off"], Some(preserve_idx))
     {
         let val = match i {
             0 => None,
@@ -177,17 +179,17 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     }
 
     ui.add_space(SP_LG);
-    let remove = egui::Button::new(egui::RichText::new("Remove cue").color(PALETTE.error))
-        .fill(PALETTE.error.linear_multiply(0.12))
-        .min_size(egui::vec2(ui.available_width(), 0.0));
-    if ui.add(remove).on_hover_text("Remove this cue from the bank").clicked() {
+    if widgets::bracket_button(ui, "remove cue", Some(p.error), 0.0)
+        .on_hover_text("Remove this cue from the bank")
+        .clicked()
+    {
         let _ = tx.send(Command::RemoveCue(cue.id));
     }
     ui.add_space(SP_SM);
     ui.label(
         egui::RichText::new("Trim, timing & speed apply the next time this cue is triggered.")
             .small()
-            .color(PALETTE.fg_muted),
+            .color(p.fg_muted),
     );
     ui.add_space(SP_SM);
 }
@@ -217,6 +219,7 @@ fn slot_label(slot: &SlotRef, m: &UiMirror) -> String {
 /// previous stage's output via `prev()`; empty = the live shader. Rows can be
 /// reordered and removed; the combo appends a slot.
 fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    let p = palette();
     widgets::section_label(ui, "effect chain").on_hover_text(
         "Stack shaders applied while this cue plays. Each stage feeds the next via prev(); \
          empty runs the live shader. The live shader can sit anywhere in the stack.",
@@ -226,35 +229,32 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
         ui.label(
             egui::RichText::new("No effects — runs the live shader.")
                 .small()
-                .color(PALETTE.fg_muted),
+                .color(p.fg_muted),
         );
     }
 
     let n = cue.chain.len();
     for (i, slot) in cue.chain.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(format!("{}.", i + 1));
-            ui.label(slot_label(&slot.shader, m));
-            // Right-aligned reorder / remove controls.
+            ui.label(egui::RichText::new(format!("{}.", i + 1)).color(p.fg_muted));
+            // Right-aligned reorder / remove controls; the name truncates
+            // into whatever width they leave on a narrow panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small())
-                    .on_hover_text("Move down")
-                    .clicked()
-                {
-                    let mut c = cue.chain.clone();
-                    c.swap(i, i + 1);
-                    let _ = tx.send(Command::SetCueChain(cue.id, c));
-                }
-                if ui.add_enabled(i > 0, egui::Button::new("▲").small())
-                    .on_hover_text("Move up")
-                    .clicked()
-                {
-                    let mut c = cue.chain.clone();
-                    c.swap(i, i - 1);
-                    let _ = tx.send(Command::SetCueChain(cue.id, c));
-                }
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("✕").color(PALETTE.error)).small())
+                ui.add_enabled_ui(i + 1 < n, |ui| {
+                    if widgets::bracket_button(ui, "▼", None, 0.0).on_hover_text("Move down").clicked() {
+                        let mut c = cue.chain.clone();
+                        c.swap(i, i + 1);
+                        let _ = tx.send(Command::SetCueChain(cue.id, c));
+                    }
+                });
+                ui.add_enabled_ui(i > 0, |ui| {
+                    if widgets::bracket_button(ui, "▲", None, 0.0).on_hover_text("Move up").clicked() {
+                        let mut c = cue.chain.clone();
+                        c.swap(i, i - 1);
+                        let _ = tx.send(Command::SetCueChain(cue.id, c));
+                    }
+                });
+                if widgets::bracket_button(ui, "×", Some(p.error), 0.0)
                     .on_hover_text("Remove from chain")
                     .clicked()
                 {
@@ -262,6 +262,14 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
                     c.remove(i);
                     let _ = tx.send(Command::SetCueChain(cue.id, c));
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(slot_label(&slot.shader, m)).color(p.fg_primary),
+                        )
+                        .truncate(),
+                    );
+                });
             });
         });
 
@@ -281,7 +289,7 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
         Command::SetCueChain(cue.id, c)
     };
     egui::ComboBox::from_id_salt("cue_chain_add")
-        .selected_text("＋ add effect")
+        .selected_text("+ add effect")
         .show_ui(ui, |ui| {
             if ui.selectable_label(false, "Live shader").clicked() {
                 let _ = tx.send(append(SlotRef::Live));
@@ -309,13 +317,15 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
                 }
             }
             ui.separator();
-            if ui.selectable_label(false, "＋ Load ISF file…").clicked() {
+            if ui.selectable_label(false, "+ Load ISF file…").clicked() {
                 crate::ui::pick_file(tx.clone(), crate::ui::PickKind::Isf);
             }
         });
 }
 
-/// Inline controls for one ISF slot's declared inputs. Each edit sends a
+/// Inline controls for one ISF slot's declared inputs, in the phosphor
+/// vocabulary: floats are faders, longs are bracket lists, bools are `[x]`
+/// checkboxes, events are bracket buttons. Each edit sends a
 /// [`Command::SetChainParam`] targeting `(cue, slot_index)` so a drag doesn't
 /// replace the whole chain. Current values come from the slot's overrides,
 /// falling back to each input's schema default.
@@ -327,6 +337,7 @@ fn isf_params_ui(
     inputs: &[IsfInput],
     tx: &Sender<Command>,
 ) {
+    let p = palette();
     if inputs.iter().all(|i| i.kind.is_texture()) {
         return; // nothing tweakable — every input is a texture (image/audio)
     }
@@ -349,16 +360,29 @@ fn isf_params_ui(
                         Some(IsfValue::Float(f)) => *f,
                         _ => *default,
                     };
-                    if ui.add(egui::Slider::new(&mut v, *min..=*max).text(label)).changed() {
-                        send(&input.name, IsfValue::Float(v));
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(label.to_lowercase()).color(p.fg_muted));
+                        if widgets::fader(
+                            ui,
+                            ("isf_fader", slot_index, input.name.as_str()),
+                            *min,
+                            *max,
+                            &mut v,
+                            12,
+                        )
+                        .changed()
+                        {
+                            send(&input.name, IsfValue::Float(v));
+                        }
+                        ui.label(egui::RichText::new(format!("{v:>7.2}")).monospace().color(p.fg_primary));
+                    });
                 }
                 IsfInputKind::Bool { default } => {
                     let mut v = match slot.param(&input.name) {
                         Some(IsfValue::Bool(b)) => *b,
                         _ => *default,
                     };
-                    if ui.checkbox(&mut v, label).changed() {
+                    if widgets::glyph_checkbox(ui, &mut v, &label.to_lowercase()).changed() {
                         send(&input.name, IsfValue::Bool(v));
                     }
                 }
@@ -367,24 +391,20 @@ fn isf_params_ui(
                         Some(IsfValue::Long(i)) => *i,
                         _ => *default,
                     };
-                    let cur_label = values
-                        .iter()
-                        .position(|v| *v == cur)
-                        .and_then(|idx| labels.get(idx))
-                        .map(String::as_str)
-                        .unwrap_or("—");
-                    ui.horizontal(|ui| {
-                        ui.label(label);
-                        egui::ComboBox::from_id_salt(("isf_long", slot_index, input.name.as_str()))
-                            .selected_text(cur_label)
-                            .show_ui(ui, |ui| {
-                                for (idx, val) in values.iter().enumerate() {
-                                    let lbl = labels.get(idx).map(String::as_str).unwrap_or("?");
-                                    if ui.selectable_label(cur == *val, lbl).clicked() {
-                                        send(&input.name, IsfValue::Long(*val));
-                                    }
-                                }
-                            });
+                    let selected = values.iter().position(|v| *v == cur);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(label.to_lowercase()).color(p.fg_muted));
+                        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                        if let Some(idx) = widgets::segmented(
+                            ui,
+                            ("isf_long", slot_index, input.name.as_str()),
+                            &labels,
+                            selected,
+                        ) {
+                            if let Some(val) = values.get(idx) {
+                                send(&input.name, IsfValue::Long(*val));
+                            }
+                        }
                     });
                 }
                 IsfInputKind::Color { default } => {
@@ -393,8 +413,10 @@ fn isf_params_ui(
                         _ => *default,
                     };
                     let mut rgba = egui::Rgba::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
-                    ui.horizontal(|ui| {
-                        ui.label(label);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(label.to_lowercase()).color(p.fg_muted));
+                        let swatch = egui::Color32::from(rgba);
+                        ui.label(egui::RichText::new("███").monospace().color(swatch));
                         let resp = egui::color_picker::color_edit_button_rgba(
                             ui,
                             &mut rgba,
@@ -408,11 +430,11 @@ fn isf_params_ui(
                 }
                 IsfInputKind::Point2D { min, max, default } => {
                     let mut cur = match slot.param(&input.name) {
-                        Some(IsfValue::Point2D(p)) => *p,
+                        Some(IsfValue::Point2D(pt)) => *pt,
                         _ => *default,
                     };
-                    ui.horizontal(|ui| {
-                        ui.label(label);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(label.to_lowercase()).color(p.fg_muted));
                         let dx = ui.add(
                             egui::DragValue::new(&mut cur[0])
                                 .speed(0.005)
@@ -430,7 +452,7 @@ fn isf_params_ui(
                 }
                 IsfInputKind::Event => {
                     // A momentary trigger: send true on click (it latches for one frame).
-                    if ui.button(label).clicked() {
+                    if widgets::bracket_button(ui, &label.to_lowercase(), None, 0.0).clicked() {
                         send(&input.name, IsfValue::Bool(true));
                     }
                 }
@@ -507,9 +529,10 @@ fn advanced_sections(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Comma
 
 /// Dwell: an "inherit" toggle plus a beats `DragValue` when overridden.
 fn dwell_row(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    let p = palette();
     ui.horizontal(|ui| {
         let mut inherit = cue.dwell.is_none();
-        if ui.checkbox(&mut inherit, "inherit").changed() {
+        if widgets::glyph_checkbox(ui, &mut inherit, "inherit").changed() {
             let cmd = (!inherit).then(|| m.phrase_len.max(1) * LOOP_TICKS_PER_BEAT);
             let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Dwell(cmd)));
         }
@@ -532,8 +555,7 @@ fn dwell_row(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             }
             None => {
                 ui.label(
-                    egui::RichText::new(format!("{} b (global)", m.phrase_len))
-                        .color(PALETTE.fg_muted),
+                    egui::RichText::new(format!("{} b (global)", m.phrase_len)).color(p.fg_muted),
                 );
             }
         }
@@ -582,13 +604,14 @@ fn param_row(
     suffix: &str,
     decimals: usize,
 ) -> Option<(bool, f64)> {
+    let p = palette();
     let mut out = None;
     ui.horizontal(|ui| {
         let mut o = on;
-        if ui.checkbox(&mut o, "").on_hover_text(hover).changed() {
+        if widgets::glyph_checkbox(ui, &mut o, "").on_hover_text(hover).changed() {
             out = Some((o, val));
         }
-        let color = if o { PALETTE.fg_secondary } else { PALETTE.fg_muted };
+        let color = if o { p.fg_secondary } else { p.fg_muted };
         ui.label(egui::RichText::new(label).color(color));
         ui.add_enabled_ui(o, |ui| {
             let mut v = val;
@@ -612,14 +635,14 @@ fn param_row(
 /// Speed: clip/cue BPM metadata, the BPM-sync toggle, the user multiplier, and
 /// the resolved effective-speed readout. The two toggles stack.
 fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
+    let p = palette();
     widgets::section_label(ui, "speed").on_hover_text(
         "Playback speed = BPM-sync factor × user multiplier. Both stack; either can be off.",
     );
     // Clip-level BPM metadata (shared by every cue on this clip).
     ui.horizontal(|ui| {
         let mut has = cue.clip_bpm.is_some();
-        if ui
-            .checkbox(&mut has, "clip bpm")
+        if widgets::glyph_checkbox(ui, &mut has, "clip bpm")
             .on_hover_text("Source tempo of the underlying clip, shared by every cue on it.")
             .changed()
         {
@@ -635,8 +658,7 @@ fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
     // Per-cue BPM override.
     ui.horizontal(|ui| {
         let mut has = cue.bpm.is_some();
-        if ui
-            .checkbox(&mut has, "cue bpm")
+        if widgets::glyph_checkbox(ui, &mut has, "cue bpm")
             .on_hover_text("Override the clip's tempo for just this cue.")
             .changed()
         {
@@ -654,8 +676,7 @@ fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
     let source_known = cue.bpm.or(cue.clip_bpm).is_some();
     ui.add_enabled_ui(source_known, |ui| {
         let mut sync = cue.bpm_sync_on;
-        if ui
-            .checkbox(&mut sync, "sync to tempo")
+        if widgets::glyph_checkbox(ui, &mut sync, "sync to tempo")
             .on_hover_text("Retime playback so the clip runs at the session tempo (needs a source BPM).")
             .changed()
         {
@@ -665,7 +686,7 @@ fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
     // User multiplier, stacked on top.
     ui.horizontal(|ui| {
         let mut on = cue.speed_mul.on;
-        if ui.checkbox(&mut on, "× mult").changed() {
+        if widgets::glyph_checkbox(ui, &mut on, "× mult").changed() {
             let _ = tx.send(Command::SetCueParam(
                 cue.id,
                 CueParam::SpeedMul(Toggle { on, val: cue.speed_mul.val }),
@@ -690,7 +711,7 @@ fn speed_section(ui: &mut Ui, cue: &CueView, tx: &Sender<Command>) {
     ui.label(
         egui::RichText::new(format!("→ {:.2}× effective", cue.speed))
             .monospace()
-            .color(PALETTE.fg_secondary),
+            .color(p.fg_secondary),
     );
 }
 
