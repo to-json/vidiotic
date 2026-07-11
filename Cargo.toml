@@ -58,6 +58,12 @@ rfd = "0.15"
 rusty_link = "0.4"
 nanoserde = "0.2"
 
+# Examples only (dev-dependencies never touch the lib/bin builds). eframe
+# rides the same egui/wgpu 0.35/29 stack as the app; glow is disabled so no
+# GL toolchain gets pulled in.
+[dev-dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+
 # A curated subset of clippy's pedantic tier. The blanket tier is not enabled:
 # the numeric-cast lints are noise in graphics/DSP code, and the must-use /
 # const-fn candidates are churn without payoff here.
