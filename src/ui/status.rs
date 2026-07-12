@@ -6,8 +6,9 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
-use super::widgets;
+use phosphor::theme::{mono, palette, ROW, SP_MD, SP_SM};
+use phosphor::widgets;
+
 use super::{pick_file, PickKind};
 use crate::commands::{Command, UiMirror};
 
@@ -262,7 +263,7 @@ fn statusline(ui: &mut Ui, m: &UiMirror) {
     // truncates it instead of running the two together.
     let summary_clip = egui::Rect::from_min_max(
         rect.min,
-        egui::pos2(rect.max.x - cw * THEME_CELLS, rect.max.y),
+        egui::pos2(rect.max.x - cw * widgets::THEME_CELLS, rect.max.y),
     );
     painter.with_clip_rect(summary_clip).text(
         egui::pos2(rect.min.x + cw * (mode_cells + 2.0), rect.center().y),
@@ -272,73 +273,5 @@ fn statusline(ui: &mut Ui, m: &UiMirror) {
         p.fg_secondary,
     );
 
-    theme_controls(ui, rect);
-}
-
-/// Statusline cells reserved on the right for the theme switchboard:
-/// `[dark] light` (13) + the hue strip (14) + margins.
-const THEME_CELLS: f32 = 31.0;
-
-/// Right-aligned theme switchboard inside the statusline: `[dark] light` and
-/// the hue-rotation strip, in the buffer's own idiom. Mutations land next
-/// frame (the engine repaints the control window every tick).
-fn theme_controls(ui: &mut Ui, rect: egui::Rect) {
-    let p = palette();
-    let cw = widgets::cell_width(ui);
-    let mut st = theme::state(ui.ctx());
-    let painter = ui.painter();
-
-    // Hue strip at the right edge.
-    const STRIP_CELLS: f32 = 14.0;
-    let strip = egui::Rect::from_min_size(
-        egui::pos2(rect.max.x - cw * (STRIP_CELLS + 1.0), rect.min.y + 4.0),
-        egui::vec2(cw * STRIP_CELLS, rect.height() - 8.0),
-    );
-    let resp = ui.interact(strip, ui.id().with("theme_hue"), egui::Sense::click_and_drag());
-    if resp.dragged() || resp.clicked() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            // Hue is circular: the strip's right edge wraps back to 0.
-            st.hue = (((pos.x - strip.min.x) / strip.width()).clamp(0.0, 1.0) * 360.0).rem_euclid(360.0);
-        }
-    }
-    const N: usize = 28;
-    for k in 0..N {
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(strip.min.x + strip.width() * k as f32 / N as f32, strip.min.y),
-            egui::vec2(strip.width() / N as f32 + 0.5, strip.height()),
-        );
-        painter.rect_filled(cell, egui::CornerRadius::ZERO, theme::hsl(k as f32 / N as f32 * 360.0, 0.5, 0.5));
-    }
-    let x = strip.min.x + strip.width() * st.hue / 360.0;
-    painter.line_segment(
-        [egui::pos2(x, strip.min.y - 2.0), egui::pos2(x, strip.max.y + 2.0)],
-        egui::Stroke::new(2.0, p.fg_primary),
-    );
-
-    // `[dark] light` selector to the strip's left.
-    let mut col = strip.min.x / cw - 15.0;
-    for (lab, dark) in [("dark", true), ("light", false)] {
-        let selected = st.dark == dark;
-        let text = if selected { format!("[{lab}]") } else { format!(" {lab} ") };
-        let w = text.chars().count() as f32;
-        let r = egui::Rect::from_min_size(
-            egui::pos2(col * cw, rect.min.y),
-            egui::vec2(w * cw, rect.height()),
-        );
-        let resp = ui.interact(r, ui.id().with(("theme_mode", lab)), egui::Sense::click());
-        let color = if selected {
-            p.accent
-        } else if resp.hovered() {
-            p.fg_primary
-        } else {
-            p.fg_secondary
-        };
-        painter.text(egui::pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, text, mono(), color);
-        if resp.clicked() {
-            st.dark = dark;
-        }
-        col += w + 1.0;
-    }
-
-    theme::set_state(ui.ctx(), st);
+    widgets::theme_controls(ui, rect);
 }

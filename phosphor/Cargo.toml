@@ -1,0 +1,16 @@
+[package]
+name = "phosphor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.35"
+
+[lints.clippy]
+use_self = "warn"
+redundant_clone = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+semicolon_if_nothing_returned = "warn"
+single_match_else = "warn"

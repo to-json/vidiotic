@@ -7,8 +7,8 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{self, palette, SP_MD, SP_SM};
-use super::widgets;
+use phosphor::theme::{self, palette, SP_MD, SP_SM};
+use phosphor::widgets;
 use crate::commands::{Command, SyncKind, UiMirror};
 
 /// Below this available width the transport clusters stack as rows.

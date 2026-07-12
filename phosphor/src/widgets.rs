@@ -2,14 +2,22 @@
 //! buffer text on the character grid — bracket buttons and selectors, paren
 //! tags, glyph checkboxes and faders, eighth-block meters — with square
 //! bordered media tiles as the one bitmap concession. All colors come from
-//! [`super::theme::palette`], so the look stays coherent as panels adopt
+//! [`crate::theme::palette`], so the look stays coherent as panels adopt
 //! these and survives hue rotation.
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-use super::theme::{self, mono, palette, ROW};
-use crate::commands::ClipRole;
+use crate::theme::{self, mono, palette, ROW};
+
+/// How a [`media_tile`] participates in playback, carried on [`TileSpec`]:
+/// picks the name-row glyph and the playing pulse border.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TileRole {
+    Playing,
+    Armed,
+    None,
+}
 
 /// Eighth-block ramp for glyph meters.
 pub const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -161,7 +169,7 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Option<Color32>, removable: bool) -> 
 pub struct TileSpec<'a> {
     pub name: &'a str,
     pub tex: Option<&'a egui::TextureHandle>,
-    pub role: ClipRole,
+    pub role: TileRole,
     /// Accent selection border (cue list: this cue is selected for editing).
     pub selected: bool,
     /// In-pool "referenced by a cue" marker (clip pool only).
@@ -211,9 +219,9 @@ pub fn media_tile(ui: &mut Ui, spec: &TileSpec) -> TileResponse {
 
     // Glyph-prefixed name, truncated by width.
     let glyph = match spec.role {
-        ClipRole::Playing => "▶",
-        ClipRole::Armed => "○",
-        ClipRole::None => " ",
+        TileRole::Playing => "▶",
+        TileRole::Armed => "○",
+        TileRole::None => " ",
     };
     let name_color = if spec.selected { p.accent } else { p.fg_primary };
     let mut job = LayoutJob::single_section(
@@ -240,7 +248,7 @@ pub fn media_tile(ui: &mut Ui, spec: &TileSpec) -> TileResponse {
         p.border
     };
     painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, border), StrokeKind::Inside);
-    if spec.role == ClipRole::Playing {
+    if spec.role == TileRole::Playing {
         let alpha = 120 + (spec.beat_pulse.powi(2) * 135.0) as u8;
         painter.rect_stroke(
             rect,
@@ -408,6 +416,76 @@ pub fn glyph_fft(ui: &mut Ui, mags: &[f32]) {
             theme::with_alpha(color, 120 + (mag * 135.0) as u8),
         );
     }
+}
+
+/// Buffer cells [`theme_controls`] occupies at the right edge of its rect:
+/// `[dark] light` (13) + the hue strip (14) + margins. Callers reserve this
+/// much width (× [`cell_width`]) when laying out around it.
+pub const THEME_CELLS: f32 = 31.0;
+
+/// Right-aligned theme switchboard painted inside `rect`: `[dark] light` and
+/// the hue-rotation strip, in the buffer's own idiom. Mutations land through
+/// [`theme::set_state`], so the restyle shows up when the app next calls
+/// [`theme::sync`] — typically the following frame.
+pub fn theme_controls(ui: &mut Ui, rect: Rect) {
+    let p = palette();
+    let cw = cell_width(ui);
+    let mut st = theme::state(ui.ctx());
+    let painter = ui.painter();
+
+    // Hue strip at the right edge.
+    const STRIP_CELLS: f32 = 14.0;
+    let strip = Rect::from_min_size(
+        egui::pos2(rect.max.x - cw * (STRIP_CELLS + 1.0), rect.min.y + 4.0),
+        egui::vec2(cw * STRIP_CELLS, rect.height() - 8.0),
+    );
+    let resp = ui.interact(strip, ui.id().with("theme_hue"), Sense::click_and_drag());
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            // Hue is circular: the strip's right edge wraps back to 0.
+            st.hue = (((pos.x - strip.min.x) / strip.width()).clamp(0.0, 1.0) * 360.0).rem_euclid(360.0);
+        }
+    }
+    const N: usize = 28;
+    for k in 0..N {
+        let cell = Rect::from_min_size(
+            egui::pos2(strip.min.x + strip.width() * k as f32 / N as f32, strip.min.y),
+            egui::vec2(strip.width() / N as f32 + 0.5, strip.height()),
+        );
+        painter.rect_filled(cell, CornerRadius::ZERO, theme::hsl(k as f32 / N as f32 * 360.0, 0.5, 0.5));
+    }
+    let x = strip.min.x + strip.width() * st.hue / 360.0;
+    painter.line_segment(
+        [egui::pos2(x, strip.min.y - 2.0), egui::pos2(x, strip.max.y + 2.0)],
+        Stroke::new(2.0, p.fg_primary),
+    );
+
+    // `[dark] light` selector to the strip's left.
+    let mut col = strip.min.x / cw - 15.0;
+    for (lab, dark) in [("dark", true), ("light", false)] {
+        let selected = st.dark == dark;
+        let text = if selected { format!("[{lab}]") } else { format!(" {lab} ") };
+        let w = text.chars().count() as f32;
+        let r = Rect::from_min_size(
+            egui::pos2(col * cw, rect.min.y),
+            egui::vec2(w * cw, rect.height()),
+        );
+        let resp = ui.interact(r, ui.id().with(("theme_mode", lab)), Sense::click());
+        let color = if selected {
+            p.accent
+        } else if resp.hovered() {
+            p.fg_primary
+        } else {
+            p.fg_secondary
+        };
+        painter.text(egui::pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, text, mono(), color);
+        if resp.clicked() {
+            st.dark = dark;
+        }
+        col += w + 1.0;
+    }
+
+    theme::set_state(ui.ctx(), st);
 }
 
 #[cfg(test)]

@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use crossbeam_channel::Sender;
 use egui::{Align2, Rect, Sense, Ui};
 
-use super::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
-use super::widgets::{self, TileSpec};
-use super::{pick_file, PickKind};
+use phosphor::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
+use phosphor::widgets::{self, TileSpec};
+
+use super::{pick_file, tile_role, PickKind};
 use crate::commands::{BankView, ClipBankView, ClipEntry, ClipId, Command, CueView, UiMirror};
 
 /// Central panel: the source clip pool, bank tabs, and the edit bank's cue list.
@@ -112,7 +113,7 @@ fn clip_tile(
     let spec = TileSpec {
         name: &clip.name,
         tex: thumbs.get(&clip.id),
-        role: clip.role,
+        role: tile_role(clip.role),
         selected: false,
         active: clip.active,
         beat_pulse,
@@ -254,7 +255,7 @@ fn cue_chip(
             let spec = TileSpec {
                 name: &cue.name,
                 tex: thumbs.get(&cue.clip),
-                role: cue.role,
+                role: tile_role(cue.role),
                 selected,
                 active: false,
                 beat_pulse,

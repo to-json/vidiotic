@@ -1,9 +1,8 @@
-//! Visual theme for the control window: the Everforest palette in HSL,
-//! generated from a dark/light switch and a global hue rotation (the
-//! "phosphor" direction from the ISF aesthetics study). Every `Color32`
-//! used under `src/ui/` should come from [`palette`] rather than being
-//! constructed ad hoc, so the look stays coherent as panels are added and
-//! survives hue rotation.
+//! The phosphor visual theme: the Everforest palette in HSL, generated from
+//! a dark/light switch and a global hue rotation. Every `Color32` an app
+//! paints with should come from [`palette`] rather than being constructed ad
+//! hoc, so the look stays coherent as panels are added and survives hue
+//! rotation.
 
 use std::sync::Mutex;
 
@@ -102,7 +101,7 @@ static CURRENT: Mutex<Option<Palette>> = Mutex::new(None);
 pub fn palette() -> Palette {
     CURRENT
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .unwrap_or_else(|| palette_for(ThemeState::default()))
 }
 
@@ -160,20 +159,6 @@ pub fn hsl(h: f32, s: f32, l: f32) -> Color32 {
     )
 }
 
-/// Convert a palette color to a wgpu clear color. The render targets in this
-/// app are non-sRGB (see `gfx::WindowSurface::configure`), so a `LoadOp::Clear`
-/// writes each channel's `0..1` fraction straight into the framebuffer with no
-/// gamma conversion — matching how egui-wgpu paints `Color32` onto the same
-/// non-sRGB target.
-pub fn wgpu_clear_color(c: Color32) -> wgpu::Color {
-    wgpu::Color {
-        r: c.r() as f64 / 255.0,
-        g: c.g() as f64 / 255.0,
-        b: c.b() as f64 / 255.0,
-        a: 1.0,
-    }
-}
-
 /// Apply the theme to `ctx` at construction. Per-frame theme edits (the
 /// statusline's dark/light and hue controls) land through [`sync`].
 pub fn apply(ctx: &Context) {
@@ -195,7 +180,7 @@ pub fn sync(ctx: &Context) {
 
 fn apply_style(ctx: &Context, st: ThemeState) {
     let p = palette_for(st);
-    *CURRENT.lock().unwrap() = Some(p);
+    *CURRENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p);
 
     // The control window follows its own switch, never the OS preference.
     ctx.set_theme(if st.dark { egui::Theme::Dark } else { egui::Theme::Light });

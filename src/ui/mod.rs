@@ -4,23 +4,23 @@
 //!
 //! Layout is split by panel: [`transport`] (top), [`status`] (bottom),
 //! [`editor`] (right, the selected cue's fields), and [`library`] (center,
-//! the clip pool and cue banks). [`theme`] holds the palette and spacing
-//! scale; [`widgets`] holds shared custom-painted controls.
+//! the clip pool and cue banks). The palette, spacing scale, and shared
+//! custom-painted controls come from the `phosphor` crate
+//! ([`phosphor::theme`] / [`phosphor::widgets`]).
 
 mod editor;
 mod library;
 mod status;
-mod theme;
 mod transport;
-mod widgets;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crossbeam_channel::Sender;
+use phosphor::{theme, widgets};
 use winit::window::Window;
 
-use crate::commands::{ClipId, Command, UiMirror};
+use crate::commands::{ClipId, ClipRole, Command, UiMirror};
 use crate::gfx::WindowSurface;
 
 /// The control window's egui stack: context, winit input translation, wgpu
@@ -129,7 +129,7 @@ impl EguiCtl {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(theme::wgpu_clear_color(theme::palette().bg_base)),
+                                load: wgpu::LoadOp::Clear(wgpu_clear_color(theme::palette().bg_base)),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -177,6 +177,29 @@ fn control_ui(
     status::show(ui, m, tx);
     editor::show(ui, m, tx);
     library::show(ui, m, tx, thumbs);
+}
+
+/// Convert a palette color to a wgpu clear color. The render targets in this
+/// app are non-sRGB (see `gfx::WindowSurface::configure`), so a `LoadOp::Clear`
+/// writes each channel's `0..1` fraction straight into the framebuffer with no
+/// gamma conversion — matching how egui-wgpu paints `Color32` onto the same
+/// non-sRGB target.
+fn wgpu_clear_color(c: egui::Color32) -> wgpu::Color {
+    wgpu::Color {
+        r: c.r() as f64 / 255.0,
+        g: c.g() as f64 / 255.0,
+        b: c.b() as f64 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// A live-playback role as the tile marker vocabulary phosphor paints.
+fn tile_role(role: ClipRole) -> widgets::TileRole {
+    match role {
+        ClipRole::Playing => widgets::TileRole::Playing,
+        ClipRole::Armed => widgets::TileRole::Armed,
+        ClipRole::None => widgets::TileRole::None,
+    }
 }
 
 /// Format a seconds count as `m:ss.cc`.

@@ -6,8 +6,9 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use super::theme::{palette, SP_LG, SP_MD, SP_SM};
-use super::widgets;
+use phosphor::theme::{palette, SP_LG, SP_MD, SP_SM};
+use phosphor::widgets;
+
 use super::{fmt_time, LOOP_CADENCE};
 use crate::bank::Toggle;
 use crate::commands::{
