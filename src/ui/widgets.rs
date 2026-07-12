@@ -87,6 +87,39 @@ pub fn unit_label(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
     ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend))
 }
 
+/// Lay out a cluster of row widgets as one wrapping unit inside a
+/// `horizontal_wrapped` row: when the whole cluster no longer fits the
+/// remaining row it breaks to the next line intact, rather than splitting
+/// between its children. Only when the intact cluster is wider than a full
+/// row — i.e. it would overflow even from the leftmost position — do the
+/// children flow into the wrapped row individually so they can break.
+///
+/// The intact width comes from the previous frame's measurement (nested
+/// groups report their size only after layout), so a resize corrects on the
+/// next frame.
+pub fn wrap_unit(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    add: impl FnOnce(&mut Ui),
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let known_width: Option<f32> = ui.data(|d| d.get_temp(id));
+    let row_width = ui.max_rect().width();
+    if known_width.is_some_and(|w| w > row_width) {
+        let at_row_start = ui.available_size_before_wrap().x >= row_width - 0.5;
+        if !at_row_start {
+            ui.end_row();
+        }
+        add(ui);
+    } else {
+        if known_width.is_some_and(|w| w > ui.available_size_before_wrap().x) {
+            ui.end_row();
+        }
+        let measured = ui.horizontal(|ui| add(ui)).response.rect.width();
+        ui.data_mut(|d| d.insert_temp(id, measured));
+    }
+}
+
 /// What happened to a [`chip`] this frame.
 pub struct ChipResponse {
     pub clicked: bool,
@@ -375,4 +408,120 @@ pub fn glyph_fft(ui: &mut Ui, mags: &[f32]) {
             theme::with_alpha(color, 120 + (mag * 135.0) as u8),
         );
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive `wrap_unit` for a few frames at the given panel width and report
+    /// the rects of the unit's two fixed-size children (30×10 and 90×10),
+    /// preceded by a 100×10 filler in the same wrapped row.
+    fn run_wrap_unit(panel_width: f32) -> (Rect, Rect, Rect) {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(panel_width, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.horizontal_wrapped(|ui| {
+                    let (filler, _) =
+                        ui.allocate_exact_size(egui::vec2(100.0, 10.0), Sense::hover());
+                    let mut a = Rect::NOTHING;
+                    let mut b = Rect::NOTHING;
+                    wrap_unit(ui, "unit", |ui| {
+                        a = ui.allocate_exact_size(egui::vec2(30.0, 10.0), Sense::hover()).0;
+                        b = ui.allocate_exact_size(egui::vec2(90.0, 10.0), Sense::hover()).0;
+                    });
+                    out = Some((filler, a, b));
+                });
+            });
+        }
+        out.unwrap()
+    }
+
+    #[test]
+    fn wrap_unit_stays_inline_when_it_fits() {
+        let (filler, a, b) = run_wrap_unit(300.0);
+        assert_eq!(a.min.y, filler.min.y, "unit should share the filler's row");
+        assert_eq!(a.min.x, filler.max.x);
+        assert_eq!(b.min.x, a.max.x, "children stay adjacent");
+    }
+
+    #[test]
+    fn wrap_unit_breaks_to_next_row_intact() {
+        // 100 filler + 120 unit > 180 row: the unit moves down whole.
+        let (filler, a, b) = run_wrap_unit(180.0);
+        assert!(a.min.y > filler.max.y, "unit should start a new row, got {a:?}");
+        assert_eq!(a.min.x, 0.0, "unit should start at the row edge");
+        assert_eq!(b.min.y, a.min.y, "children stay on one row");
+        assert_eq!(b.min.x, a.max.x, "children stay adjacent");
+    }
+
+    #[test]
+    fn wrap_unit_wider_than_row_lets_children_wrap() {
+        // Unit alone is 120 wide > 100 row: children wrap individually.
+        let (filler, a, b) = run_wrap_unit(100.0);
+        assert!(a.min.y > filler.max.y, "unit should leave the filler's row");
+        assert_eq!(a.min.x, 0.0, "first child starts at the row edge");
+        assert!(b.min.y >= a.max.y, "second child wraps below the first, got a={a:?} b={b:?}");
+    }
+
+// Scratch reproduction of the transport cadence row, appended to widgets.rs
+// tests temporarily. Prints where each cluster lands at several widths.
+
+#[test]
+fn repro_cadence_row() {
+    for width in [900.0_f32, 700.0, 560.0, 420.0, 320.0, 240.0] {
+        let ctx = egui::Context::default();
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.clear();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 7.0);
+                ui.horizontal_wrapped(|ui| {
+                    let nl = section_label(ui, "next every").rect;
+                    segmented(ui, "next_cadence", &["1", "2", "4", "8", "16"], Some(2));
+                    ui.add_space(8.0);
+                    let mut ll = Rect::NOTHING;
+                    let mut last = Rect::NOTHING;
+                    wrap_unit(ui, "loop_every_unit", |ui| {
+                        ll = section_label(ui, "loop every").rect;
+                        segmented(
+                            ui,
+                            "loop_cadence",
+                            &["off", "1/8", "1/4", "1/2", "1", "2", "4", "8", "16"],
+                            Some(0),
+                        );
+                        last = ui.min_rect();
+                    });
+                    ui.add_space(8.0);
+                    let mut pp = true;
+                    let ppr = glyph_checkbox(ui, &mut pp, "preserve playhead").rect;
+                    rows.push(("next_label", nl));
+                    rows.push(("loop_label", ll));
+                    rows.push(("loop_unit", last));
+                    rows.push(("preserve", ppr));
+                });
+            });
+        }
+        println!("--- width {width} ---");
+        for (name, r) in &rows {
+            println!("{name:12} x {:7.1}..{:7.1}  y {:5.1}..{:5.1}", r.min.x, r.max.x, r.min.y, r.max.y);
+        }
+    }
+}
 }

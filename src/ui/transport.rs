@@ -287,17 +287,21 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             }
 
             ui.add_space(SP_MD);
-            widgets::section_label(ui, "loop every")
-                .on_hover_text("Force the current clip back to its start on this beat grid");
-            let loop_labels: Vec<&str> =
-                std::iter::once("off").chain(LOOP_CADENCE.iter().map(|(l, _)| *l)).collect();
-            let loop_selected = m.loop_len.map_or(0, |beats| {
-                LOOP_CADENCE.iter().position(|(_, b)| *b == beats).map_or(0, |i| i + 1)
+            widgets::wrap_unit(ui, "loop_every_unit", |ui| {
+                widgets::section_label(ui, "loop every")
+                    .on_hover_text("Force the current clip back to its start on this beat grid");
+                let loop_labels: Vec<&str> =
+                    std::iter::once("off").chain(LOOP_CADENCE.iter().map(|(l, _)| *l)).collect();
+                let loop_selected = m.loop_len.map_or(0, |beats| {
+                    LOOP_CADENCE.iter().position(|(_, b)| *b == beats).map_or(0, |i| i + 1)
+                });
+                if let Some(i) =
+                    widgets::segmented(ui, "loop_cadence", &loop_labels, Some(loop_selected))
+                {
+                    let beats = if i == 0 { None } else { Some(LOOP_CADENCE[i - 1].1) };
+                    let _ = tx.send(Command::SetLoopLen(beats));
+                }
             });
-            if let Some(i) = widgets::segmented(ui, "loop_cadence", &loop_labels, Some(loop_selected)) {
-                let beats = if i == 0 { None } else { Some(LOOP_CADENCE[i - 1].1) };
-                let _ = tx.send(Command::SetLoopLen(beats));
-            }
 
             ui.add_space(SP_MD);
             let mut preserve = m.preserve_playhead;
@@ -328,3 +332,4 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         ui.add_space(SP_SM);
     });
 }
+
