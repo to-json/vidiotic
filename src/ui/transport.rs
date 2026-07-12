@@ -94,7 +94,8 @@ fn phrase_strip(ui: &mut Ui, m: &UiMirror) {
     ui.label(egui::RichText::new(strip).monospace().color(p.blue));
 }
 
-/// BPM hero (or the keyboard-entry readout) plus the drag/nudge stack.
+/// BPM hero (or the keyboard-entry readout) plus the nudge buttons. The hero
+/// itself is the tempo control: drag to scrub, click to type.
 fn bpm_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     let p = palette();
     if let Some(entry) = &m.bpm_entry {
@@ -107,6 +108,14 @@ fn bpm_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             );
             ui.label(egui::RichText::new("enter to set").small().color(p.fg_muted));
         });
+        return;
+    }
+
+    // Tempo edits are disabled for listen-only sources (Link): the hero
+    // falls back to a plain readout and the nudges grey out, but the number
+    // still tracks the followed tempo.
+    if m.can_set_tempo {
+        bpm_hero_drag(ui, m, tx);
     } else {
         ui.label(
             egui::RichText::new(format!("{:6.1}", m.bpm))
@@ -114,40 +123,67 @@ fn bpm_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 .size(32.0)
                 .color(p.fg_primary),
         );
-        // Tempo edits are disabled for listen-only sources (Link): the
-        // readout above still tracks the followed tempo, but nothing here
-        // can write back to the session.
-        ui.add_enabled_ui(m.can_set_tempo, |ui| {
-            ui.vertical(|ui| {
-                let mut bpm = m.bpm;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut bpm)
-                            .speed(0.1)
-                            .range(20.0..=300.0)
-                            .fixed_decimals(1),
-                    )
-                    .changed()
-                {
-                    let _ = tx.send(Command::SetBpm(bpm));
-                }
-                ui.horizontal(|ui| {
-                    if widgets::bracket_button(ui, "−.1%", None, 0.0)
-                        .on_hover_text("Nudge tempo down for beat-matching drift. Key: [")
-                        .clicked()
-                    {
-                        let _ = tx.send(Command::NudgeBpm(-0.001));
-                    }
-                    if widgets::bracket_button(ui, "+.1%", None, 0.0)
-                        .on_hover_text("Nudge tempo up for beat-matching drift. Key: ]")
-                        .clicked()
-                    {
-                        let _ = tx.send(Command::NudgeBpm(0.001));
-                    }
-                });
-            });
-        });
     }
+    ui.add_enabled_ui(m.can_set_tempo, |ui| {
+        if widgets::bracket_button(ui, "−.1%", None, 0.0)
+            .on_hover_text("Nudge tempo down for beat-matching drift. Key: [")
+            .clicked()
+        {
+            let _ = tx.send(Command::NudgeBpm(-0.001));
+        }
+        if widgets::bracket_button(ui, "+.1%", None, 0.0)
+            .on_hover_text("Nudge tempo up for beat-matching drift. Key: ]")
+            .clicked()
+        {
+            let _ = tx.send(Command::NudgeBpm(0.001));
+        }
+    });
+}
+
+/// The editable hero: a `DragValue` restyled as the 32 pt readout, with the
+/// button chrome stripped so it reads as a number (hover tint and the resize
+/// cursor are the interactivity cues). Typed values apply on commit, not per
+/// keystroke, so half-typed tempos never reach the engine.
+fn bpm_hero_drag(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    let hero_font = egui::FontId::monospace(32.0);
+    ui.scope(|ui| {
+        let hero = egui::TextStyle::Name("bpm-hero".into());
+        ui.style_mut().text_styles.insert(hero.clone(), hero_font.clone());
+        ui.style_mut().drag_value_text_style = hero;
+        let v = ui.visuals_mut();
+        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+            w.weak_bg_fill = egui::Color32::TRANSPARENT;
+            w.bg_stroke = egui::Stroke::NONE;
+            w.expansion = 0.0;
+        }
+        v.widgets.inactive.fg_stroke.color = p.fg_primary;
+        v.widgets.hovered.fg_stroke.color = p.accent;
+        v.widgets.active.fg_stroke.color = p.accent;
+        // Reserve the full "300.0" width so neighbors don't shift as the
+        // tempo crosses 100.
+        let cw = ui
+            .painter()
+            .layout_no_wrap("0".into(), hero_font, egui::Color32::WHITE)
+            .size()
+            .x;
+        ui.spacing_mut().interact_size.x = cw * 5.0;
+
+        let mut bpm = m.bpm;
+        if ui
+            .add(
+                egui::DragValue::new(&mut bpm)
+                    .speed(0.1)
+                    .range(20.0..=300.0)
+                    .fixed_decimals(1)
+                    .update_while_editing(false),
+            )
+            .on_hover_text("Drag to scrub tempo; click to type a value.")
+            .changed()
+        {
+            let _ = tx.send(Command::SetBpm(bpm));
+        }
+    });
 }
 
 /// The four tap buttons: downbeat, soft/hard reset, tap tempo.
