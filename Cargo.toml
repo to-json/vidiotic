@@ -22,6 +22,10 @@ path = "src/bin/spike_render.rs"
 name = "spike_decode"
 path = "src/bin/spike_decode.rs"
 
+[[bin]]
+name = "spike_capture"
+path = "src/bin/spike_capture.rs"
+
 # The transcode hot path (BC1 block compression, its rayon fan-out, and snappy
 # framing) is drastically slower unoptimized — build it optimized even in dev.
 [profile.dev.package.texpresso]
@@ -61,6 +65,16 @@ egui-winit = { version = "0.35", default-features = false, features = ["links"] 
 rfd = "0.15"
 rusty_link = "0.4"
 nanoserde = "0.2"
+
+# Camera capture: AVFoundation supplies device enumeration, stable identity
+# (uniqueID), and TCC permission state; the actual frame capture goes through
+# ffmpeg's avfoundation demuxer on the already-linked ffmpeg-next.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-av-foundation = { version = "0.3", features = ["objc2-core-media"] }
+objc2-core-media = "0.3"
+block2 = "0.6"
 
 # Examples only (dev-dependencies never touch the lib/bin builds). eframe
 # rides the same egui/wgpu 0.35/29 stack as the app; glow is disabled so no
