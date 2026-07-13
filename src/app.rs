@@ -22,8 +22,8 @@ use crate::bank::{Bank, Cue, CueId};
 use crate::clippool::{self, Clip, ClipBank, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{
-    BankView, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam, CueView,
-    SlotRef, SyncKind, UiMirror, LOOP_TICKS_PER_BEAT,
+    BankView, Cadence, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam,
+    CueView, SlotRef, SyncKind, TimeSig, UiMirror, LOOP_TICKS_PER_BEAT,
 };
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -48,8 +48,8 @@ pub struct Boot {
     pub windowed: bool,
     pub monitor: Option<usize>,
     pub bpm: f64,
-    pub quantum: f64,
-    pub phrase_len: u32,
+    pub time_sig: TimeSig,
+    pub phrase_cadence: Cadence,
     pub initial_sync: SyncKind,
     pub clips: Vec<Clip>,
     /// Named groupings over `clips`; at least one bank should cover the pool or
@@ -67,7 +67,7 @@ pub struct Boot {
     pub project_path: Option<PathBuf>,
     /// Session playback defaults (project load overrides the CLI defaults).
     pub preserve_playhead: bool,
-    pub loop_len: Option<u32>,
+    pub loop_cadence: Option<Cadence>,
     pub advanced: bool,
     pub thumb_rx: Option<Receiver<Thumbnail>>,
     pub audio_out: triple_buffer::Output<AudioFrame>,
@@ -91,7 +91,11 @@ pub struct App {
     // engine state
     clock: Box<dyn ClockSource>,
     sync: SyncKind,
-    quantum: f64,
+    time_sig: TimeSig,
+    // Source-of-truth cadences: re-resolved against `time_sig` into the
+    // sequencer's dwell / `loop_len` on every mutation (see `apply_cadences`).
+    phrase_cadence: Cadence,
+    loop_cadence: Option<Cadence>,
     sequencer: Sequencer,
     clips: Vec<Clip>,
     // Clip banks group the flat pool for the UI; `ClipId`s stay globally unique
@@ -124,8 +128,9 @@ pub struct App {
     // global-phrase behavior; per-cue edits are still stored, just inert.
     advanced: bool,
     // musical re-loop: force the current clip back to its start on a beat grid,
-    // measured in 1/32-beat ticks. None = let the clip loop on EOF only. In
-    // advanced mode a per-cue rate/phase can override this for the playing cue.
+    // measured in 1/32-beat ticks — `loop_cadence` resolved against `time_sig`
+    // by `apply_cadences`. None = let the clip loop on EOF only. In advanced
+    // mode a per-cue rate/phase can override this for the playing cue.
     loop_len: Option<u32>,
     loop_tracker: BoundaryTracker,
     // on a cut, carry the outgoing playhead into the incoming clip (true, the
@@ -186,10 +191,12 @@ impl App {
             graphics: None,
             renderer: None,
             egui: None,
-            clock: Box::new(InternalClock::new(boot.bpm, boot.quantum)),
+            clock: Box::new(InternalClock::new(boot.bpm, boot.time_sig.quantum())),
             sync: SyncKind::Internal,
-            quantum: boot.quantum,
-            sequencer: Sequencer::new(boot.phrase_len as f64),
+            time_sig: boot.time_sig,
+            phrase_cadence: boot.phrase_cadence,
+            loop_cadence: boot.loop_cadence,
+            sequencer: Sequencer::new(boot.phrase_cadence.beats(boot.time_sig)),
             clips: boot.clips,
             clip_banks: boot.clip_banks,
             active_clip_bank: 0,
@@ -209,7 +216,7 @@ impl App {
             last_beat: 0.0,
             last_bpm: boot.bpm,
             advanced: boot.advanced,
-            loop_len: boot.loop_len,
+            loop_len: boot.loop_cadence.map(|c| c.ticks(boot.time_sig)),
             loop_tracker: BoundaryTracker::new(),
             preserve_playhead: boot.preserve_playhead,
             tap_times: Vec::new(),
@@ -273,8 +280,8 @@ impl App {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let defaults = SessionDefaults {
             bpm: self.clock.snapshot().bpm,
-            quantum: self.quantum,
-            phrase_len: self.sequencer.phrase_len() as u32,
+            quantum: self.time_sig.quantum(),
+            phrase_len: self.sequencer.phrase_len().round() as u32,
             sync: match self.sync {
                 SyncKind::Internal => SyncSpec::Internal,
                 SyncKind::Link => SyncSpec::Link,
@@ -282,6 +289,11 @@ impl App {
             preserve_playhead: self.preserve_playhead,
             loop_len: self.loop_len,
             advanced: self.advanced,
+            ts_num: self.time_sig.num,
+            ts_den: self.time_sig.den,
+            phrase_cadence: Some(self.phrase_cadence.into()),
+            loop_cadence_set: true,
+            loop_cadence: self.loop_cadence.map(Into::into),
             // Absolutize like clip paths: a CWD-relative `--shader` would resolve
             // against the save dir on load and be lost.
             shader_path: Some(project::relativize(dir, &project::absolutize(&self.shader_path))),
@@ -770,7 +782,7 @@ impl App {
         let snap = self.clock.snapshot();
         self.clock = match kind {
             SyncKind::Internal => Box::new(InternalClock::from_snapshot(&snap)),
-            SyncKind::Link => Box::new(LinkClock::new(snap.bpm, self.quantum)),
+            SyncKind::Link => Box::new(LinkClock::new(snap.bpm, self.time_sig.quantum())),
         };
         self.sync = kind;
         self.sequencer.reset_boundary(); // beat numbering may jump on switch
@@ -817,7 +829,7 @@ impl App {
             let intervals = (self.tap_times.len() - 1) as f64;
             let avg = now.duration_since(first).as_secs_f64() / intervals;
             if avg > 0.0 {
-                let bpm = (60.0 / avg).clamp(20.0, 300.0);
+                let bpm = (60.0 / avg).clamp(20.0, 1000.0);
                 self.clock.set_bpm(bpm);
             }
         }
@@ -826,6 +838,15 @@ impl App {
     fn set_loop_len(&mut self, ticks: Option<u32>) {
         self.loop_len = ticks;
         self.loop_tracker.reset();
+    }
+
+    /// Re-resolve `phrase_cadence`/`loop_cadence` against the current
+    /// `time_sig` and push the concrete lengths into the sequencer and the
+    /// loop grid. Called after any edit to the cadences or the signature.
+    fn apply_cadences(&mut self) {
+        let ev = self.sequencer.set_phrase_len(self.phrase_cadence.beats(self.time_sig));
+        self.apply_seq_events(ev);
+        self.set_loop_len(self.loop_cadence.map(|c| c.ticks(self.time_sig)));
     }
 
     /// Reset the beat grid to its origin (bar 1, beat 1, phrase 1) and re-prime
@@ -864,11 +885,20 @@ impl App {
             Command::SoftReset => self.soft_reset(),
             Command::HardReset => self.hard_reset(),
             Command::SetSyncSource(kind) => self.set_sync_source(kind),
-            Command::SetPhraseLen(n) => {
-                let ev = self.sequencer.set_phrase_len(n);
-                self.apply_seq_events(ev);
+            Command::SetTimeSig(ts) => {
+                self.time_sig = ts.sanitized();
+                self.clock.set_quantum(self.time_sig.quantum());
+                self.apply_cadences();
+                self.sequencer.reset_boundary();
             }
-            Command::SetLoopLen(beats) => self.set_loop_len(beats),
+            Command::SetPhraseCadence(c) => {
+                self.phrase_cadence = c;
+                self.apply_cadences();
+            }
+            Command::SetLoopCadence(c) => {
+                self.loop_cadence = c;
+                self.apply_cadences();
+            }
             Command::SetPreservePlayhead(on) => self.preserve_playhead = on,
             Command::ToggleClipActive(id) => self.toggle_clip_active(id, self.last_beat),
             Command::AddCue(clip) => self.add_cue(clip),
@@ -1109,12 +1139,16 @@ impl App {
         self.mirror.beat = snap.beat;
         self.mirror.phase = snap.phase;
         self.mirror.quantum = snap.quantum;
-        self.mirror.phrase_len = phrase as u32;
+        self.mirror.time_sig = self.time_sig;
+        self.mirror.phrase_cadence = self.phrase_cadence;
+        self.mirror.loop_cadence = self.loop_cadence;
+        self.mirror.phrase_beats = phrase;
         self.mirror.loop_len = self.loop_len;
         self.mirror.preserve_playhead = self.preserve_playhead;
         self.mirror.advanced = self.advanced;
-        self.mirror.bars_per_phrase = (phrase / 4.0) as u32;
-        self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / 4.0) as u32;
+        let q = snap.quantum.max(0.25);
+        self.mirror.bars_per_phrase = (phrase / q).round().max(1.0) as u32;
+        self.mirror.bar_in_phrase = (snap.beat.rem_euclid(phrase) / q) as u32;
         self.mirror.sync = Some(self.sync);
         let caps = self.clock.caps();
         self.mirror.peers = caps.peers;
@@ -1372,7 +1406,7 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 if let Some(s) = self.bpm_entry.take() {
                     if let Ok(b) = s.parse::<f64>() {
-                        if (20.0..=300.0).contains(&b) {
+                        if (20.0..=1000.0).contains(&b) {
                             let _ = self.cmd_tx.send(Command::SetBpm(b));
                         }
                     }

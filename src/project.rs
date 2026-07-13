@@ -19,7 +19,7 @@ use nanoserde::{DeRon, SerRon};
 
 use crate::bank::{Bank, Cue, CueId, Toggle};
 use crate::clippool::{Clip, ClipBank};
-use crate::commands::{ChainSlot, ClipId, SlotRef};
+use crate::commands::{Cadence, ChainSlot, ClipId, SlotRef, TimeSig};
 use crate::isf::IsfValue;
 
 /// Bumped on any breaking change to the on-disk shape; [`load`] routes older
@@ -43,7 +43,38 @@ pub struct Project {
     pub cue_banks: Vec<CueBankSpec>,
 }
 
+/// On-disk mirror of [`crate::commands::Cadence`].
+#[derive(SerRon, DeRon, Clone, Copy, Debug, PartialEq)]
+pub enum CadenceSpec {
+    Note(u32),
+    Bars(u32),
+}
+
+impl From<Cadence> for CadenceSpec {
+    fn from(c: Cadence) -> Self {
+        match c {
+            Cadence::Note(t) => Self::Note(t),
+            Cadence::Bars(n) => Self::Bars(n),
+        }
+    }
+}
+
+impl From<CadenceSpec> for Cadence {
+    fn from(c: CadenceSpec) -> Self {
+        match c {
+            CadenceSpec::Note(t) => Self::Note(t),
+            CadenceSpec::Bars(n) => Self::Bars(n),
+        }
+    }
+}
+
 /// Session-wide playback defaults; mirrors the engine's global knobs.
+///
+/// `quantum`/`phrase_len`/`loop_len` are the pre-time-signature fields, kept
+/// for `vidiotic-prep` compatibility and as the fallback a legacy (pre-`ts_num`)
+/// file resolves through. `ts_num == 0` marks a file with no signature written
+/// (defaults to 4/4); `phrase_cadence: None` and `!loop_cadence_set` mean
+/// "derive from the legacy fields" rather than "use the new ones".
 #[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct SessionDefaults {
     pub bpm: f64,
@@ -58,6 +89,20 @@ pub struct SessionDefaults {
     pub loop_len: Option<u32>,
     #[nserde(default)]
     pub advanced: bool,
+    /// Time signature numerator; `0` = not written (pre-signature file, 4/4).
+    #[nserde(default)]
+    pub ts_num: u8,
+    #[nserde(default)]
+    pub ts_den: u8,
+    /// The "next every" cadence; `None` = derive from `phrase_len`.
+    #[nserde(default)]
+    pub phrase_cadence: Option<CadenceSpec>,
+    /// Whether `loop_cadence` is authoritative (it may still be `None` = off);
+    /// when `false`, derive from `loop_len` instead.
+    #[nserde(default)]
+    pub loop_cadence_set: bool,
+    #[nserde(default)]
+    pub loop_cadence: Option<CadenceSpec>,
     /// The live (livecoded) shader file; relative-to-project or absolute.
     #[nserde(default)]
     pub shader_path: Option<String>,
@@ -201,6 +246,36 @@ impl CueSpec {
             clip,
             name,
             ..Self::default()
+        }
+    }
+}
+
+impl SessionDefaults {
+    /// Resolve the time signature and cadences, falling back to the legacy
+    /// `quantum`/`phrase_len`/`loop_len` fields for a file saved before
+    /// signatures existed.
+    pub fn time_sig(&self) -> TimeSig {
+        if self.ts_num > 0 {
+            TimeSig { num: self.ts_num, den: self.ts_den.max(1) }.sanitized()
+        } else {
+            TimeSig::default()
+        }
+    }
+
+    /// Resolve the "next every" cadence, in 1/32-beat-tick note terms when
+    /// falling back to the legacy `phrase_len` (whole beats).
+    pub fn phrase_cadence(&self) -> Cadence {
+        self.phrase_cadence.map(Cadence::from).unwrap_or_else(|| {
+            Cadence::Note(self.phrase_len.max(1) * crate::commands::LOOP_TICKS_PER_BEAT)
+        })
+    }
+
+    /// Resolve the "loop every" cadence (`None` = loop on EOF only).
+    pub fn loop_cadence(&self) -> Option<Cadence> {
+        if self.loop_cadence_set {
+            self.loop_cadence.map(Cadence::from)
+        } else {
+            self.loop_len.map(Cadence::Note)
         }
     }
 }
@@ -612,12 +687,17 @@ mod tests {
             version: FORMAT_VERSION,
             defaults: SessionDefaults {
                 bpm: 128.0,
-                quantum: 4.0,
+                quantum: 3.5,
                 phrase_len: 16,
                 sync: SyncSpec::Link,
                 preserve_playhead: true,
                 loop_len: Some(128),
                 advanced: false,
+                ts_num: 7,
+                ts_den: 8,
+                phrase_cadence: Some(CadenceSpec::Bars(2)),
+                loop_cadence_set: true,
+                loop_cadence: Some(CadenceSpec::Note(16)),
                 shader_path: Some("shaders/demo.frag".into()),
             },
             clips: vec![ClipSpec {
@@ -673,6 +753,11 @@ mod tests {
         assert_eq!(back.clips[0].source.as_ref().unwrap().in_frame, 10);
         assert_eq!(back.clip_banks[0].clip_ids, vec![0]);
         assert_eq!(back.defaults.sync, SyncSpec::Link);
+        assert_eq!(back.defaults.ts_num, 7);
+        assert_eq!(back.defaults.ts_den, 8);
+        assert_eq!(back.defaults.time_sig(), TimeSig { num: 7, den: 8 });
+        assert_eq!(back.defaults.phrase_cadence(), Cadence::Bars(2));
+        assert_eq!(back.defaults.loop_cadence(), Some(Cadence::Note(16)));
         let cue = &back.cue_banks[0].cues[0];
         assert_eq!(cue.loop_phase, Some(-4));
         assert_eq!(cue.start_nudge, None);
@@ -777,6 +862,11 @@ mod tests {
             preserve_playhead: true,
             loop_len: Some(128),
             advanced: false,
+            ts_num: 4,
+            ts_den: 4,
+            phrase_cadence: Some(CadenceSpec::Bars(4)),
+            loop_cadence_set: true,
+            loop_cadence: Some(CadenceSpec::Bars(4)),
             shader_path: Some("shaders/demo.frag".into()),
         };
 
@@ -836,6 +926,13 @@ mod tests {
         migrate(&mut p);
         assert_eq!(p.version, FORMAT_VERSION);
         assert!(p.clips.is_empty());
+        // No ts_num/phrase_cadence written: resolves through the legacy fields.
+        assert_eq!(p.defaults.time_sig(), TimeSig::default());
+        assert_eq!(
+            p.defaults.phrase_cadence(),
+            Cadence::Note(16 * crate::commands::LOOP_TICKS_PER_BEAT)
+        );
+        assert_eq!(p.defaults.loop_cadence(), None);
     }
 
     #[test]

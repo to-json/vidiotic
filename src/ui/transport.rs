@@ -9,23 +9,34 @@ use egui::Ui;
 
 use phosphor::theme::{self, palette, SP_MD, SP_SM};
 use phosphor::widgets;
-use crate::commands::{Command, SyncKind, UiMirror};
+use crate::commands::{Cadence, Command, SyncKind, TimeSig, UiMirror, TIME_SIG_DENS};
 
 /// Below this available width the transport clusters stack as rows.
 const STACK_BELOW: f32 = 800.0;
 
-/// Bar-based cadence choices for the "Next every" (sequencer) grid:
-/// (label, bars). Labels are bare bar counts — the "next every" section
-/// label carries the unit.
-const CADENCE_BARS: [(&str, u32); 5] = [
-    ("1", 1),
-    ("2", 2),
-    ("4", 4),
-    ("8", 8),
-    ("16", 16),
+/// "Next every" detents: fractions are absolute note values (down to a
+/// quarter note); whole numbers are bars of the current time signature.
+const NEXT_CADENCE: [(&str, Cadence); 7] = [
+    ("1/4", Cadence::Note(32)),
+    ("1/2", Cadence::Note(64)),
+    ("1", Cadence::Bars(1)),
+    ("2", Cadence::Bars(2)),
+    ("4", Cadence::Bars(4)),
+    ("8", Cadence::Bars(8)),
+    ("16", Cadence::Bars(16)),
 ];
 
-use super::LOOP_CADENCE;
+/// "Loop every" detents (paired with an "off" entry ahead of these).
+const LOOP_CADENCE_CHOICES: [(&str, Cadence); 8] = [
+    ("1/8", Cadence::Note(16)),
+    ("1/4", Cadence::Note(32)),
+    ("1/2", Cadence::Note(64)),
+    ("1", Cadence::Bars(1)),
+    ("2", Cadence::Bars(2)),
+    ("4", Cadence::Bars(4)),
+    ("8", Cadence::Bars(8)),
+    ("16", Cadence::Bars(16)),
+];
 
 /// Run one tap button through the flash-decay temp-memory pattern: paints at
 /// the previous frame's decayed flash, then bumps it back to 1.0 if triggered
@@ -51,19 +62,27 @@ fn tap_button(
     triggered
 }
 
-/// One glyph per beat in the bar (`●` current, `○` rest): the current beat is
-/// brightest and fades toward the next; the downbeat (index 0) is tinted
-/// `phosphor` instead of `accent` so bar starts read at a glance.
+/// One glyph per subdivision of the bar (`●` current, `○` rest): the current
+/// subdivision is brightest and fades toward the next; the downbeat (index 0)
+/// is tinted `phosphor` instead of `accent` so bar starts read at a glance.
+/// The bar has `time_sig.num` subdivisions of `4/den` beats each (so BPM stays
+/// quarter-note based); pooled down past 16 so a large numerator doesn't blow
+/// the row.
 fn beat_glyphs(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
-    let n = m.quantum.round().max(1.0) as usize;
-    let current = m.phase.floor() as usize % n;
+    let num = m.time_sig.num.max(1) as usize;
+    let unit = 4.0 / m.time_sig.den.max(1) as f64;
+    let unit_idx = (m.phase / unit).floor() as usize % num;
+    let unit_frac = (m.phase / unit).fract() as f32;
+    let cells = num.min(16);
+    let current = unit_idx * cells / num;
     let cw = widgets::cell_width(ui);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(cw * n as f32, theme::ROW), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(cw * cells as f32, theme::ROW), egui::Sense::hover());
     let painter = ui.painter();
-    for i in 0..n {
+    for i in 0..cells {
         let (ch, color) = if i == current {
-            let bright = (1.0 - m.phase.fract() as f32).powi(2).clamp(0.0, 1.0);
+            let bright = (1.0 - unit_frac).powi(2).clamp(0.0, 1.0);
             let base = if i == 0 { p.phosphor } else { p.accent };
             ("●", theme::with_alpha(base, 120 + (bright * 135.0) as u8))
         } else {
@@ -83,12 +102,12 @@ fn beat_glyphs(ui: &mut Ui, m: &UiMirror) {
 /// past 32 beats), filled up to the phrase fraction.
 fn phrase_strip(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
-    let phrase_len = m.phrase_len.max(1) as f64;
-    let quantum = m.quantum.max(1.0);
+    let phrase_beats = m.phrase_beats.max(1.0);
+    let quantum = m.quantum.max(0.25);
     let progressed = m.bar_in_phrase as f64 * quantum + m.phase;
-    let frac = (progressed / phrase_len).clamp(0.0, 1.0) as f32;
+    let frac = (progressed / phrase_beats).clamp(0.0, 1.0) as f32;
 
-    let cells = (m.phrase_len.max(1) as usize).min(32);
+    let cells = (phrase_beats.ceil() as usize).clamp(1, 32);
     let filled = (frac * cells as f32).floor() as usize;
     let strip: String = (0..cells).map(|k| if k < filled { '▰' } else { '▱' }).collect();
     ui.label(egui::RichText::new(strip).monospace().color(p.blue));
@@ -160,21 +179,21 @@ fn bpm_hero_drag(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         v.widgets.inactive.fg_stroke.color = p.fg_primary;
         v.widgets.hovered.fg_stroke.color = p.accent;
         v.widgets.active.fg_stroke.color = p.accent;
-        // Reserve the full "300.0" width so neighbors don't shift as the
-        // tempo crosses 100.
+        // Reserve the full "1000.0" width so neighbors don't shift as the
+        // tempo crosses 100 or 1000.
         let cw = ui
             .painter()
             .layout_no_wrap("0".into(), hero_font, egui::Color32::WHITE)
             .size()
             .x;
-        ui.spacing_mut().interact_size.x = cw * 5.0;
+        ui.spacing_mut().interact_size.x = cw * 6.0;
 
         let mut bpm = m.bpm;
         if ui
             .add(
                 egui::DragValue::new(&mut bpm)
                     .speed(0.1)
-                    .range(20.0..=300.0)
+                    .range(20.0..=1000.0)
                     .fixed_decimals(1)
                     .update_while_editing(false),
             )
@@ -248,10 +267,12 @@ fn tap_cluster(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     }
 }
 
-/// The bar-in-phrase readout over the per-beat glyphs.
-fn bar_beat(ui: &mut Ui, m: &UiMirror) {
+/// The time signature scroller, over the bar-in-phrase readout and the
+/// per-beat glyphs.
+fn bar_beat(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     let p = palette();
     ui.vertical(|ui| {
+        sig_row(ui, m, tx);
         widgets::unit_label(
             ui,
             egui::RichText::new(format!(
@@ -262,6 +283,37 @@ fn bar_beat(ui: &mut Ui, m: &UiMirror) {
             .color(p.fg_secondary),
         );
         beat_glyphs(ui, m);
+    });
+}
+
+/// Time signature: numerator scrolls 1..=255, denominator scrolls the
+/// allowed note values. BPM stays quarter-note based regardless.
+fn sig_row(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    ui.horizontal(|ui| {
+        widgets::section_label(ui, "sig").on_hover_text(
+            "Time signature: bar length and beat subdivision. BPM stays quarter-note based.",
+        );
+        if let Some(v) =
+            widgets::detent_scroll_uint(ui, "sig_num", m.time_sig.num as u32, 1..=255, 2)
+        {
+            let _ = tx.send(Command::SetTimeSig(TimeSig { num: v as u8, den: m.time_sig.den }));
+        }
+        ui.label(egui::RichText::new("/").color(p.fg_muted));
+        let den_labels: Vec<&str> = TIME_SIG_DENS.iter().map(|d| match d {
+            1 => "1",
+            2 => "2",
+            4 => "4",
+            8 => "8",
+            _ => "16",
+        }).collect();
+        let den_selected = TIME_SIG_DENS.iter().position(|&d| d == m.time_sig.den);
+        if let Some(i) = widgets::detent_scroll(ui, "sig_den", &den_labels, den_selected, 2) {
+            let _ = tx.send(Command::SetTimeSig(TimeSig {
+                num: m.time_sig.num,
+                den: TIME_SIG_DENS[i],
+            }));
+        }
     });
 }
 
@@ -296,7 +348,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 bpm_cluster(ui, m, tx);
                 tap_cluster(ui, m, tx);
                 ui.add_space(SP_MD);
-                bar_beat(ui, m);
+                bar_beat(ui, m, tx);
                 ui.add_space(SP_MD);
                 sync_cluster(ui, m, tx);
             });
@@ -305,7 +357,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             ui.horizontal(|ui| {
                 tap_cluster(ui, m, tx);
                 ui.add_space(SP_MD);
-                bar_beat(ui, m);
+                bar_beat(ui, m, tx);
             });
             ui.horizontal_wrapped(|ui| sync_cluster(ui, m, tx));
         }
@@ -314,12 +366,15 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         // the next active clip; `Loop` = how often the current clip restarts.
         // Wrapped: the bracket lists break between items on a narrow window.
         ui.horizontal_wrapped(|ui| {
-            widgets::section_label(ui, "next every")
-                .on_hover_text("Beats between auto-transitions to the next active clip");
-            let next_labels: Vec<&str> = CADENCE_BARS.iter().map(|(l, _)| *l).collect();
-            let next_selected = CADENCE_BARS.iter().position(|(_, bars)| bars * 4 == m.phrase_len);
-            if let Some(i) = widgets::segmented(ui, "next_cadence", &next_labels, next_selected) {
-                let _ = tx.send(Command::SetPhraseLen(CADENCE_BARS[i].1 * 4));
+            widgets::section_label(ui, "next every").on_hover_text(
+                "Musical length between auto-transitions to the next active clip",
+            );
+            let next_labels: Vec<&str> = NEXT_CADENCE.iter().map(|(l, _)| *l).collect();
+            let phrase_ticks = m.phrase_cadence.ticks(m.time_sig);
+            let next_selected =
+                NEXT_CADENCE.iter().position(|(_, c)| c.ticks(m.time_sig) == phrase_ticks);
+            if let Some(i) = widgets::detent_scroll(ui, "next_cadence", &next_labels, next_selected, 3) {
+                let _ = tx.send(Command::SetPhraseCadence(NEXT_CADENCE[i].1));
             }
 
             ui.add_space(SP_MD);
@@ -327,15 +382,19 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 widgets::section_label(ui, "loop every")
                     .on_hover_text("Force the current clip back to its start on this beat grid");
                 let loop_labels: Vec<&str> =
-                    std::iter::once("off").chain(LOOP_CADENCE.iter().map(|(l, _)| *l)).collect();
-                let loop_selected = m.loop_len.map_or(0, |beats| {
-                    LOOP_CADENCE.iter().position(|(_, b)| *b == beats).map_or(0, |i| i + 1)
+                    std::iter::once("off").chain(LOOP_CADENCE_CHOICES.iter().map(|(l, _)| *l)).collect();
+                let loop_selected = m.loop_cadence.map_or(0, |c| {
+                    let ticks = c.ticks(m.time_sig);
+                    LOOP_CADENCE_CHOICES
+                        .iter()
+                        .position(|(_, lc)| lc.ticks(m.time_sig) == ticks)
+                        .map_or(0, |i| i + 1)
                 });
                 if let Some(i) =
-                    widgets::segmented(ui, "loop_cadence", &loop_labels, Some(loop_selected))
+                    widgets::detent_scroll(ui, "loop_cadence", &loop_labels, Some(loop_selected), 3)
                 {
-                    let beats = if i == 0 { None } else { Some(LOOP_CADENCE[i - 1].1) };
-                    let _ = tx.send(Command::SetLoopLen(beats));
+                    let cadence = if i == 0 { None } else { Some(LOOP_CADENCE_CHOICES[i - 1].1) };
+                    let _ = tx.send(Command::SetLoopCadence(cadence));
                 }
             });
 

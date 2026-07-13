@@ -36,6 +36,9 @@ pub trait ClockSource {
     fn snapshot(&mut self) -> ClockSnapshot;
     /// Set an absolute tempo, clamped to the source's supported range.
     fn set_bpm(&mut self, bpm: f64);
+    /// Change the bar length in beats (a time-signature edit). Beat
+    /// continuity is unaffected; only phase/downbeat derivation changes.
+    fn set_quantum(&mut self, quantum: f64);
     /// Multiply tempo by `1 + ratio`; `ratio = ±0.001` for the ±0.1% controls.
     fn nudge_bpm(&mut self, ratio: f64);
     /// Make "now" an exact quantum (bar) boundary — sets the downbeat anchor.
@@ -47,7 +50,7 @@ pub trait ClockSource {
 }
 
 const BPM_MIN: f64 = 20.0;
-const BPM_MAX: f64 = 999.0;
+const BPM_MAX: f64 = 1000.0;
 
 /// App-owned clock: beats accrue from host time at the current tempo, anchored
 /// so tempo changes and taps never re-price already-elapsed time.
@@ -107,6 +110,10 @@ impl ClockSource for InternalClock {
     fn set_bpm(&mut self, bpm: f64) {
         self.reanchor();
         self.bpm = bpm.clamp(BPM_MIN, BPM_MAX);
+    }
+
+    fn set_quantum(&mut self, quantum: f64) {
+        self.quantum = quantum.max(0.25);
     }
 
     fn nudge_bpm(&mut self, ratio: f64) {
@@ -183,6 +190,12 @@ impl ClockSource for LinkClock {
     // the engine calls them generically for any source; `caps()` tells the UI
     // to disable the controls that route here.
     fn set_bpm(&mut self, _bpm: f64) {}
+
+    // Local only: the bar length is a display concern, not part of the
+    // shared Link session state.
+    fn set_quantum(&mut self, quantum: f64) {
+        self.quantum = quantum.max(0.25);
+    }
 
     fn nudge_bpm(&mut self, _ratio: f64) {}
 
@@ -289,6 +302,25 @@ mod tests {
         // beat must not jump on a tempo change (allow tiny elapsed advance)
         assert!((b1 - b0).abs() < 0.05, "beat jumped by {}", b1 - b0);
         assert_eq!(c.snapshot().bpm, 174.0);
+    }
+
+    #[test]
+    fn internal_clock_quantum_change_is_continuous() {
+        let mut c = InternalClock::new(120.0, 4.0);
+        let b0 = c.snapshot().beat;
+        c.set_quantum(3.5);
+        let s = c.snapshot();
+        // beat must not jump on a signature change (allow tiny elapsed advance)
+        assert!((s.beat - b0).abs() < 0.05, "beat jumped by {}", s.beat - b0);
+        assert_eq!(s.quantum, 3.5);
+        assert_eq!(s.phase, s.beat.rem_euclid(3.5));
+    }
+
+    #[test]
+    fn bpm_clamps_to_max() {
+        let mut c = InternalClock::new(120.0, 4.0);
+        c.set_bpm(1200.0);
+        assert_eq!(c.snapshot().bpm, BPM_MAX);
     }
 
     #[test]

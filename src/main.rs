@@ -9,11 +9,9 @@ use vidiotic::app::{self, Boot};
 use vidiotic::audio;
 use vidiotic::bank::Bank;
 use vidiotic::clippool::{self, Clip, ClipBank};
-use vidiotic::commands::{ClipId, Command, SyncKind};
+use vidiotic::commands::{Cadence, ClipId, Command, SyncKind, TimeSig, LOOP_TICKS_PER_BEAT};
 use vidiotic::project;
 use vidiotic::transcode;
-
-const QUANTUM: f64 = 4.0;
 
 #[derive(Parser)]
 #[command(name = "vidiotic", version, about = "VJ controller: audio-reactive shader over video clips")]
@@ -118,10 +116,11 @@ struct Loaded {
     /// The `.viproj` this was loaded from, if any (the default save target).
     project_path: Option<PathBuf>,
     bpm: f64,
-    phrase_len: u32,
+    time_sig: TimeSig,
+    phrase_cadence: Cadence,
     sync: SyncKind,
     preserve_playhead: bool,
-    loop_len: Option<u32>,
+    loop_cadence: Option<Cadence>,
     advanced: bool,
     shader: PathBuf,
 }
@@ -178,13 +177,14 @@ fn load_from_flags(cli: &RunArgs) -> anyhow::Result<Loaded> {
         clip_meta: HashMap::new(),
         project_path: None,
         bpm: cli.bpm,
-        phrase_len: cli.phrase_len,
+        time_sig: TimeSig::default(),
+        phrase_cadence: Cadence::Note(cli.phrase_len.max(1) * LOOP_TICKS_PER_BEAT),
         sync: match cli.sync {
             SyncArg::Internal => SyncKind::Internal,
             SyncArg::Link => SyncKind::Link,
         },
         preserve_playhead: true,
-        loop_len: None,
+        loop_cadence: None,
         advanced: false,
         shader,
     })
@@ -295,13 +295,18 @@ fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
         clip_meta,
         project_path: Some(path.to_path_buf()),
         bpm: if d.bpm > 0.0 { d.bpm } else { cli.bpm },
-        phrase_len: if d.phrase_len > 0 { d.phrase_len } else { cli.phrase_len },
+        time_sig: d.time_sig(),
+        phrase_cadence: if d.phrase_cadence.is_some() || d.phrase_len > 0 {
+            d.phrase_cadence()
+        } else {
+            Cadence::Note(cli.phrase_len.max(1) * LOOP_TICKS_PER_BEAT)
+        },
         sync: match d.sync {
             project::SyncSpec::Internal => SyncKind::Internal,
             project::SyncSpec::Link => SyncKind::Link,
         },
         preserve_playhead: d.preserve_playhead,
-        loop_len: d.loop_len,
+        loop_cadence: d.loop_cadence(),
         advanced: d.advanced,
         shader,
     })
@@ -342,8 +347,8 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         windowed: cli.windowed,
         monitor: cli.monitor,
         bpm: loaded.bpm,
-        quantum: QUANTUM,
-        phrase_len: loaded.phrase_len,
+        time_sig: loaded.time_sig,
+        phrase_cadence: loaded.phrase_cadence,
         initial_sync: loaded.sync,
         clips: loaded.clips,
         clip_banks: loaded.clip_banks,
@@ -352,7 +357,7 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         clip_meta: loaded.clip_meta,
         project_path: loaded.project_path,
         preserve_playhead: loaded.preserve_playhead,
-        loop_len: loaded.loop_len,
+        loop_cadence: loaded.loop_cadence,
         advanced: loaded.advanced,
         thumb_rx,
         audio_out,

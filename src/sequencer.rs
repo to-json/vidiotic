@@ -244,8 +244,8 @@ impl Sequencer {
     /// Change the global default dwell (the "next every" phrase length). Any
     /// armed cue is disarmed (its fire beat was computed against the old length);
     /// it re-arms at the new window's arm point.
-    pub fn set_phrase_len(&mut self, beats: u32) -> Vec<SequencerEvent> {
-        self.default_dwell = beats.max(1) as f64;
+    pub fn set_phrase_len(&mut self, beats: f64) -> Vec<SequencerEvent> {
+        self.default_dwell = beats.max(1.0);
         if let SeqState::PlayingArmed { cue, started, .. } = self.state {
             self.state = SeqState::Playing { cue, started };
             return vec![SequencerEvent::DisarmDecoder];

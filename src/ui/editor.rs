@@ -534,7 +534,8 @@ fn dwell_row(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     ui.horizontal(|ui| {
         let mut inherit = cue.dwell.is_none();
         if widgets::glyph_checkbox(ui, &mut inherit, "inherit").changed() {
-            let cmd = (!inherit).then(|| m.phrase_len.max(1) * LOOP_TICKS_PER_BEAT);
+            let cmd = (!inherit)
+                .then(|| (m.phrase_beats.max(1.0) * LOOP_TICKS_PER_BEAT as f64).round() as u32);
             let _ = tx.send(Command::SetCueParam(cue.id, CueParam::Dwell(cmd)));
         }
         match cue.dwell {
@@ -556,7 +557,8 @@ fn dwell_row(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             }
             None => {
                 ui.label(
-                    egui::RichText::new(format!("{} b (global)", m.phrase_len)).color(p.fg_muted),
+                    egui::RichText::new(format!("{:.2} b (global)", m.phrase_beats))
+                        .color(p.fg_muted),
                 );
             }
         }

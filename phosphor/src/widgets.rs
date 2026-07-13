@@ -80,6 +80,112 @@ pub fn segmented(
     clicked
 }
 
+/// How far a drag must travel (in points) to step one detent.
+const DETENT_DRAG_STEP: f32 = 24.0;
+/// How far the wheel-scroll accumulator must travel (in points) to step one detent.
+const DETENT_SCROLL_STEP: f32 = 40.0;
+
+/// Scroll-with-detents selector: shows the current choice as `[ label ]`.
+/// Left-click steps forward one detent, right-click steps back one; a
+/// horizontal click-and-drag scrubs continuously (same "grab it" feel as
+/// [`fader`]); hovering and scrolling the wheel also steps through the
+/// detents. Values wrap around at either end. Renders `--` when `selected`
+/// is `None`. Returns the newly selected index when the user steps to a
+/// different one.
+pub fn detent_scroll(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    labels: &[&str],
+    selected: Option<usize>,
+    width_chars: usize,
+) -> Option<usize> {
+    let text = match selected {
+        Some(i) => format!("[{:^width$}]", labels[i], width = width_chars),
+        None => format!("[{:^width$}]", "--", width = width_chars),
+    };
+    let id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = detent_frame(ui, &text);
+    let stepped = detent_step(ui, id, &resp, labels.len());
+    let new_selected = stepped.map(|delta| {
+        let cur = selected.unwrap_or(0) as i32;
+        (cur + delta).rem_euclid(labels.len() as i32) as usize
+    });
+    detent_paint(ui, rect, &text, resp.hovered());
+    new_selected.filter(|&i| Some(i) != selected)
+}
+
+/// `detent_scroll` for a bare integer within `range` (wraps at either end).
+/// Returns the new value when it changes.
+pub fn detent_scroll_uint(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    v: u32,
+    range: std::ops::RangeInclusive<u32>,
+    width_chars: usize,
+) -> Option<u32> {
+    let text = format!("[{:^width$}]", v, width = width_chars);
+    let id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = detent_frame(ui, &text);
+    let span = *range.end() as i64 - *range.start() as i64 + 1;
+    let stepped = detent_step(ui, id, &resp, span as usize);
+    let new_v = stepped.map(|delta| {
+        let cur = v as i64 - *range.start() as i64;
+        (*range.start() as i64 + (cur + delta as i64).rem_euclid(span)) as u32
+    });
+    detent_paint(ui, rect, &text, resp.hovered());
+    new_v.filter(|&x| x != v)
+}
+
+/// Allocate the fixed-width cell for a detent scroller, sensing click and
+/// drag (painting happens after step handling so the updated value shows
+/// immediately).
+fn detent_frame(ui: &mut Ui, text: &str) -> (Rect, Response) {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), mono(), Color32::WHITE);
+    ui.allocate_exact_size(egui::vec2(galley.size().x, ROW), Sense::click_and_drag())
+}
+
+/// Resolve this frame's interaction into a whole-detent step: a left-click
+/// is `+1` and a right-click is `-1`, both immediate; otherwise a horizontal
+/// drag or (while hovered) the wheel accumulates into `id`'s stored offset
+/// and steps whenever it crosses a threshold. `count` gates how many detents
+/// exist so a lone detent never "steps".
+fn detent_step(ui: &mut Ui, id: egui::Id, resp: &Response, count: usize) -> Option<i32> {
+    if count <= 1 {
+        return None;
+    }
+    if resp.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(id, 0.0_f32));
+        return Some(1);
+    }
+    if resp.secondary_clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(id, 0.0_f32));
+        return Some(-1);
+    }
+    let mut accum: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let step_size = if resp.dragged() {
+        accum += resp.drag_delta().x;
+        DETENT_DRAG_STEP
+    } else if resp.hovered() {
+        accum += ui.input(|i| i.smooth_scroll_delta.y);
+        DETENT_SCROLL_STEP
+    } else {
+        accum = 0.0;
+        DETENT_SCROLL_STEP
+    };
+    let steps = (accum / step_size).trunc() as i32;
+    accum -= steps as f32 * step_size;
+    ui.ctx().data_mut(|d| d.insert_temp(id, accum));
+    (steps != 0).then_some(steps)
+}
+
+/// Paint a detent scroller's bracketed text: accent on hover, primary
+/// otherwise (mirrors [`segmented`]'s selected-item coloring).
+fn detent_paint(ui: &mut Ui, rect: Rect, text: &str, hovered: bool) {
+    let p = palette();
+    let color = if hovered { p.accent } else { p.fg_primary };
+    ui.painter().text(egui::pos2(rect.min.x, rect.center().y), Align2::LEFT_CENTER, text, mono(), color);
+}
+
 /// Small lowercase muted label for grouping controls, e.g. "next every".
 /// Never splits: in a wrapped row it moves to the next line as a unit.
 pub fn section_label(ui: &mut Ui, text: &str) -> Response {
