@@ -501,22 +501,25 @@ void main() {
 
     #[test]
     fn bundled_isf_shaders_compile() {
-        // Every shipped `.fs` ISF example must survive header parse, transpile,
-        // and naga parse+validate.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        // Every shipped `.fs` ISF shader — ours in shaders/, vendored ones in
+        // shaders/vidvox/ — must survive header parse, transpile, and naga
+        // parse+validate.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).expect("shaders dir") {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("fs") {
-                continue;
+        for dir in [root.clone(), root.join("vidvox")] {
+            for entry in std::fs::read_dir(&dir).expect("shaders dir") {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("fs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                let prog = crate::isf::transpile(&src)
+                    .unwrap_or_else(|| panic!("{} is not a valid ISF shader", path.display()));
+                if let Err(e) = compile_isf_program(&prog) {
+                    panic!("ISF {} failed to compile:\n{e}", path.display());
+                }
+                checked += 1;
             }
-            let src = std::fs::read_to_string(&path).unwrap();
-            let prog = crate::isf::transpile(&src)
-                .unwrap_or_else(|| panic!("{} is not a valid ISF shader", path.display()));
-            if let Err(e) = compile_isf_program(&prog) {
-                panic!("ISF {} failed to compile:\n{e}", path.display());
-            }
-            checked += 1;
         }
         assert!(checked >= 1, "expected at least one bundled .fs ISF example");
     }

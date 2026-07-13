@@ -180,6 +180,12 @@ const BUILTIN_EFFECTS: &[(&str, &str)] = &[
     ("glitch-vhs", include_str!("../shaders/glitch-vhs.frag")),
     ("chroma-punch", include_str!("../shaders/chroma-punch.frag")),
     ("spectrum-warp", include_str!("../shaders/spectrum-warp.frag")),
+    ("pixellate", include_str!("../shaders/pixellate.frag")),
+    ("strobe", include_str!("../shaders/strobe.frag")),
+    ("tile", include_str!("../shaders/tile.frag")),
+    ("posterize", include_str!("../shaders/posterize.frag")),
+    ("edge-neon", include_str!("../shaders/edge-neon.frag")),
+    ("wave-warp", include_str!("../shaders/wave-warp.frag")),
 ];
 
 /// Two persistent offscreen color buffers ping-ponged between chain stages,

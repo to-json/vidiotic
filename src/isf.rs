@@ -875,6 +875,7 @@ pub fn transpile(src: &str) -> Option<IsfProgram> {
     let tex_inputs = tex_inputs_of(&header);
 
     let additions = generate_additions(&header, &targets, &tex_inputs);
+    let renames = rename_map(&header, &targets, &tex_inputs);
 
     let mut combined = String::new();
     combined.push_str(PREAMBLE);
@@ -882,7 +883,7 @@ pub fn transpile(src: &str) -> Option<IsfProgram> {
     combined.push_str(&additions);
     debug_assert!(combined.ends_with('\n'));
     let preamble_lines = combined.lines().count() as u32;
-    combined.push_str(&strip_body(&body));
+    combined.push_str(&rewrite_names(&strip_body(&body), &renames));
     combined.push('\n');
 
     Some(IsfProgram {
@@ -916,8 +917,9 @@ fn tex_inputs_of(header: &IsfHeader) -> Vec<IsfTexInput> {
 }
 
 /// The ISF prelude appended after the base `PREAMBLE`: built-in aliases, the
-/// `IMG_*` accessors, the parameter UBO, per-input `#define`s, and the named
-/// pass-target samplers.
+/// `IMG_*` accessors, the parameter UBO, and the named pass-target samplers.
+/// Author-chosen input/target names are mapped by [`rewrite_names`] in the
+/// body, not by `#define`s here.
 fn generate_additions(
     header: &IsfHeader,
     targets: &[IsfTarget],
@@ -992,39 +994,86 @@ fn generate_additions(
             let b = i + 2;
             s.push_str(&format!("layout(set = 3, binding = {b}) uniform texture2D {name}Tex;\n"));
         }
-        for t in targets {
-            s.push_str(&format!("#define {0} sampler2D({0}Tex, isfSmp)\n", t.name));
-        }
-        for t in tex_inputs {
-            s.push_str(&format!("#define {0} sampler2D({0}Tex, isfSmp)\n", t.name));
-        }
     }
+    s.push_str("// ---- end ISF compatibility ----\n");
+    s
+}
 
-    // Per-input #defines mapping the bare ISF name onto the UBO field / sampler.
+/// The author-chosen names the transpiler must map onto its own bindings —
+/// scalar inputs onto UBO fields, image-like names onto combined samplers.
+/// These are rewritten in the body by [`rewrite_names`] rather than `#define`d:
+/// a macro also expands member/swizzle accesses (`c.r` breaks the moment an
+/// input is named `r`), which no preprocessor can avoid.
+fn rename_map(
+    header: &IsfHeader,
+    targets: &[IsfTarget],
+    tex_inputs: &[IsfTexInput],
+) -> Vec<(String, String)> {
+    let mut map = Vec::new();
     for input in &header.inputs {
         let n = &input.name;
         match &input.kind {
             IsfInputKind::Bool { .. } | IsfInputKind::Event => {
-                s.push_str(&format!("#define {n} (uISF.in_{n} != 0)\n"));
+                map.push((n.clone(), format!("(uISF.in_{n} != 0)")));
             }
             IsfInputKind::Float { .. }
             | IsfInputKind::Long { .. }
             | IsfInputKind::Color { .. }
             | IsfInputKind::Point2D { .. } => {
-                s.push_str(&format!("#define {n} uISF.in_{n}\n"));
+                map.push((n.clone(), format!("uISF.in_{n}")));
             }
             IsfInputKind::Image => {
                 // Generic image inputs (no host source routing) alias to the
                 // effect's stage input.
-                s.push_str(&format!("#define {n} sampler2D(inputTex, inputSmp)\n"));
+                map.push((n.clone(), "sampler2D(inputTex, inputSmp)".into()));
             }
-            // Audio inputs are set=3 textures; their `#define` is emitted with the
-            // rest of the `tex_inputs` above.
+            // Audio inputs are set=3 textures, covered via `tex_inputs` below.
             IsfInputKind::Audio | IsfInputKind::AudioFft => {}
         }
     }
-    s.push_str("// ---- end ISF compatibility ----\n");
-    s
+    for t in targets {
+        map.push((t.name.clone(), format!("sampler2D({}Tex, isfSmp)", t.name)));
+    }
+    for t in tex_inputs {
+        map.push((t.name.clone(), format!("sampler2D({}Tex, isfSmp)", t.name)));
+    }
+    map
+}
+
+/// Replace whole-identifier occurrences of each rename in `body`, skipping
+/// member/swizzle accesses (an identifier preceded by `.`, whitespace allowed
+/// between). Replacements are single-line, so body line numbers are preserved.
+fn rewrite_names(body: &str, renames: &[(String, String)]) -> String {
+    if renames.is_empty() {
+        return body.to_string();
+    }
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut after_dot = false; // last non-whitespace char was `.`
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &body[start..i];
+            match renames.iter().find(|(n, _)| !after_dot && n == ident) {
+                Some((_, repl)) => out.push_str(repl),
+                None => out.push_str(ident),
+            }
+            after_dot = false;
+        } else {
+            let ch = body[i..].chars().next().expect("in-bounds char");
+            out.push(ch);
+            if !ch.is_whitespace() {
+                after_dot = ch == '.';
+            }
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// Blank `#version` / `precision` lines in the ISF body (naga uses the base
@@ -1196,7 +1245,8 @@ void main() { gl_FragColor = IMG_NORM_PIXEL(bufA, isf_FragNormCoord); }
         assert_eq!(prog.targets[0].writer_pass, 0);
         assert_eq!(prog.passes.len(), 2);
         assert!(prog.combined.contains("uniform texture2D bufATex"));
-        assert!(prog.combined.contains("#define bufA sampler2D(bufATex, isfSmp)"));
+        // the body's `bufA` reference is rewritten onto the sampler pair
+        assert!(prog.combined.contains("IMG_NORM_PIXEL(sampler2D(bufATex, isfSmp), isf_FragNormCoord)"));
     }
 
     #[test]
@@ -1227,7 +1277,7 @@ void main() { gl_FragColor = IMG_NORM_PIXEL(spectrum, vec2(isf_FragNormCoord.x, 
         assert!(prog
             .combined
             .contains("layout(set = 3, binding = 4) uniform texture2D spectrumTex;"));
-        assert!(prog.combined.contains("#define spectrum sampler2D(spectrumTex, isfSmp)"));
+        assert!(prog.combined.contains("IMG_NORM_PIXEL(sampler2D(spectrumTex, isfSmp), vec2(isf_FragNormCoord.x, 0.0))"));
     }
 
     #[test]
@@ -1250,9 +1300,49 @@ void main() { gl_FragColor = IMG_THIS_NORM_PIXEL(noise) + IMG_THIS_NORM_PIXEL(wa
                 },
             ]
         );
-        // wave@2, noise@3; both get a sampler #define.
+        // wave@2, noise@3; both body references rewrite onto sampler pairs.
         assert!(prog.combined.contains("layout(set = 3, binding = 3) uniform texture2D noiseTex;"));
-        assert!(prog.combined.contains("#define noise sampler2D(noiseTex, isfSmp)"));
+        assert!(prog.combined.contains("IMG_THIS_NORM_PIXEL(sampler2D(noiseTex, isfSmp))"));
+    }
+
+    #[test]
+    fn rewrite_names_spares_swizzles() {
+        let renames = vec![
+            ("r".to_string(), "(uISF.in_r != 0)".to_string()),
+            ("rate".to_string(), "uISF.in_rate".to_string()),
+        ];
+        // plain identifier uses are rewritten
+        assert_eq!(rewrite_names("if (r) x = rate;", &renames), "if ((uISF.in_r != 0)) x = uISF.in_rate;");
+        // member/swizzle accesses are not, even with whitespace around the dot
+        assert_eq!(rewrite_names("c.r = c . r;", &renames), "c.r = c . r;");
+        // longer identifiers sharing a prefix are untouched
+        assert_eq!(rewrite_names("rated = ratio;", &renames), "rated = ratio;");
+        // no rename after a float literal's trailing dot (exponent-style tokens)
+        assert_eq!(rewrite_names("x = 1.r;", &renames), "x = 1.r;");
+        // multibyte chars pass through intact
+        assert_eq!(rewrite_names("// crédit — r\nfloat x = rate;", &renames), "// crédit — (uISF.in_r != 0)\nfloat x = uISF.in_rate;");
+    }
+
+    #[test]
+    fn transpile_rewrites_swizzle_colliding_input_names() {
+        // The RGB Strobe shape: bool inputs named after swizzle selectors. A
+        // #define would also expand `c.r`; the body rewrite must not.
+        let src = r#"/*{
+            "INPUTS": [
+                { "NAME": "r", "TYPE": "bool", "DEFAULT": 1.0 },
+                { "NAME": "g", "TYPE": "bool", "DEFAULT": 1.0 }
+            ]
+        }*/
+void main() {
+    vec4 c = IMG_THIS_NORM_PIXEL(inputImage);
+    if (r) c.r = 1.0 - c.r;
+    if (g) c.g = 1.0 - c.g;
+    gl_FragColor = c;
+}
+"#;
+        let prog = transpile(src).unwrap();
+        assert!(prog.combined.contains("if ((uISF.in_r != 0)) c.r = 1.0 - c.r;"));
+        assert!(prog.combined.contains("if ((uISF.in_g != 0)) c.g = 1.0 - c.g;"));
     }
 
     #[test]
