@@ -31,7 +31,8 @@ use crate::sequencer::{CueStep, Sequencer, SequencerEvent};
 use crate::shader::lang_of;
 use crate::shaderwatch::ShaderWatcher;
 use crate::ui::EguiCtl;
-use crate::video::decoder::{self, DecodeHandle};
+use crate::video::decoder;
+use crate::video::SourceHandle;
 use crate::video::frame::DecodedFrame;
 
 const SHADER_DEBOUNCE: Duration = Duration::from_millis(75);
@@ -117,7 +118,7 @@ pub struct App {
     edit_bank: usize,
     selected_cue: Option<CueId>,
     next_cue_id: CueId,
-    decoders: HashMap<CueId, DecodeHandle>,
+    decoders: HashMap<CueId, SourceHandle>,
     current: Option<CueId>,
     current_pts: f64, // playhead of the displayed clip, for set-in/out-to-playhead
     video_mode: i32,
@@ -338,7 +339,7 @@ impl App {
         if let Some(path) = self.clip_path(clip) {
             match decoder::spawn(path, in_sec, out_sec, speed) {
                 Ok(h) => {
-                    self.decoders.insert(id, h);
+                    self.decoders.insert(id, SourceHandle::File(h));
                 }
                 Err(e) => log::error!("decode spawn for cue {id} (clip {clip}): {e:#}"),
             }
@@ -1031,14 +1032,12 @@ impl App {
             self.loop_tracker.reset();
         }
 
-        // 6. Pull the newest frame from the current clip and upload it.
+        // 6. Pull the newest frame from the current source and upload it.
         if let Some(cur) = self.current {
-            let mut newest: Option<DecodedFrame> = None;
-            if let Some(h) = self.decoders.get(&cur) {
-                while let Ok(f) = h.frames.try_recv() {
-                    newest = Some(f);
-                }
-            }
+            let newest: Option<DecodedFrame> = self
+                .decoders
+                .get_mut(&cur)
+                .and_then(|h| h.poll_newest(Instant::now()));
             if let Some(frame) = newest {
                 self.current_pts = frame.pts_sec;
                 self.video_mode = frame.pixels.video_mode();

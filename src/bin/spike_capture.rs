@@ -6,6 +6,11 @@
 //! Usage: `spike_capture [device-index] [seconds]` — defaults to device 0 for
 //! 3 seconds. Run with no capture args after plugging/unplugging devices to
 //! re-check enumeration.
+//!
+//! `spike_capture milestone [device-index]` runs the Stream 2 go/no-go: a
+//! `CaptureService` feeding a live tap and a 1.5 s delayed tap, both rendered
+//! through the real `Renderer` offscreen path, asserting the delayed tap's
+//! frames trail the live edge by the requested delay.
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
@@ -28,7 +33,11 @@ mod macos {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .init();
         let mut args = std::env::args().skip(1);
-        let pick: Option<usize> = args.next().and_then(|a| a.parse().ok());
+        let first = args.next();
+        if first.as_deref() == Some("milestone") {
+            return milestone(args.next().and_then(|a| a.parse().ok()));
+        }
+        let pick: Option<usize> = first.and_then(|a| a.parse().ok());
         let secs: f64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(3.0);
 
         // -- Permission --------------------------------------------------
@@ -189,5 +198,128 @@ mod macos {
             Ok(_) => "ok".into(),
             Err(e) => format!("err({e:#})"),
         }
+    }
+
+    const DELAY: f64 = 1.5;
+    const RUN_FOR: Duration = Duration::from_secs(5);
+
+    /// Stream 2 go/no-go: CaptureService + live tap + delayed tap through the
+    /// real offscreen render path. Passes when the delayed tap's frames trail
+    /// the live edge by the requested delay (within a couple frame periods)
+    /// and both taps render through `Renderer` without error.
+    fn milestone(pick: Option<usize>) -> anyhow::Result<()> {
+        use vidiotic::render::{Globals, Renderer};
+        use vidiotic::video::capture::{CaptureService, ServiceStatus};
+
+        let devices = capture::enumerate();
+        let dev = pick
+            .and_then(|i| devices.iter().find(|d| d.index == i))
+            .or_else(|| devices.first())
+            .ok_or_else(|| anyhow::anyhow!("no capture devices found"))?;
+        println!("milestone: service on [{}] {:?} (uid={})", dev.index, dev.name, dev.uid);
+
+        let service = CaptureService::start(dev.uid.clone());
+        let t0 = Instant::now();
+        loop {
+            match service.status() {
+                ServiceStatus::Running { width, height, fps } => {
+                    println!("service running: {width}x{height} @ {fps:.2} fps");
+                    break;
+                }
+                ServiceStatus::Failed(e) => anyhow::bail!("service failed: {e}"),
+                ServiceStatus::Starting if t0.elapsed() > Duration::from_secs(10) => {
+                    anyhow::bail!("service did not start within 10s")
+                }
+                ServiceStatus::Starting => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+
+        // Offscreen GPU + the real renderer (mirrors spike_render's harness).
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("spike-capture-device"),
+                required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            }))?;
+        let mut renderer = Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_globals(&queue, &Globals::default());
+
+        let mut live = service.tap();
+        let mut delayed = service.tap();
+        delayed.delay_eff = DELAY;
+
+        let (mut live_frames, mut delayed_frames, mut renders) = (0u32, 0u32, 0u32);
+        let mut live_edge_pts = 0.0f64;
+        let mut worst_lag_err = 0.0f64;
+        let mut lag_samples = 0u32;
+        let deadline = Instant::now() + RUN_FOR;
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            if let Some(f) = live.poll(now) {
+                live_frames += 1;
+                live_edge_pts = f.pts_sec;
+                render_offscreen(&device, &queue, &mut renderer, &f);
+                renders += 1;
+            }
+            if let Some(f) = delayed.poll(now) {
+                delayed_frames += 1;
+                // Only judge the lag once the ring holds a full DELAY of
+                // history; before that the tap clamps to the oldest frame.
+                if live_edge_pts > DELAY + 0.2 {
+                    let lag = live_edge_pts - f.pts_sec;
+                    worst_lag_err = f64::max(worst_lag_err, (lag - DELAY).abs());
+                    lag_samples += 1;
+                }
+                render_offscreen(&device, &queue, &mut renderer, &f);
+                renders += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(service); // detached teardown; process exit races it, which is fine
+
+        println!(
+            "live={live_frames} delayed={delayed_frames} renders={renders} \
+             lag_samples={lag_samples} worst_lag_err={worst_lag_err:.3}s"
+        );
+        let ok = live_frames > 60
+            && delayed_frames > 30
+            && lag_samples > 10
+            && worst_lag_err < 0.1;
+        println!("{}", if ok { "MILESTONE PASS" } else { "MILESTONE FAIL" });
+        std::process::exit(i32::from(!ok));
+    }
+
+    /// Upload a frame and run the real render pass into a throwaway offscreen
+    /// target — the point is exercising the upload/render path, not the pixels.
+    fn render_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut vidiotic::render::Renderer,
+        frame: &vidiotic::video::frame::DecodedFrame,
+    ) {
+        renderer.upload_frame(device, queue, frame);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        renderer.render(device, queue, &mut encoder, &view, 64, 64);
+        queue.submit([encoder.finish()]);
     }
 }
