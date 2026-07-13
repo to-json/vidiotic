@@ -1000,7 +1000,8 @@ fn generate_additions(
 }
 
 /// The author-chosen names the transpiler must map onto its own bindings —
-/// scalar inputs onto UBO fields, image-like names onto combined samplers.
+/// scalar inputs onto UBO fields, image-like names onto combined samplers —
+/// plus `gl_FragCoord`, remapped onto the GL bottom-left origin ISF assumes.
 /// These are rewritten in the body by [`rewrite_names`] rather than `#define`d:
 /// a macro also expands member/swizzle accesses (`c.r` breaks the moment an
 /// input is named `r`), which no preprocessor can avoid.
@@ -1037,6 +1038,14 @@ fn rename_map(
     for t in tex_inputs {
         map.push((t.name.clone(), format!("sampler2D({}Tex, isfSmp)", t.name)));
     }
+    // GL's gl_FragCoord has a bottom-left origin; naga/wgpu's is top-left. ISF
+    // bodies assume the GL convention (and the IMG_* macros flip Y expecting
+    // it), so flip per pass. Replacements are not re-scanned, so the
+    // self-reference stays literal.
+    map.push((
+        "gl_FragCoord".into(),
+        "(vec4(gl_FragCoord.x, uISF.renderSize.y - gl_FragCoord.y, gl_FragCoord.zw))".into(),
+    ));
     map
 }
 
@@ -1343,6 +1352,21 @@ void main() {
         let prog = transpile(src).unwrap();
         assert!(prog.combined.contains("if ((uISF.in_r != 0)) c.r = 1.0 - c.r;"));
         assert!(prog.combined.contains("if ((uISF.in_g != 0)) c.g = 1.0 - c.g;"));
+    }
+
+    #[test]
+    fn transpile_flips_frag_coord_origin() {
+        // ISF bodies assume GL's bottom-left gl_FragCoord; naga's is top-left.
+        // The CMYK Halftone shape: sample positions computed from gl_FragCoord
+        // and passed to IMG_PIXEL must land on the un-mirrored pixel.
+        let src = r#"/*{ "ISFVSN": "2.0" }*/
+void main() { gl_FragColor = IMG_PIXEL(inputImage, gl_FragCoord.xy); }
+"#;
+        let prog = transpile(src).unwrap();
+        assert!(prog.combined.contains(
+            "(vec4(gl_FragCoord.x, uISF.renderSize.y - gl_FragCoord.y, gl_FragCoord.zw)).xy"
+        ));
+        crate::shader::compile_isf_program(&prog).expect("flipped FragCoord compiles");
     }
 
     #[test]
