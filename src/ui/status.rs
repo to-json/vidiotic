@@ -111,9 +111,10 @@ fn pinned_shaders(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 // justified vertical layout (the click landed in the popup,
                 // closing it, but not on the sub-rect chip expected).
                 ui.label(egui::RichText::new(s.name.as_ref()).monospace().color(p.fg_secondary));
-                if widgets::bracket_button(ui, icon::DELETE, Some(p.error), 0.0)
-                    .on_hover_text("unpin")
-                    .clicked()
+                if !s.builtin
+                    && widgets::bracket_button(ui, icon::DELETE, Some(p.error), 0.0)
+                        .on_hover_text("unpin")
+                        .clicked()
                 {
                     let _ = tx.send(Command::RemoveShader(s.id));
                 }

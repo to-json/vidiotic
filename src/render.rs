@@ -580,12 +580,18 @@ impl Renderer {
         }
     }
 
-    /// Drop a pinned shader from the pool, removing any chain slots that
-    /// reference it (built-ins are never removed this way).
-    pub fn remove_pool_shader(&mut self, id: ShaderId) {
+    /// Drop a pinned or ISF pool shader, removing any chain slots that
+    /// reference it by id or by path (built-ins are never removed this way).
+    /// Returns the removed entry's name/path so callers can scrub other
+    /// chains (e.g. cues not currently active) that reference it too.
+    pub fn remove_pool_shader(&mut self, id: ShaderId) -> Option<Arc<str>> {
+        let name = self.pool.iter().find(|p| p.id == id && !p.builtin)?.name.clone();
         self.pool.retain(|p| p.id != id || p.builtin);
-        self.active_chain
-            .retain(|slot| slot.shader != SlotRef::Pinned(id));
+        self.active_chain.retain(|slot| {
+            slot.shader != SlotRef::Pinned(id)
+                && !matches!(&slot.shader, SlotRef::Isf(path) if path.as_ref() == name.as_ref())
+        });
+        Some(name)
     }
 
     /// Set the effect chain rendered this frame (empty = the live shader).

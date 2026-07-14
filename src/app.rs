@@ -680,16 +680,17 @@ impl App {
         }
     }
 
-    /// Drop a pinned shader and clear any cue references to it (they fall back to
-    /// the live shader).
+    /// Drop a pinned or ISF pool shader and clear any cue references to it
+    /// (they fall back to the live shader). No-op for builtins.
     fn remove_shader(&mut self, id: crate::commands::ShaderId) {
-        if let Some(r) = self.renderer.as_mut() {
-            r.remove_pool_shader(id);
-        }
+        let Some(r) = self.renderer.as_mut() else { return };
+        let Some(name) = r.remove_pool_shader(id) else { return };
         for bank in &mut self.banks {
             for cue in &mut bank.cues {
-                cue.chain
-                    .retain(|slot| slot.shader != crate::commands::SlotRef::Pinned(id));
+                cue.chain.retain(|slot| {
+                    slot.shader != crate::commands::SlotRef::Pinned(id)
+                        && !matches!(&slot.shader, crate::commands::SlotRef::Isf(path) if path.as_ref() == name.as_ref())
+                });
             }
         }
     }
