@@ -964,6 +964,35 @@ impl App {
         self.captures.set_on_air(uid, on);
     }
 
+    /// Point every clip referencing the missing device `from` at the connected
+    /// device `to`, and drop those cues' taps so they re-attach to the new
+    /// device's service on the next tick.
+    fn relink_camera(&mut self, from: &str, to: &str) {
+        let Some(dev) = self.camera_devices.iter().find(|d| d.uid == to) else {
+            log::warn!("camera relink target {to} not in the last enumeration");
+            return;
+        };
+        let name: Arc<str> = dev.name.as_str().into();
+        for c in &mut self.clips {
+            if c.camera_uid() == Some(from) {
+                c.source = ClipSource::Camera { uid: to.into(), name: name.clone() };
+                c.name = name.clone();
+            }
+        }
+        let stale: Vec<CueId> = self
+            .decoders
+            .keys()
+            .copied()
+            .filter(|&id| {
+                self.live_cue(id)
+                    .is_some_and(|c| self.clip_camera_uid(c.clip).as_deref() == Some(to))
+            })
+            .collect();
+        for id in stale {
+            self.decoders.remove(&id);
+        }
+    }
+
     /// Add a cue for a capture device to the edit bank, creating the device's
     /// pool clip on first use.
     fn add_camera_cue(&mut self, uid: &str) {
@@ -1092,6 +1121,7 @@ impl App {
             Command::RefreshCameras => self.refresh_cameras(),
             Command::SetCameraOnAir(uid, on) => self.set_camera_on_air(&uid, on),
             Command::AddCameraCue(uid) => self.add_camera_cue(&uid),
+            Command::RelinkCamera { from, to } => self.relink_camera(&from, &to),
             Command::SetShaderPath(p) => {
                 self.shader_path = p;
                 self.watcher = ShaderWatcher::new(&self.shader_path).ok();
@@ -1408,6 +1438,7 @@ impl App {
                     name: d.name.as_str().into(),
                     on_air,
                     status,
+                    missing: false,
                     active: clip_id.is_some_and(|id| active_clips.contains(&id)),
                     role: if clip_id.is_some() && playing_clip == clip_id {
                         ClipRole::Playing
@@ -1419,6 +1450,32 @@ impl App {
                 }
             })
             .collect();
+        // Camera clips whose device isn't connected get a missing-device row:
+        // the project loaded anyway (their cues render black); the row offers
+        // relinking onto a connected device.
+        for c in &self.clips {
+            let ClipSource::Camera { uid, name } = &c.source else { continue };
+            let enumerated = self.camera_devices.iter().any(|d| d.uid == uid.as_ref());
+            let already = self.mirror.cameras.iter().any(|e| e.uid == *uid);
+            if enumerated || already {
+                continue;
+            }
+            self.mirror.cameras.push(CameraEntry {
+                uid: uid.clone(),
+                name: name.clone(),
+                on_air: false,
+                status: "missing device".into(),
+                missing: true,
+                active: active_clips.contains(&c.id),
+                role: if playing_clip == Some(c.id) {
+                    ClipRole::Playing
+                } else if armed_clip == Some(c.id) {
+                    ClipRole::Armed
+                } else {
+                    ClipRole::None
+                },
+            });
+        }
         // Cue banks: the bank bar, and the edit bank's cues (with live roles).
         let armed_cue = self.sequencer.armed();
         let playing_cue = self.current;

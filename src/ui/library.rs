@@ -154,15 +154,20 @@ fn cameras_section(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         return;
     }
     for cam in &m.cameras {
-        camera_row(ui, cam, tx);
+        camera_row(ui, m, cam, tx);
     }
 }
 
 /// One capture device: on-air toggle, camera-glyph name (double-click adds a
-/// cue to the edit bank), status tag, and the playing/armed role tag.
-fn camera_row(ui: &mut Ui, cam: &CameraEntry, tx: &Sender<Command>) {
+/// cue to the edit bank), status tag, and the playing/armed role tag. Rows for
+/// a saved-but-absent device offer a pick-a-device relink instead.
+fn camera_row(ui: &mut Ui, m: &UiMirror, cam: &CameraEntry, tx: &Sender<Command>) {
     let p = palette();
     ui.horizontal(|ui| {
+        if cam.missing {
+            missing_camera_row(ui, m, cam, tx);
+            return;
+        }
         let mut on = cam.on_air;
         if widgets::glyph_checkbox(ui, &mut on, "")
             .on_hover_text(
@@ -193,6 +198,26 @@ fn camera_row(ui: &mut Ui, cam: &CameraEntry, tx: &Sender<Command>) {
             ClipRole::None => {}
         }
     });
+}
+
+/// A saved camera whose device isn't connected: name, "missing device" tag,
+/// and a combo listing the connected devices to relink onto.
+fn missing_camera_row(ui: &mut Ui, m: &UiMirror, cam: &CameraEntry, tx: &Sender<Command>) {
+    let p = palette();
+    ui.label(egui::RichText::new(format!("◉ {}", cam.name)).color(p.fg_muted));
+    widgets::chip(ui, &cam.status, Some(p.error), false);
+    egui::ComboBox::from_id_salt(("cam_relink", &cam.uid))
+        .selected_text("relink…")
+        .show_ui(ui, |ui| {
+            for other in m.cameras.iter().filter(|c| !c.missing) {
+                if ui.selectable_label(false, other.name.as_ref()).clicked() {
+                    let _ = tx.send(Command::RelinkCamera {
+                        from: cam.uid.clone(),
+                        to: other.uid.clone(),
+                    });
+                }
+            }
+        });
 }
 
 /// One bracket-text tab: `[name (3)]` accent when selected, dim otherwise,

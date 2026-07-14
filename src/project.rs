@@ -23,8 +23,12 @@ use crate::commands::{Cadence, ChainSlot, ClipId, SlotRef, TimeSig};
 use crate::isf::IsfValue;
 
 /// Bumped on any breaking change to the on-disk shape; [`load`] routes older
-/// files through [`migrate`].
-pub const FORMAT_VERSION: u32 = 1;
+/// files through [`migrate`] and refuses newer ones with a versioned error.
+///
+/// v2: camera clips (`ClipSpec.camera`) and per-cue live delay
+/// (`CueSpec.cam_delay`). v1 files load unchanged (the new fields default);
+/// v2 files fail in v1 binaries at the unknown `camera`/`cam_delay` keys.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// A whole saved session: a flat clip pool, named clip-bank groupings over it,
 /// and the cue banks the sequencer plays.
@@ -110,6 +114,9 @@ pub struct SessionDefaults {
 
 /// One source clip. `path` is relative to the `.viproj`'s directory, or
 /// absolute; [`resolve`] turns it into a concrete path and flags misses.
+/// Camera clips carry a [`CameraSpec`] instead — `path` is empty and ignored,
+/// and [`resolve`] never path-checks them (a missing device is not a missing
+/// file: the project still loads and the clip relinks by picking a device).
 #[derive(SerRon, DeRon, Clone, Debug, Default)]
 pub struct ClipSpec {
     pub id: ClipId,
@@ -124,8 +131,20 @@ pub struct ClipSpec {
     #[nserde(default)]
     pub duration_sec: Option<f64>,
     /// If this clip was baked from a span of a larger source, how it was cut.
+    /// (Bake provenance — distinct from `camera`, the live-capture identity.)
     #[nserde(default)]
     pub source: Option<SpanProvenance>,
+    /// Set when this clip is a live capture device rather than a file.
+    #[nserde(default)]
+    pub camera: Option<CameraSpec>,
+}
+
+/// A camera clip's identity: the stable `AVFoundation` `uniqueID`, plus the
+/// device's human name at save time (the relink hint when the uid is absent).
+#[derive(SerRon, DeRon, Clone, Debug, Default)]
+pub struct CameraSpec {
+    pub uid: String,
+    pub name: String,
 }
 
 /// How a baked clip was carved out of its pre-transcode original — informational
@@ -235,6 +254,17 @@ pub struct CueSpec {
     /// name; pinned livecode captures are dropped on save.
     #[nserde(default)]
     pub chain: Vec<CueEffectSpec>,
+    /// Camera cues: voluntary live delay. `None` = default (no delay).
+    #[nserde(default)]
+    pub cam_delay: Option<CamDelaySpec>,
+}
+
+/// On-disk mirror of [`crate::bank::CamDelay`].
+#[derive(SerRon, DeRon, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CamDelaySpec {
+    pub value: f64,
+    pub beats: bool,
+    pub quantize: bool,
 }
 
 impl CueSpec {
@@ -303,11 +333,18 @@ pub fn save(p: &Project, path: &Path) -> anyhow::Result<()> {
 /// Read and parse a `.viproj`, then run version migrations.
 ///
 /// # Errors
-/// Propagates read failures and RON parse errors.
+/// Propagates read failures and RON parse errors, and refuses files written by
+/// a newer format version.
 pub fn load(path: &Path) -> anyhow::Result<Project> {
     let text = std::fs::read_to_string(path)?;
     let mut p = Project::deserialize_ron(&text)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+    anyhow::ensure!(
+        p.version <= FORMAT_VERSION,
+        "{} is format v{} but this vidiotic reads up to v{FORMAT_VERSION} — update vidiotic",
+        path.display(),
+        p.version
+    );
     migrate(&mut p);
     Ok(p)
 }
@@ -318,7 +355,10 @@ fn migrate(p: &mut Project) {
     if p.version == 0 {
         p.version = FORMAT_VERSION;
     }
-    // Future breaking changes add their fix-ups here, keyed on p.version.
+    // v1 → v2: nothing to fix up — the added camera fields default to absent.
+    if p.version == 1 {
+        p.version = 2;
+    }
 }
 
 // --- path resolution -----------------------------------------------------
@@ -365,11 +405,16 @@ pub struct ResolvedProject {
     pub missing: Vec<ClipId>,
 }
 
-/// Resolve every clip path and record which ones do not exist on disk.
+/// Resolve every clip path and record which ones do not exist on disk. Camera
+/// clips are skipped entirely — no path, and a missing *device* must not block
+/// a load the way a missing *file* does.
 pub fn resolve(project: Project, project_dir: &Path) -> ResolvedProject {
     let mut clip_paths = HashMap::new();
     let mut missing = Vec::new();
     for c in &project.clips {
+        if c.camera.is_some() {
+            continue;
+        }
         let path = resolve_path(project_dir, &c.path);
         if !path.exists() {
             missing.push(c.id);
@@ -502,10 +547,14 @@ impl ClipSpec {
     /// different directory would emit a string that resolves against the wrong
     /// root on load.
     pub fn from_clip(c: &Clip, project_dir: &Path, meta: ClipMeta) -> Self {
-        let path = match c.file_path() {
-            Some(p) => relativize(project_dir, &absolutize(p)),
-            // Camera clips have no file; their identity is the CameraSpec.
-            None => String::new(),
+        let (path, camera) = match &c.source {
+            crate::clippool::ClipSource::File(p) => {
+                (relativize(project_dir, &absolutize(p)), None)
+            }
+            crate::clippool::ClipSource::Camera { uid, name } => (
+                String::new(),
+                Some(CameraSpec { uid: uid.to_string(), name: name.to_string() }),
+            ),
         };
         Self {
             id: c.id,
@@ -516,14 +565,23 @@ impl ClipSpec {
             frames: meta.frames,
             duration_sec: meta.duration_sec,
             source: meta.source,
+            camera,
         }
     }
 
-    /// Build a runtime clip from a spec with its already-resolved absolute path.
+    /// Build a runtime clip from a spec with its already-resolved absolute path
+    /// (ignored for camera clips, which resolve by device uid instead).
     pub fn to_clip(&self, resolved: PathBuf) -> Clip {
+        let source = match &self.camera {
+            Some(cam) => crate::clippool::ClipSource::Camera {
+                uid: cam.uid.as_str().into(),
+                name: cam.name.as_str().into(),
+            },
+            None => crate::clippool::ClipSource::File(resolved),
+        };
         Clip {
             id: self.id,
-            source: crate::clippool::ClipSource::File(resolved),
+            source,
             name: self.name.as_str().into(),
             bpm: self.bpm,
         }
@@ -572,6 +630,11 @@ impl CueSpec {
             bpm_sync_on: c.bpm_sync_on,
             speed_mul: c.speed_mul.on.then_some(c.speed_mul.val),
             chain,
+            cam_delay: (c.delay != crate::bank::CamDelay::default()).then_some(CamDelaySpec {
+                value: c.delay.value,
+                beats: c.delay.beats,
+                quantize: c.delay.quantize,
+            }),
         }
     }
 
@@ -613,7 +676,9 @@ impl CueSpec {
             bpm: self.bpm,
             bpm_sync_on: self.bpm_sync_on,
             speed_mul: toggle(self.speed_mul, 1.0),
-            delay: crate::bank::CamDelay::default(),
+            delay: self.cam_delay.map_or_else(crate::bank::CamDelay::default, |d| {
+                crate::bank::CamDelay { value: d.value, beats: d.beats, quantize: d.quantize }
+            }),
         }
     }
 }
@@ -721,6 +786,7 @@ mod tests {
                     in_sec: 0.333,
                     out_sec: 2.466,
                 }),
+                camera: None,
             }],
             clip_banks: vec![ClipBankSpec {
                 name: "drums".into(),
@@ -743,6 +809,7 @@ mod tests {
                     bpm_sync_on: true,
                     speed_mul: Some(1.5),
                     chain: vec![CueEffectSpec::Builtin("kaleido".into()), CueEffectSpec::Live],
+                    cam_delay: None,
                 }],
             }],
         }
@@ -917,6 +984,70 @@ mod tests {
             spec.path
         );
         assert!(spec.path.ends_with("some/relative/clip.mov"));
+    }
+
+    #[test]
+    fn camera_clip_and_delay_round_trip() {
+        use crate::clippool::ClipSource;
+
+        let dir = Path::new("/proj");
+        let clip = Clip {
+            id: 3,
+            source: ClipSource::Camera { uid: "UID-123".into(), name: "FaceTime HD".into() },
+            name: "FaceTime HD".into(),
+            bpm: None,
+        };
+        let spec = ClipSpec::from_clip(&clip, dir, ClipMeta::default());
+        assert!(spec.path.is_empty());
+        assert_eq!(spec.camera.as_ref().unwrap().uid, "UID-123");
+
+        let mut cue = CueSpec::full_length(3, "cam".into()).to_cue(1, dir);
+        cue.delay = crate::bank::CamDelay { value: 1.5, beats: true, quantize: true };
+        let cue_spec = CueSpec::from_cue(&cue, dir);
+        assert_eq!(
+            cue_spec.cam_delay,
+            Some(CamDelaySpec { value: 1.5, beats: true, quantize: true })
+        );
+
+        // Through RON text and back to runtime.
+        let project = Project {
+            version: FORMAT_VERSION,
+            clips: vec![spec],
+            cue_banks: vec![CueBankSpec { name: "A".into(), cues: vec![cue_spec] }],
+            ..Default::default()
+        };
+        let text = project.serialize_ron();
+        let back = Project::deserialize_ron(&text).expect("parse");
+        let clip_back = back.clips[0].to_clip(PathBuf::new());
+        assert_eq!(clip_back.camera_uid(), Some("UID-123"));
+        let cue_back = back.cue_banks[0].cues[0].to_cue(9, dir);
+        assert_eq!(cue_back.delay, crate::bank::CamDelay { value: 1.5, beats: true, quantize: true });
+
+        // A camera clip never path-checks: no missing flag, no resolved path.
+        let r = resolve(back, dir);
+        assert!(r.missing.is_empty());
+        assert!(!r.clip_paths.contains_key(&3));
+    }
+
+    #[test]
+    fn default_cam_delay_is_not_written() {
+        let cue = CueSpec::full_length(0, "x".into());
+        let text = cue.serialize_ron();
+        assert!(!text.contains("cam_delay: Some"), "default delay must stay absent: {text}");
+    }
+
+    #[test]
+    fn newer_format_version_refuses_to_load() {
+        let dir = std::env::temp_dir().join("vidiotic_proj_test_future");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = sample();
+        p.version = FORMAT_VERSION + 1;
+        let path = dir.join("future.viproj");
+        save(&p, &path).expect("save");
+        let err = load(&path).expect_err("future version must refuse");
+        assert!(err.to_string().contains("format v"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

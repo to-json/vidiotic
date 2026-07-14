@@ -206,6 +206,9 @@ pub enum Command {
     RefreshCameras,
     SetCameraOnAir(Arc<str>, bool),     // device uid
     AddCameraCue(Arc<str>),             // device uid
+    // Point every clip referencing the missing device `from` at the connected
+    // device `to` (the camera analogue of relinking a moved file).
+    RelinkCamera { from: Arc<str>, to: Arc<str> },
     SetShaderPath(PathBuf),
     SetAudioDevice(Option<String>), // id key; None = default
     ToggleFullscreen,               // shell-intercepted
@@ -269,6 +272,9 @@ pub struct CameraEntry {
     pub on_air: bool,
     /// Human status line: "off air", "1920x1080 @ 30", or an error.
     pub status: Arc<str>,
+    /// A saved project references this uid but no connected device has it;
+    /// the row offers relinking instead of the on-air toggle.
+    pub missing: bool,
     pub active: bool,   // has a cue in the live bank
     pub role: ClipRole, // playing/armed if its clip's cue is
 }

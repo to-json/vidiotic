@@ -225,7 +225,11 @@ fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
         .project
         .clips
         .iter()
-        .map(|spec| spec.to_clip(resolved.clip_paths[&spec.id].clone()))
+        // Camera clips have no resolved path (resolve() skips them); to_clip
+        // ignores the placeholder and rebuilds the camera source from the spec.
+        .map(|spec| {
+            spec.to_clip(resolved.clip_paths.get(&spec.id).cloned().unwrap_or_default())
+        })
         .collect();
     let clip_banks: Vec<ClipBank> = resolved
         .project
