@@ -75,12 +75,17 @@ brew / FaceTime HD Camera only — no virtual cam or UVC stick attached).**
 
 - **Backend combo confirmed**: `objc2-av-foundation` 0.3 enumeration + ffmpeg
   `avfoundation` capture. No nokhwa fallback needed.
-- **Device identity**: `uniqueID` works (stable UUID). Device selection uses the
-  demuxer's `video_device_index` **option** (not the URL), which sidesteps
-  ffmpeg's prefix-based name matching and digit-leading-name hazards entirely.
-  Index parity holds because `capture::enumerate()` reproduces ffmpeg 8's exact
-  discovery array (`[BuiltInWideAngle, DeskView, Continuity, External]`, video
-  then muxed). Resolve uid → index against a fresh enumeration at every open.
+- **Device identity**: `uniqueID` works (stable UUID). ~~Selection by
+  `video_device_index` with enumeration-order parity~~ — **falsified 2026-07-14
+  with OBS attached**: macOS discovery order is unstable (built-in and external
+  devices swapped positions between calls seconds apart *within one process*,
+  despite the documented sorted-by-deviceType behavior), so any index is racy
+  by the time the demuxer re-enumerates inside open. Selection now goes by
+  `localizedName` (the demuxer prefix-matches against its own fresh list);
+  names a URL can't express (leading digit, embedded `:`) fall back to the
+  racy index with a warning, and prefix-colliding names are warned at
+  enumeration. Duplicate identical names remain ambiguous — an ffmpeg
+  limitation; the full-objc2 capture arm is the escape hatch if it ever bites.
 - **Open must pass explicit `video_size` + `framerate`** from an enumerated
   `DeviceFormat`: the demuxer's NTSC 29.97 default hard-errors on devices
   without a matching frame-rate range. `pixel_format` mapped from the CM
@@ -89,6 +94,13 @@ brew / FaceTime HD Camera only — no virtual cam or UVC stick attached).**
   AVFoundation decompresses MJPEG-native devices to CV formats itself, so the
   ring only ever sees uncompressed frames — plan step 2.2's "decode MJPEG
   before the ring" is satisfied by the OS.
+- **OBS virtual cam (verified 2026-07-14)**: `BGRA` 1920x1080 at a *forced*
+  60 fps (its only frame-rate range is 60–60). Two consequences: the
+  `pixel_format` name must come from the demuxer's own table (`bgr0`, not
+  `bgra` — an unknown-to-avfoundation name is a hard open error logged as
+  `(null)`), and packed RGB at 60 fps would shrink the byte-capped ring to
+  &lt;1 s, so the worker now converts non-compact-YUV frames to NV12 before
+  ringing (full 3 s window preserved, one swscale per captured frame).
 - **Timing**: open ≈ 1.5 s (session start — confirms the persistent-service
   design; a per-cue open could never work). First frame &lt;1 ms after open.
   Steady 30.00 fps, pts in host-clock microseconds (map pts→wall clock once at

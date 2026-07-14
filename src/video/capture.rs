@@ -3,12 +3,13 @@
 //! through ffmpeg's `avfoundation` input device on the already-linked
 //! ffmpeg-next, so camera packets ride the same decode surface as file clips.
 //!
-//! ffmpeg's demuxer selects a device by its position in ffmpeg's own discovery
-//! list. [`enumerate`] reproduces that list exactly — same device types in the
-//! same order, video devices then muxed devices — so a [`DeviceInfo::index`]
-//! can be handed straight to the demuxer as `video_device_index`. The mapping
-//! is only valid against a fresh enumeration: resolve uid → index at open
-//! time, never cache the index.
+//! Device selection: macOS does **not** keep discovery order stable — the
+//! same process can see built-in and external devices swap positions between
+//! enumerations seconds apart — so an index is racy by the time the demuxer
+//! re-enumerates inside open. [`open_device`] therefore selects by
+//! `localizedName` (the demuxer prefix-matches it against its own fresh list),
+//! falling back to `video_device_index` only for names its URL parser can't
+//! express (leading digit, embedded `:`). [`DeviceInfo::index`] is advisory.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,16 +66,19 @@ impl DeviceFormat {
     }
 
     /// The ffmpeg `pixel_format` option value matching this format's
-    /// `CoreMedia` four-char code, where one exists. Compressed-native devices
-    /// (MJPEG four-char `dmb1`) have no mapping — `AVFoundation` decompresses
-    /// those to a CV format itself, so the demuxer's default-with-fallback
-    /// handles them.
+    /// `CoreMedia` four-char code, where one exists. The name must come from
+    /// the avfoundation demuxer's own format table — a name it doesn't know
+    /// (even a valid ffmpeg one, e.g. `bgra`) is a hard open error, whereas an
+    /// unmapped `None` falls back to the demuxer's default-with-override path.
+    /// Compressed-native devices (MJPEG four-char `dmb1`) stay unmapped —
+    /// `AVFoundation` decompresses those to a CV format itself.
     pub fn ffmpeg_pixel_format(&self) -> Option<&'static str> {
         match &self.fourcc {
             b"420v" | b"420f" => Some("nv12"),
             b"2vuy" => Some("uyvy422"),
             b"yuvs" => Some("yuyv422"),
-            b"BGRA" => Some("bgra"),
+            // avfoundation maps kCVPixelFormatType_32BGRA to bgr0, not bgra.
+            b"BGRA" => Some("bgr0"),
             _ => None,
         }
     }
@@ -84,8 +88,9 @@ impl DeviceFormat {
 /// across threads, valid until devices are plugged or unplugged.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
-    /// Position in ffmpeg's avfoundation device list; pass as
-    /// `video_device_index`. Valid only against a fresh [`enumerate`].
+    /// Position in this enumeration. Advisory (display, spike args): macOS
+    /// device order is unstable, so selection goes by name — see
+    /// [`open_device`].
     pub index: usize,
     /// `AVFoundation` `uniqueID` — the stable identity that survives replugs
     /// and reboots. This is what a project file stores.
@@ -206,9 +211,9 @@ fn device_formats(dev: &AVCaptureDevice) -> Vec<DeviceFormat> {
     out
 }
 
-/// Enumerate capture devices in ffmpeg's avfoundation order (video devices,
-/// then muxed devices), so each entry's `index` is directly usable as the
-/// demuxer's `video_device_index`.
+/// Enumerate capture devices with the same discovery scope as ffmpeg's
+/// avfoundation demuxer (video device types, then muxed). Order is whatever
+/// macOS returns this instant — selection goes by name, not position.
 pub fn enumerate() -> Vec<DeviceInfo> {
     let mut out = Vec::new();
     for (is_muxed, types, media) in [
@@ -237,6 +242,17 @@ pub fn enumerate() -> Vec<DeviceInfo> {
             });
         }
     }
+    // The demuxer prefix-matches names, so a device whose full name prefixes
+    // another's is ambiguous to select. Rare; surface it rather than guess.
+    for a in &out {
+        if out.iter().any(|b| b.uid != a.uid && b.name.starts_with(&a.name)) {
+            log::warn!(
+                "capture device name {:?} is a prefix of another device's name; \
+                 selection may pick the wrong one",
+                a.name
+            );
+        }
+    }
     out
 }
 
@@ -252,21 +268,32 @@ pub fn pick_format(formats: &[DeviceFormat], max_h: u32) -> Option<&DeviceFormat
         .or_else(|| formats.iter().min_by_key(|f| key(f)))
 }
 
-/// Open a capture device through ffmpeg's avfoundation demuxer. `index` must
-/// come from a fresh [`enumerate`]. `video_size` and `framerate` should come
-/// from one of the device's [`DeviceFormat`]s — the demuxer rejects frame
-/// rates that don't match a supported range's max (its NTSC default fails on
-/// most devices), while an unsupported `pixel_format` merely falls back with a
-/// log line (pass [`DeviceFormat::ffmpeg_pixel_format`] to skip the fallback).
+/// True when the demuxer's URL parser can express this device name: a leading
+/// digit would parse as a device index, and `:` splits the video/audio parts.
+fn name_selectable(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && !name.contains(':')
+}
+
+/// Open a capture device through ffmpeg's avfoundation demuxer. Selection is
+/// by the device's `localizedName` (prefix-matched by the demuxer against its
+/// own fresh enumeration) because macOS device *order* is unstable — an index
+/// can point at a different device by the time the demuxer looks. Names the
+/// URL parser can't express fall back to `video_device_index` best-effort.
+///
+/// `video_size` and `framerate` should come from one of the device's
+/// [`DeviceFormat`]s — the demuxer rejects frame rates that don't match a
+/// supported range's max (its NTSC default fails on most devices), while an
+/// unsupported `pixel_format` merely falls back with a log line (pass
+/// [`DeviceFormat::ffmpeg_pixel_format`] to skip the fallback).
 ///
 /// Dropping the returned context stops the capture session; measure that cost
 /// before putting it on a latency-sensitive path.
 ///
 /// # Errors
-/// Fails if ffmpeg lacks the avfoundation input device, the index is stale,
+/// Fails if ffmpeg lacks the avfoundation input device, the device vanished,
 /// the format/framerate combination is rejected, or TCC denies capture.
-pub fn open_by_index(
-    index: usize,
+pub fn open_device(
+    dev: &DeviceInfo,
     video_size: (u32, u32),
     framerate: f64,
     pixel_format: Option<&str>,
@@ -284,14 +311,25 @@ pub fn open_by_index(
     let input = unsafe { ff::format::Input::wrap(fmt_ptr.cast_mut()) };
 
     let mut opts = ff::Dictionary::new();
-    opts.set("video_device_index", &index.to_string());
     opts.set("video_size", &format!("{}x{}", video_size.0, video_size.1));
     opts.set("framerate", &format!("{framerate:.4}"));
     if let Some(pf) = pixel_format {
         opts.set("pixel_format", pf);
     }
+    let url = if name_selectable(&dev.name) {
+        dev.name.clone()
+    } else {
+        log::warn!(
+            "device name {:?} can't be matched by the demuxer; \
+             falling back to the racy index {}",
+            dev.name,
+            dev.index
+        );
+        opts.set("video_device_index", &dev.index.to_string());
+        String::new()
+    };
 
-    match ff::format::open_with("", &ff::Format::Input(input), opts)? {
+    match ff::format::open_with(&url, &ff::Format::Input(input), opts)? {
         ff::format::Context::Input(i) => Ok(i),
         ff::format::Context::Output(_) => unreachable!("opened an input format"),
     }
@@ -548,8 +586,8 @@ fn capture_once(uid: &str, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()>
         .ok_or_else(|| anyhow::anyhow!("device not connected"))?;
     let fmt = pick_format(&dev.formats, CAPTURE_MAX_H)
         .ok_or_else(|| anyhow::anyhow!("device reports no formats"))?;
-    let mut ictx = open_by_index(
-        dev.index,
+    let mut ictx = open_device(
+        dev,
         (fmt.width, fmt.height),
         fmt.max_fps,
         fmt.ffmpeg_pixel_format(),
@@ -575,6 +613,8 @@ fn capture_once(uid: &str, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()>
     );
 
     let start = Instant::now();
+    let mut ring_scaler: Option<(ff::software::scaling::Context, (u32, u32, ff::format::Pixel))> =
+        None;
     for (stream, packet) in ictx.packets() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -591,12 +631,55 @@ fn capture_once(uid: &str, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()>
             let wall = Instant::now();
             let pts_sec = wall.duration_since(start).as_secs_f64();
             let frame = std::mem::replace(&mut decoded, ff::frame::Video::empty());
+            let frame = normalize_for_ring(frame, &mut ring_scaler);
             lock_unpoisoned(&ring.state).push(wall, pts_sec, frame);
         }
     }
     // The packet iterator only ends on read error / EOF — a live input
     // shouldn't do either, so treat it as a fault and reopen.
     anyhow::bail!("capture input ended unexpectedly")
+}
+
+/// Re-encode fat pixel layouts to NV12 before they enter the ring. Packed RGB
+/// (e.g. OBS's forced 1080p60 BGRA) is 4 B/px — against the byte cap that
+/// shrinks the delay window under a second, while NV12's 1.5 B/px keeps the
+/// full window. Compact YUV layouts pass through untouched; on conversion
+/// failure the original frame is ringed rather than dropped.
+fn normalize_for_ring(
+    frame: ff::frame::Video,
+    scaler: &mut Option<(ff::software::scaling::Context, (u32, u32, ff::format::Pixel))>,
+) -> ff::frame::Video {
+    use ff::format::Pixel;
+    let (w, h, fmt) = (frame.width(), frame.height(), frame.format());
+    if matches!(fmt, Pixel::NV12 | Pixel::YUV420P | Pixel::UYVY422 | Pixel::YUYV422) {
+        return frame;
+    }
+    if scaler.as_ref().is_none_or(|(_, key)| *key != (w, h, fmt)) {
+        match ff::software::scaling::Context::get(
+            fmt,
+            w,
+            h,
+            Pixel::NV12,
+            w,
+            h,
+            ff::software::scaling::Flags::BILINEAR,
+        ) {
+            Ok(ctx) => *scaler = Some((ctx, (w, h, fmt))),
+            Err(e) => {
+                log::warn!("ring NV12 convert unavailable for {fmt:?}: {e}");
+                return frame;
+            }
+        }
+    }
+    let Some((ctx, _)) = scaler.as_mut() else { return frame };
+    let mut nv12 = ff::frame::Video::empty();
+    match ctx.run(&frame, &mut nv12) {
+        Ok(()) => nv12,
+        Err(e) => {
+            log::warn!("ring NV12 convert failed: {e}");
+            frame
+        }
+    }
 }
 
 /// The on-air registry: one persistent [`CaptureService`] per toggled-on
@@ -726,6 +809,28 @@ mod tests {
         // Delay target predates everything in the ring: clamp, don't starve.
         let hit = r.peek_at(t0).unwrap();
         assert!((hit.pts_sec - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalize_converts_packed_rgb_to_nv12() {
+        let mut scaler = None;
+        let bgra = ff::frame::Video::new(ff::format::Pixel::BGRA, 16, 16);
+        let out = normalize_for_ring(bgra, &mut scaler);
+        assert_eq!(out.format(), ff::format::Pixel::NV12);
+        assert_eq!((out.width(), out.height()), (16, 16));
+        // Compact YUV passes through untouched.
+        let mut scaler = None;
+        let out = normalize_for_ring(nv12(16, 16), &mut scaler);
+        assert_eq!(out.format(), ff::format::Pixel::NV12);
+        assert!(scaler.is_none());
+    }
+
+    #[test]
+    fn name_selectable_flags_url_hazards() {
+        assert!(name_selectable("OBS Virtual Camera"));
+        assert!(!name_selectable("4K Capture Stick"));
+        assert!(!name_selectable("Cam: Pro"));
+        assert!(!name_selectable(""));
     }
 
     #[test]

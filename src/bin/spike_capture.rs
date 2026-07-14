@@ -107,8 +107,7 @@ mod macos {
             pixfmt.unwrap_or("<default>")
         );
         let t = Instant::now();
-        let mut ictx =
-            capture::open_by_index(dev.index, (fmt.width, fmt.height), fmt.max_fps, pixfmt)?;
+        let mut ictx = capture::open_device(dev, (fmt.width, fmt.height), fmt.max_fps, pixfmt)?;
         println!("open took {:?}", t.elapsed());
 
         let (vid_idx, params, time_base) = {
@@ -183,8 +182,8 @@ mod macos {
 
         // -- Double-open behavior (informational, 1.2) -----------------------
         println!("\ndouble-open check: opening the same device twice...");
-        let a = capture::open_by_index(dev.index, (fmt.width, fmt.height), fmt.max_fps, pixfmt);
-        let b = capture::open_by_index(dev.index, (fmt.width, fmt.height), fmt.max_fps, pixfmt);
+        let a = capture::open_device(dev, (fmt.width, fmt.height), fmt.max_fps, pixfmt);
+        let b = capture::open_device(dev, (fmt.width, fmt.height), fmt.max_fps, pixfmt);
         println!("first={} second={}", ok_err(&a), ok_err(&b));
         let t = Instant::now();
         drop(a);
