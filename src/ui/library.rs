@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crossbeam_channel::Sender;
 use egui::{Align2, Rect, Sense, Ui};
 
+use phosphor::icon;
 use phosphor::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
 use phosphor::widgets::{self, TileSpec};
 
@@ -29,7 +30,7 @@ pub(super) fn show(
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::section_label(ui, "clips");
-            if widgets::bracket_button(ui, "folder…", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} folder…", icon::FOLDER), None, 0.0)
                 .on_hover_text("Pick a folder of video clips to fill the pool")
                 .clicked()
             {
@@ -96,7 +97,7 @@ fn empty_state(ui: &mut Ui, headline: &str, sub: &str, folder_pick: Option<(&Sen
         ui.label(egui::RichText::new(sub).small().color(p.fg_muted));
         if let Some((tx, kind)) = folder_pick {
             ui.add_space(SP_SM);
-            if widgets::bracket_button(ui, "folder…", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} folder…", icon::FOLDER), None, 0.0)
                 .on_hover_text("Pick a folder of video clips to fill the pool")
                 .clicked()
             {
@@ -142,7 +143,7 @@ fn cameras_section(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     let p = palette();
     ui.horizontal_wrapped(|ui| {
         widgets::section_label(ui, "cameras");
-        if widgets::bracket_button(ui, "refresh", None, 0.0)
+        if widgets::bracket_button(ui, &format!("{} refresh", icon::REFRESH), None, 0.0)
             .on_hover_text("re-enumerate capture devices (after plugging/unplugging)")
             .clicked()
         {
@@ -260,7 +261,7 @@ fn clip_bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         for (i, b) in m.clip_banks.iter().enumerate() {
             clip_bank_tab(ui, m, i, b, tx);
         }
-        if widgets::bracket_button(ui, "+", None, 0.0)
+        if widgets::bracket_button(ui, icon::ADD, None, 0.0)
             .on_hover_text("add a folder as another clip bank")
             .clicked()
         {
@@ -289,7 +290,7 @@ fn bank_bar(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         for (i, b) in m.banks.iter().enumerate() {
             bank_tab(ui, m, i, b, tx);
         }
-        if widgets::bracket_button(ui, "+", None, 0.0).on_hover_text("add a bank").clicked() {
+        if widgets::bracket_button(ui, icon::ADD, None, 0.0).on_hover_text("add a bank").clicked() {
             let _ = tx.send(Command::AddBank);
         }
     });
@@ -412,12 +413,17 @@ fn cue_chip(
             ui.horizontal(|ui| {
                 if m.advanced {
                     ui.spacing_mut().item_spacing.x = SP_SM;
-                    if widgets::bracket_button(ui, "◀", None, 0.0).on_hover_text("move earlier").clicked()
+                    if widgets::bracket_button(ui, icon::STEP_BACK, None, 0.0)
+                        .on_hover_text("move earlier")
+                        .clicked()
                         && index > 0
                     {
                         let _ = tx.send(Command::MoveCue(cue.id, index - 1));
                     }
-                    if widgets::bracket_button(ui, "▶", None, 0.0).on_hover_text("move later").clicked() {
+                    if widgets::bracket_button(ui, icon::STEP_FWD, None, 0.0)
+                        .on_hover_text("move later")
+                        .clicked()
+                    {
                         let _ = tx.send(Command::MoveCue(cue.id, index + 1));
                     }
                 }

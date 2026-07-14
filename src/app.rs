@@ -1767,7 +1767,14 @@ impl ApplicationHandler for App {
                 Window::default_attributes()
                     .with_title(title)
                     .with_inner_size(winit::dpi::LogicalSize::new(w, h))
-                    .with_min_inner_size(winit::dpi::LogicalSize::new(min_w, min_h)),
+                    .with_min_inner_size(winit::dpi::LogicalSize::new(min_w, min_h))
+                    // See phosphor::theme::apply's doc for why this matters.
+                    // eframe apps get the equivalent via a viewport command
+                    // phosphor sends at theme-apply time, but this control
+                    // window's egui integration never forwards viewport
+                    // commands (see EguiCtl::render), so it's set here directly
+                    // instead, at window creation.
+                    .with_transparent(true),
             )
         };
         // The control layout is designed to stack down to ~420 px wide;

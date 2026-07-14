@@ -6,6 +6,7 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
+use phosphor::icon;
 use phosphor::theme::{palette, SP_LG, SP_MD, SP_SM};
 use phosphor::widgets;
 
@@ -322,20 +323,26 @@ fn chain_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>)
             // into whatever width they leave on a narrow panel.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(i + 1 < n, |ui| {
-                    if widgets::bracket_button(ui, "▼", None, 0.0).on_hover_text("Move down").clicked() {
+                    if widgets::bracket_button(ui, icon::MOVE_DOWN, None, 0.0)
+                        .on_hover_text("Move down")
+                        .clicked()
+                    {
                         let mut c = cue.chain.clone();
                         c.swap(i, i + 1);
                         let _ = tx.send(Command::SetCueChain(cue.id, c));
                     }
                 });
                 ui.add_enabled_ui(i > 0, |ui| {
-                    if widgets::bracket_button(ui, "▲", None, 0.0).on_hover_text("Move up").clicked() {
+                    if widgets::bracket_button(ui, icon::MOVE_UP, None, 0.0)
+                        .on_hover_text("Move up")
+                        .clicked()
+                    {
                         let mut c = cue.chain.clone();
                         c.swap(i, i - 1);
                         let _ = tx.send(Command::SetCueChain(cue.id, c));
                     }
                 });
-                if widgets::bracket_button(ui, "×", Some(p.error), 0.0)
+                if widgets::bracket_button(ui, icon::DELETE, Some(p.error), 0.0)
                     .on_hover_text("Remove from chain")
                     .clicked()
                 {

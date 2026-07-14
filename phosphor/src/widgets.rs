@@ -6,7 +6,10 @@
 //! these and survives hue rotation.
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
-use egui::{Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Popup, Rect, RectAlign, Response, Sense, Stroke,
+    StrokeKind, Ui, Vec2,
+};
 
 use crate::theme::{self, mono, palette, ROW};
 
@@ -524,10 +527,15 @@ pub fn glyph_fft(ui: &mut Ui, mags: &[f32]) {
     }
 }
 
-/// Buffer cells [`theme_controls`] occupies at the right edge of its rect:
-/// `[dark] light` (13) + the hue strip (14) + margins. Callers reserve this
-/// much width (× [`cell_width`]) when laying out around it.
+/// Buffer cells [`theme_controls`] occupies: `[dark] light` (13) + the hue
+/// strip (14) + margins. [`theme_toggle`]'s popup reserves this much width
+/// (× [`cell_width`]) for the expanded picker.
 pub const THEME_CELLS: f32 = 31.0;
+
+/// Buffer cells [`theme_toggle`]'s collapsed button occupies at the edge of
+/// its rect — callers reserve this much width (× [`cell_width`]) instead of
+/// the full [`THEME_CELLS`], since the picker itself now lives in a popup.
+pub const THEME_TOGGLE_CELLS: f32 = 5.0;
 
 /// Right-aligned theme switchboard painted inside `rect`: `[dark] light` and
 /// the hue-rotation strip, in the buffer's own idiom. Mutations land through
@@ -592,6 +600,81 @@ pub fn theme_controls(ui: &mut Ui, rect: Rect) {
     }
 
     theme::set_state(ui.ctx(), st);
+}
+
+/// Collapsed stand-in for [`theme_controls`]: a small `[◐]`/`[◑]` toggle
+/// painted at `rect` (dark/light glyph tracks the current mode) that opens
+/// the full switchboard in a floating popup on click, instead of the picker
+/// always eating a full row's width.
+pub fn theme_toggle(ui: &mut Ui, rect: Rect) {
+    let p = palette();
+    let resp = ui
+        .interact(rect, ui.id().with("theme_toggle"), Sense::click())
+        .on_hover_text("theme: dark/light + hue");
+    let glyph = if theme::state(ui.ctx()).dark { "[◐]" } else { "[◑]" };
+    let color = if resp.hovered() { p.accent } else { p.fg_secondary };
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, mono(), color);
+
+    Popup::from_toggle_button_response(&resp).align(RectAlign::TOP).show(|ui| {
+        let cw = cell_width(ui);
+        let (prect, _) = ui.allocate_exact_size(
+            egui::vec2(cw * (THEME_CELLS + 2.0), ROW + theme::SP_MD),
+            Sense::hover(),
+        );
+        theme_controls(ui, prect);
+    });
+}
+
+/// The shared statusline strip: a full-width `select`-filled bar with a mode
+/// segment (`mode.0`, tinted with `mode.1` when something is happening, else
+/// neutral), a `summary` readout, and the collapsed [`theme_toggle`] at the
+/// right edge. Used as the last row of each app's bottom panel.
+pub fn statusline(ui: &mut Ui, mode: (&str, Option<Color32>), summary: &str) {
+    let p = palette();
+    let cw = cell_width(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::ZERO, p.accent_dim);
+
+    // Mode segment: its own fill when something is happening.
+    let (mode_label, mode_bg) = mode;
+    let mode_cells = mode_label.chars().count() as f32 + 2.0;
+    if let Some(bg) = mode_bg {
+        painter.rect_filled(
+            Rect::from_min_size(rect.min, egui::vec2(cw * mode_cells, rect.height())),
+            CornerRadius::ZERO,
+            bg,
+        );
+    }
+    let mode_fg = if mode_bg.is_some() { p.bg_inset } else { p.fg_primary };
+    painter.text(
+        egui::pos2(rect.min.x + cw, rect.center().y),
+        Align2::LEFT_CENTER,
+        mode_label,
+        mono(),
+        mode_fg,
+    );
+
+    // Clip the summary short of the theme toggle so a narrow window
+    // truncates it instead of running the two together.
+    let summary_clip = Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.max.x - cw * THEME_TOGGLE_CELLS, rect.max.y),
+    );
+    painter.with_clip_rect(summary_clip).text(
+        egui::pos2(rect.min.x + cw * (mode_cells + 2.0), rect.center().y),
+        Align2::LEFT_CENTER,
+        summary,
+        mono(),
+        p.fg_secondary,
+    );
+
+    let toggle_rect = Rect::from_min_size(
+        egui::pos2(rect.max.x - cw * THEME_TOGGLE_CELLS, rect.min.y),
+        egui::vec2(cw * THEME_TOGGLE_CELLS, rect.height()),
+    );
+    theme_toggle(ui, toggle_rect);
 }
 
 #[cfg(test)]

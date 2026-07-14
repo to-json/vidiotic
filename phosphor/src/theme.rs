@@ -161,9 +161,47 @@ pub fn hsl(h: f32, s: f32, l: f32) -> Color32 {
 
 /// Apply the theme to `ctx` at construction. Per-frame theme edits (the
 /// statusline's dark/light and hue controls) land through [`sync`].
+///
+/// Also requests a transparent window backing store via
+/// [`egui::ViewportCommand::Transparent`]. Without this, macOS's
+/// rounded-corner window mask clips an opaque backing layer with hard,
+/// unantialiased corners — visibly square nubs poking past the rounded
+/// frame. This reaches the window on any runtime that processes root
+/// viewport commands (eframe does this automatically); a custom egui+winit
+/// integration that doesn't run [`egui_winit::process_viewport_commands`]
+/// needs the equivalent `.with_transparent(true)` set directly on its
+/// `winit::window::WindowAttributes` at creation instead.
 pub fn apply(ctx: &Context) {
+    install_icon_fonts(ctx);
     set_state(ctx, ThemeState::default());
     apply_style(ctx, ThemeState::default());
+    ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+}
+
+/// Append symbol fallbacks for both font families so the [`crate::icon`]
+/// glyphs (and other symbols the default egui font lacks) render instead of
+/// showing the missing-glyph box:
+/// - Noto Sans Symbols 2 covers standard-Unicode symbols (geometric shapes,
+///   media controls, arrows).
+/// - Symbols Nerd Font covers the private-use icon sets (Font Awesome,
+///   Material, Powerline, …) that back [`crate::icon`].
+///
+/// egui resolves glyphs per-character down the fallback chain, so plain text
+/// still uses the primary font.
+fn install_icon_fonts(ctx: &Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for (key, bytes) in [
+        ("symbols2", &include_bytes!("../assets/NotoSansSymbols2-Regular.ttf")[..]),
+        ("nerd", &include_bytes!("../assets/SymbolsNerdFont-Regular.ttf")[..]),
+    ] {
+        fonts
+            .font_data
+            .insert(key.to_owned(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(key.to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Re-derive the palette and egui style when the theme state changed since
@@ -196,8 +234,11 @@ fn apply_style(ctx: &Context, st: ThemeState) {
         v.hyperlink_color = p.blue;
         v.error_fg_color = p.error;
 
-        // The buffer aesthetic is square: no rounded corners anywhere.
+        // The buffer aesthetic is square: no rounded corners anywhere,
+        // including egui's own window/menu chrome (defaults to 6px).
         let radius = CornerRadius::ZERO;
+        v.window_corner_radius = radius;
+        v.menu_corner_radius = radius;
         v.widgets.noninteractive.corner_radius = radius;
         v.widgets.noninteractive.bg_fill = p.bg_panel;
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);

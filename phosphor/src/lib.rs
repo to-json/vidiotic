@@ -8,5 +8,6 @@
 //! Wiring: call [`theme::apply`] once at context setup and [`theme::sync`]
 //! at the top of every frame; read colors through [`theme::palette`].
 
+pub mod icon;
 pub mod theme;
 pub mod widgets;

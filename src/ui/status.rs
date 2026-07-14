@@ -6,7 +6,8 @@
 use crossbeam_channel::Sender;
 use egui::Ui;
 
-use phosphor::theme::{mono, palette, ROW, SP_MD, SP_SM};
+use phosphor::icon;
+use phosphor::theme::{palette, SP_MD, SP_SM};
 use phosphor::widgets;
 
 use super::{pick_file, PickKind};
@@ -20,7 +21,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
     egui::Panel::bottom(egui::Id::new("io")).show(ui, |ui| {
         ui.add_space(SP_SM);
         ui.horizontal_wrapped(|ui| {
-            if widgets::bracket_button(ui, "shader…", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} shader…", icon::FOLDER), None, 0.0)
                 .on_hover_text("Load a GLSL/WGSL shader file to livecode")
                 .clicked()
             {
@@ -35,7 +36,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
                 )
                 .truncate(),
             );
-            if widgets::bracket_button(ui, "pin", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} pin", icon::PIN), None, 0.0)
                 .on_hover_text(
                     "Pin the current shader's last good compile into the pool so a \
                      cue can use it while you keep livecoding this one. Key: c",
@@ -44,23 +45,13 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             {
                 let _ = tx.send(Command::CaptureShader);
             }
-            ui.add_space(SP_MD);
-            let mut unpinned = None;
-            for s in &m.shader_pool {
-                let resp = widgets::chip(ui, s.name.as_ref(), None, true);
-                ui.interact(resp.rect, ui.id().with(("pinned_shader_hover", s.id)), egui::Sense::hover())
-                    .on_hover_text("Pinned shader — available to any cue's shader override. ✕ to unpin.");
-                if resp.removed {
-                    unpinned = Some(s.id);
-                }
-                ui.add_space(SP_SM);
-            }
-            if let Some(id) = unpinned {
-                let _ = tx.send(Command::RemoveShader(id));
+            if !m.shader_pool.is_empty() {
+                ui.add_space(SP_MD);
+                pinned_shaders(ui, m, tx);
             }
 
             ui.add_space(SP_MD);
-            if widgets::bracket_button(ui, "save", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} save", icon::SAVE), None, 0.0)
                 .on_hover_text(
                     "Save the project (⌘/Ctrl+S). Writes back to the loaded file, or \
                      asks where to put it for a fresh session.",
@@ -69,7 +60,7 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             {
                 let _ = tx.send(Command::SaveProject);
             }
-            if widgets::bracket_button(ui, "save as…", None, 0.0)
+            if widgets::bracket_button(ui, &format!("{} save as…", icon::SAVE), None, 0.0)
                 .on_hover_text("Save the project to a new .viproj file")
                 .clicked()
             {
@@ -101,6 +92,33 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
         error_drawer(ui, m);
         ui.add_space(SP_SM);
         statusline(ui, m);
+    });
+}
+
+/// Collapsed toggle for the pinned-shader pool: `[N pinned]`, opening a popup
+/// with one row per pinned shader (name + delete button) on click, instead
+/// of chips always eating a full row's width as the pool grows.
+fn pinned_shaders(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    let resp = widgets::bracket_button(ui, &format!("{} pinned", m.shader_pool.len()), None, 0.0)
+        .on_hover_text("Pinned shaders — available to any cue's shader override");
+    egui::Popup::menu(&resp).show(|ui| {
+        for s in &m.shader_pool {
+            ui.horizontal(|ui| {
+                // Plain label + a full-widget delete button, not `chip`'s
+                // carved-out close sub-rect: that math assumes a stable
+                // horizontal flow and doesn't hold up inside the popup's
+                // justified vertical layout (the click landed in the popup,
+                // closing it, but not on the sub-rect chip expected).
+                ui.label(egui::RichText::new(s.name.as_ref()).monospace().color(p.fg_secondary));
+                if widgets::bracket_button(ui, icon::DELETE, Some(p.error), 0.0)
+                    .on_hover_text("unpin")
+                    .clicked()
+                {
+                    let _ = tx.send(Command::RemoveShader(s.id));
+                }
+            });
+        }
     });
 }
 
@@ -218,40 +236,17 @@ fn error_drawer(ui: &mut Ui, m: &UiMirror) {
 
 /// The statusline: a full-width `select`-filled strip with the mode word
 /// (NORMAL / ENTRY while typing a BPM / ERROR on a failed compile), the
-/// loaded shader, a session summary, and the theme switchboard on the right.
+/// loaded shader, a session summary, and the collapsed theme toggle on the
+/// right.
 fn statusline(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
-    let cw = widgets::cell_width(ui);
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, p.accent_dim);
-
-    // Mode segment: its own fill when something is happening.
-    let (mode, mode_bg) = if m.shader_error.is_some() {
+    let mode = if m.shader_error.is_some() {
         ("ERROR", Some(p.error))
     } else if m.bpm_entry.is_some() {
         ("ENTRY", Some(p.accent))
     } else {
         ("NORMAL", None)
     };
-    let mode_cells = mode.chars().count() as f32 + 2.0;
-    if let Some(bg) = mode_bg {
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.min, egui::vec2(cw * mode_cells, rect.height())),
-            egui::CornerRadius::ZERO,
-            bg,
-        );
-    }
-    let mode_fg = if mode_bg.is_some() { p.bg_inset } else { p.fg_primary };
-    painter.text(
-        egui::pos2(rect.min.x + cw, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        mode,
-        mono(),
-        mode_fg,
-    );
-
     let summary = format!(
         "{}   {} clips · {} cues · {:.1} bpm",
         m.shader_name.as_deref().unwrap_or("—"),
@@ -259,19 +254,5 @@ fn statusline(ui: &mut Ui, m: &UiMirror) {
         m.cues.len(),
         m.bpm,
     );
-    // Clip the summary short of the theme switchboard so a narrow window
-    // truncates it instead of running the two together.
-    let summary_clip = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.max.x - cw * widgets::THEME_CELLS, rect.max.y),
-    );
-    painter.with_clip_rect(summary_clip).text(
-        egui::pos2(rect.min.x + cw * (mode_cells + 2.0), rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        summary,
-        mono(),
-        p.fg_secondary,
-    );
-
-    widgets::theme_controls(ui, rect);
+    widgets::statusline(ui, mode, &summary);
 }
