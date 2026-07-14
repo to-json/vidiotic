@@ -207,7 +207,9 @@ fn spectrum(ui: &mut Ui, m: &UiMirror) {
 
 /// Slide-open drawer under the bar for the shader compile error: `error`-tinted
 /// fill, a 2px `error` left border, monospace `fg_primary` text (the border
-/// alone carries the red — a red-on-dark error wall was unreadable).
+/// alone carries the red — a red-on-dark error wall was unreadable). Collapsed
+/// to the first line of the message by default; click the chevron to open a
+/// scrollable view of the full text.
 fn error_drawer(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
     let openness = ui.ctx().animate_bool(egui::Id::new("shader_err_drawer"), m.shader_error.is_some());
@@ -222,14 +224,33 @@ fn error_drawer(ui: &mut Ui, m: &UiMirror) {
         ui.data_mut(|d| d.insert_temp(text_id, err.to_string()));
     }
     let text = ui.data_mut(|d| d.get_temp::<String>(text_id)).unwrap_or_default();
+    let first_line = text.lines().next().unwrap_or_default().to_string();
+
+    let expanded_id = egui::Id::new("shader_err_expanded");
+    let mut expanded = ui.data_mut(|d| d.get_temp::<bool>(expanded_id)).unwrap_or(false);
 
     let frame = egui::Frame::new()
         .fill(p.error.linear_multiply(0.08))
         .inner_margin(egui::Margin::symmetric(SP_MD as i8, SP_SM as i8));
     let outer = frame.show(ui, |ui| {
-        egui::ScrollArea::vertical().id_salt("shader_err").max_height(96.0 * openness).show(ui, |ui| {
-            ui.label(egui::RichText::new(&text).monospace().color(p.fg_primary));
+        ui.horizontal(|ui| {
+            let chevron = if expanded { icon::MOVE_UP } else { icon::MOVE_DOWN };
+            if widgets::bracket_button(ui, chevron, Some(p.error), 0.0)
+                .on_hover_text(if expanded { "collapse" } else { "expand full message" })
+                .clicked()
+            {
+                expanded = !expanded;
+                ui.data_mut(|d| d.insert_temp(expanded_id, expanded));
+            }
+            ui.add(
+                egui::Label::new(egui::RichText::new(&first_line).monospace().color(p.fg_primary)).truncate(),
+            );
         });
+        if expanded {
+            egui::ScrollArea::vertical().id_salt("shader_err").max_height(160.0 * openness).show(ui, |ui| {
+                ui.label(egui::RichText::new(&text).monospace().color(p.fg_primary));
+            });
+        }
     });
     let border = egui::Rect::from_min_size(outer.response.rect.min, egui::vec2(2.0, outer.response.rect.height()));
     ui.painter().rect_filled(border, egui::CornerRadius::ZERO, p.error);
