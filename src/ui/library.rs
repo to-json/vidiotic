@@ -10,7 +10,9 @@ use phosphor::theme::{self, mono, palette, ROW, SP_MD, SP_SM};
 use phosphor::widgets::{self, TileSpec};
 
 use super::{pick_file, tile_role, PickKind};
-use crate::commands::{BankView, ClipBankView, ClipEntry, ClipId, Command, CueView, UiMirror};
+use crate::commands::{
+    BankView, CameraEntry, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueView, UiMirror,
+};
 
 /// Central panel: the source clip pool, bank tabs, and the edit bank's cue list.
 pub(super) fn show(
@@ -62,6 +64,9 @@ pub(super) fn show(
                     });
                 }
             });
+
+        ui.add_space(SP_MD);
+        cameras_section(ui, m, tx);
 
         ui.add_space(SP_MD);
         bank_bar(ui, m, tx);
@@ -128,6 +133,66 @@ fn clip_tile(
     if resp.double_clicked {
         let _ = tx.send(Command::AddCue(clip.id));
     }
+}
+
+/// The cameras section: one row per enumerated capture device with an on-air
+/// toggle and a status tag. Double-click a device's name to add a cue, like a
+/// clip tile.
+fn cameras_section(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
+    let p = palette();
+    ui.horizontal_wrapped(|ui| {
+        widgets::section_label(ui, "cameras");
+        if widgets::bracket_button(ui, "refresh", None, 0.0)
+            .on_hover_text("re-enumerate capture devices (after plugging/unplugging)")
+            .clicked()
+        {
+            let _ = tx.send(Command::RefreshCameras);
+        }
+    });
+    if m.cameras.is_empty() {
+        ui.label(egui::RichText::new("no capture devices found").small().color(p.fg_muted));
+        return;
+    }
+    for cam in &m.cameras {
+        camera_row(ui, cam, tx);
+    }
+}
+
+/// One capture device: on-air toggle, camera-glyph name (double-click adds a
+/// cue to the edit bank), status tag, and the playing/armed role tag.
+fn camera_row(ui: &mut Ui, cam: &CameraEntry, tx: &Sender<Command>) {
+    let p = palette();
+    ui.horizontal(|ui| {
+        let mut on = cam.on_air;
+        if widgets::glyph_checkbox(ui, &mut on, "")
+            .on_hover_text(
+                "on air: keep this camera capturing (privacy light on) regardless of cue rotation",
+            )
+            .changed()
+        {
+            let _ = tx.send(Command::SetCameraOnAir(cam.uid.clone(), on));
+        }
+        let name_color = if cam.active { p.fg_primary } else { p.fg_secondary };
+        let resp = ui
+            .add(
+                egui::Label::new(egui::RichText::new(format!("◉ {}", cam.name)).color(name_color))
+                    .sense(Sense::click()),
+            )
+            .on_hover_text("double-click: add a cue to the edit bank");
+        if resp.double_clicked() {
+            let _ = tx.send(Command::AddCameraCue(cam.uid.clone()));
+        }
+        widgets::chip(ui, &cam.status, cam.on_air.then_some(p.phosphor), false);
+        match cam.role {
+            ClipRole::Playing => {
+                widgets::chip(ui, "playing", Some(p.playing), false);
+            }
+            ClipRole::Armed => {
+                widgets::chip(ui, "armed", Some(p.armed), false);
+            }
+            ClipRole::None => {}
+        }
+    });
 }
 
 /// One bracket-text tab: `[name (3)]` accent when selected, dim otherwise,
@@ -383,6 +448,9 @@ fn fmt_beats(ticks: u32) -> String {
 }
 
 fn trim_label(cue: &CueView) -> String {
+    if cue.camera {
+        return "live".to_string();
+    }
     let out = cue.out_sec.map(super::fmt_time).unwrap_or_else(|| "end".to_string());
     format!("{}–{}", super::fmt_time(cue.in_sec), out)
 }

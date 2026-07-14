@@ -10,10 +10,11 @@ use phosphor::theme::{palette, SP_LG, SP_MD, SP_SM};
 use phosphor::widgets;
 
 use super::{fmt_time, LOOP_CADENCE};
-use crate::bank::Toggle;
+use crate::bank::{CamDelay, Toggle};
 use crate::commands::{
     ChainSlot, ClipRole, Command, CueParam, CueView, SlotRef, UiMirror, LOOP_TICKS_PER_BEAT,
 };
+use crate::video::capture::DELAY_CAP;
 use crate::isf::{IsfInput, IsfInputKind, IsfValue};
 
 /// Ticks per beat, as a float for beat↔tick conversions in the advanced rows.
@@ -84,6 +85,18 @@ fn cue_editor(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
 /// (when enabled), and the remove button.
 fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
     let p = palette();
+    // Camera cues have no timeline: the trim grid gives way to the live-delay
+    // controls, and the seek-dependent knobs below render greyed and inert.
+    if cue.camera {
+        ui.label(
+            egui::RichText::new("live camera — no timeline to trim")
+                .small()
+                .color(p.fg_muted),
+        );
+        ui.add_space(SP_MD);
+        delay_section(ui, m, cue, tx);
+    }
+    if !cue.camera {
     egui::Grid::new("cue_trim").num_columns(2).spacing(egui::vec2(SP_SM, SP_SM)).show(ui, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new("in").color(p.fg_muted));
@@ -152,25 +165,32 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
         });
         ui.end_row();
     });
+    }
 
     ui.add_space(SP_LG);
-    widgets::section_label(ui, "preserve playhead").on_hover_text(
-        "On a cut, carry the playhead into this cue. Inherit follows the global toggle.",
-    );
-    let preserve_idx = match cue.preserve {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
-    };
-    if let Some(i) = widgets::segmented(ui, "cue_preserve", &["inherit", "on", "off"], Some(preserve_idx))
-    {
-        let val = match i {
-            0 => None,
-            1 => Some(true),
-            _ => Some(false),
+    // Preserve is meaningless once restart is a no-op (camera): greyed, inert.
+    ui.add_enabled_ui(!cue.camera, |ui| {
+        widgets::section_label(ui, "preserve playhead").on_hover_text(
+            "On a cut, carry the playhead into this cue. Inherit follows the global toggle.",
+        );
+        let preserve_idx = match cue.preserve {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
         };
-        let _ = tx.send(Command::SetCuePreserve(cue.id, val));
-    }
+        if let Some(i) =
+            widgets::segmented(ui, "cue_preserve", &["inherit", "on", "off"], Some(preserve_idx))
+        {
+            let val = match i {
+                0 => None,
+                1 => Some(true),
+                _ => Some(false),
+            };
+            if !cue.camera {
+                let _ = tx.send(Command::SetCuePreserve(cue.id, val));
+            }
+        }
+    });
 
     ui.add_space(SP_LG);
     chain_section(ui, m, cue, tx);
@@ -193,6 +213,66 @@ fn cue_fields(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
             .color(p.fg_muted),
     );
     ui.add_space(SP_SM);
+}
+
+/// The camera cue's voluntary live delay: a fader dialed in seconds or beats
+/// (unit toggle re-expresses the value so the resolved delay stays put), plus
+/// the quantize-to-loop-grid toggle and the current effective readout. Beats
+/// mode shows its clamp whenever `beats × 60/bpm` exceeds the ring window.
+fn delay_section(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Command>) {
+    let p = palette();
+    let d = cue.delay;
+    let send = |d: CamDelay| {
+        let _ = tx.send(Command::SetCueParam(cue.id, CueParam::CamDelay(d)));
+    };
+    widgets::section_label(ui, "live delay").on_hover_text(
+        "Play this camera behind the live feed. Changes glide toward the new value \
+         (or snap at loop-grid boundaries with quantize on).",
+    );
+    let bpm = m.bpm.max(1.0);
+    ui.horizontal(|ui| {
+        if let Some(i) =
+            widgets::segmented(ui, "cam_delay_unit", &["seconds", "beats"], Some(usize::from(d.beats)))
+        {
+            let beats = i == 1;
+            if beats != d.beats {
+                let value = if beats { d.value * bpm / 60.0 } else { d.value * 60.0 / bpm };
+                send(CamDelay { value, beats, ..d });
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        let max = if d.beats { (DELAY_CAP * bpm / 60.0).max(1.0) } else { DELAY_CAP };
+        let mut v = d.value as f32;
+        if widgets::fader(ui, "cam_delay_fader", 0.0, max as f32, &mut v, 12).changed() {
+            send(CamDelay { value: f64::from(v), ..d });
+        }
+        let unit = if d.beats { "b" } else { "s" };
+        ui.label(
+            egui::RichText::new(format!("{:>5.2} {unit}", d.value))
+                .monospace()
+                .color(p.fg_primary),
+        );
+    });
+    if d.beats && d.seconds(bpm) > DELAY_CAP {
+        ui.label(
+            egui::RichText::new(format!("clamped to {DELAY_CAP:.1} s at {bpm:.0} bpm"))
+                .small()
+                .color(p.armed),
+        );
+    }
+    let mut q = d.quantize;
+    if widgets::glyph_checkbox(ui, &mut q, "quantize to loop grid")
+        .on_hover_text("Apply delay changes exactly on loop-grid boundaries instead of gliding.")
+        .changed()
+    {
+        send(CamDelay { quantize: q, ..d });
+    }
+    ui.label(
+        egui::RichText::new(format!("→ {:.2} s effective", cue.delay_eff))
+            .monospace()
+            .color(p.fg_secondary),
+    );
 }
 
 /// Human-readable label for a chain slot.
@@ -496,19 +576,25 @@ fn advanced_sections(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Comma
         let val = v.round() as i32;
         let _ = tx.send(Command::SetCueParam(cue.id, CueParam::LoopPhase(Toggle { on, val })));
     }
-    if let Some((on, v)) = param_row(
-        ui,
-        "nudge",
-        "Add seconds to the in-point on each (re)start — sweep which frames show.",
-        cue.start_nudge.on,
-        cue.start_nudge.val,
-        0.01,
-        -600.0..=600.0,
-        " s",
-        2,
-    ) {
-        let _ = tx.send(Command::SetCueParam(cue.id, CueParam::StartNudge(Toggle { on, val: v })));
-    }
+    // Nudge shifts the in-point — meaningless without a timeline.
+    ui.add_enabled_ui(!cue.camera, |ui| {
+        if let Some((on, v)) = param_row(
+            ui,
+            "nudge",
+            "Add seconds to the in-point on each (re)start — sweep which frames show.",
+            cue.start_nudge.on,
+            cue.start_nudge.val,
+            0.01,
+            -600.0..=600.0,
+            " s",
+            2,
+        ) {
+            if !cue.camera {
+                let _ = tx
+                    .send(Command::SetCueParam(cue.id, CueParam::StartNudge(Toggle { on, val: v })));
+            }
+        }
+    });
     if let Some((on, v)) = param_row(
         ui,
         "delay",
@@ -525,7 +611,11 @@ fn advanced_sections(ui: &mut Ui, m: &UiMirror, cue: &CueView, tx: &Sender<Comma
     }
 
     ui.add_space(SP_LG);
-    speed_section(ui, cue, tx);
+    // Speed (BPM-sync × multiplier) is pacing math on a seekable timeline; a
+    // live feed is already real-time. Greyed and inert for camera cues.
+    ui.add_enabled_ui(!cue.camera, |ui| {
+        speed_section(ui, cue, tx);
+    });
 }
 
 /// Dwell: an "inherit" toggle plus a beats `DragValue` when overridden.

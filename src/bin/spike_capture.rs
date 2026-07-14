@@ -203,7 +203,7 @@ mod macos {
     const DELAY: f64 = 1.5;
     const RUN_FOR: Duration = Duration::from_secs(5);
 
-    /// Stream 2 go/no-go: CaptureService + live tap + delayed tap through the
+    /// Stream 2 go/no-go: `CaptureService` + live tap + delayed tap through the
     /// real offscreen render path. Passes when the delayed tap's frames trail
     /// the live edge by the requested delay (within a couple frame periods)
     /// and both taps render through `Renderer` without error.

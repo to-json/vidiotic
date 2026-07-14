@@ -27,6 +27,37 @@ impl<T> Toggle<T> {
     }
 }
 
+/// A camera cue's voluntary delay: how far behind the live edge it plays.
+/// Dialed in seconds, or in beats (re-resolved against the live tempo every
+/// tick). By default a change slews toward its new target; with `quantize` on
+/// it re-targets exactly at loop-grid boundary crossings instead. Ignored for
+/// file-backed cues.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CamDelay {
+    pub value: f64,
+    /// `value` is in beats (`× 60 / bpm`) rather than seconds.
+    pub beats: bool,
+    /// Re-target at loop-grid boundaries instead of slewing continuously.
+    pub quantize: bool,
+}
+
+impl CamDelay {
+    /// The target delay in seconds at the given live tempo.
+    pub fn seconds(&self, bpm: f64) -> f64 {
+        if self.beats {
+            self.value * 60.0 / bpm.max(1.0)
+        } else {
+            self.value
+        }
+    }
+}
+
+impl Default for CamDelay {
+    fn default() -> Self {
+        Self { value: 0.0, beats: false, quantize: false }
+    }
+}
+
 /// A placement of a source clip: trim points plus per-cue playback overrides.
 ///
 /// The advanced-mode fields (`dwell` through `speed_mul`) are always stored but
@@ -69,6 +100,8 @@ pub struct Cue {
     pub bpm_sync_on: bool,
     /// User playback-speed multiplier, stacked on top of any BPM-sync factor.
     pub speed_mul: Toggle<f64>,
+    /// Voluntary live delay, for camera-sourced cues only.
+    pub delay: CamDelay,
 }
 
 impl Cue {
@@ -90,6 +123,7 @@ impl Cue {
             bpm: None,
             bpm_sync_on: false,
             speed_mul: Toggle::off(1.0),
+            delay: CamDelay::default(),
         }
     }
 }

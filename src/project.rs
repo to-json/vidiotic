@@ -502,9 +502,14 @@ impl ClipSpec {
     /// different directory would emit a string that resolves against the wrong
     /// root on load.
     pub fn from_clip(c: &Clip, project_dir: &Path, meta: ClipMeta) -> Self {
+        let path = match c.file_path() {
+            Some(p) => relativize(project_dir, &absolutize(p)),
+            // Camera clips have no file; their identity is the CameraSpec.
+            None => String::new(),
+        };
         Self {
             id: c.id,
-            path: relativize(project_dir, &absolutize(&c.path)),
+            path,
             name: c.name.to_string(),
             bpm: c.bpm,
             fps: meta.fps,
@@ -518,7 +523,7 @@ impl ClipSpec {
     pub fn to_clip(&self, resolved: PathBuf) -> Clip {
         Clip {
             id: self.id,
-            path: resolved,
+            source: crate::clippool::ClipSource::File(resolved),
             name: self.name.as_str().into(),
             bpm: self.bpm,
         }
@@ -608,6 +613,7 @@ impl CueSpec {
             bpm: self.bpm,
             bpm_sync_on: self.bpm_sync_on,
             speed_mul: toggle(self.speed_mul, 1.0),
+            delay: crate::bank::CamDelay::default(),
         }
     }
 }
@@ -824,7 +830,7 @@ mod tests {
         // carries a `Builtin("kaleido") → Live` chain (the feature we must persist).
         let clips = vec![Clip {
             id: 0,
-            path: dir.join("clips/kick.mov"),
+            source: crate::clippool::ClipSource::File(dir.join("clips/kick.mov")),
             name: "kick.mov".into(),
             bpm: Some(128.0),
         }];
@@ -900,7 +906,7 @@ mod tests {
         // first, so relativizing against a foreign dir yields an absolute path.
         let clip = Clip {
             id: 0,
-            path: "some/relative/clip.mov".into(),
+            source: crate::clippool::ClipSource::File("some/relative/clip.mov".into()),
             name: "clip.mov".into(),
             bpm: None,
         };

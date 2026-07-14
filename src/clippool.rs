@@ -13,15 +13,44 @@ const VIDEO_EXTS: &[&str] = &["mov", "mp4", "mkv", "m4v", "avi", "webm", "hap"];
 const THUMB_W: u32 = 192;
 const THUMB_H: u32 = 108;
 
-/// One source video in the pool.
+/// Where a pool clip's frames come from.
+#[derive(Clone, Debug)]
+pub enum ClipSource {
+    /// A video file on disk.
+    File(PathBuf),
+    /// A live capture device, by its stable `AVFoundation` `uniqueID`. `name` is
+    /// the device's human name at the time the clip was created (also the
+    /// relink hint when the uid is absent).
+    Camera { uid: Arc<str>, name: Arc<str> },
+}
+
+/// One source in the pool: a video file, or a camera device.
 #[derive(Clone, Debug)]
 pub struct Clip {
     pub id: ClipId,
-    pub path: PathBuf,
+    pub source: ClipSource,
     pub name: Arc<str>,
     /// User-entered source tempo, used for advanced-mode BPM-synced playback;
     /// `None` until set (not derived from the file — container FPS is unreliable).
     pub bpm: Option<f64>,
+}
+
+impl Clip {
+    /// The backing file, for file-sourced clips.
+    pub fn file_path(&self) -> Option<&Path> {
+        match &self.source {
+            ClipSource::File(p) => Some(p),
+            ClipSource::Camera { .. } => None,
+        }
+    }
+
+    /// The capture-device uid, for camera-sourced clips.
+    pub fn camera_uid(&self) -> Option<&str> {
+        match &self.source {
+            ClipSource::File(_) => None,
+            ClipSource::Camera { uid, .. } => Some(uid),
+        }
+    }
 }
 
 /// A named group of clips over the flat pool, referenced by id. Purely a
@@ -76,7 +105,7 @@ pub fn scan_from(dir: &Path, start_id: ClipId) -> Vec<Clip> {
                 .into();
             Clip {
                 id: start_id + i as ClipId,
-                path,
+                source: ClipSource::File(path),
                 name,
                 bpm: None,
             }
@@ -93,7 +122,10 @@ pub fn spawn_thumbnailer(clips: Vec<Clip>) -> crossbeam_channel::Receiver<Thumbn
         .spawn(move || {
             let _ = ff::init();
             for clip in clips {
-                match first_frame_rgba(&clip.path, THUMB_W, THUMB_H) {
+                // Camera clips have no file to decode; their pool row wears a
+                // static glyph instead.
+                let Some(path) = clip.file_path() else { continue };
+                match first_frame_rgba(path, THUMB_W, THUMB_H) {
                     Ok((w, h, rgba)) => {
                         let _ = tx.send(Thumbnail {
                             id: clip.id,

@@ -142,7 +142,7 @@ fn load_from_flags(cli: &RunArgs) -> anyhow::Result<Loaded> {
             .into();
         clips.push(Clip {
             id,
-            path: single.clone(),
+            source: clippool::ClipSource::File(single.clone()),
             name,
             bpm: None,
         });

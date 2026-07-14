@@ -297,8 +297,12 @@ pub fn open_by_index(
     }
 }
 
-/// How much history a service's ring retains. Slightly above the 3 s delay cap
-/// so a maxed-out delay still finds a frame.
+/// Maximum voluntary delay a cue can dial in, seconds. The ship cap from the
+/// plan's staging; raising it is the "scale" pass.
+pub const DELAY_CAP: f64 = 3.0;
+
+/// How much history a service's ring retains. Slightly above [`DELAY_CAP`] so
+/// a maxed-out delay still finds a frame.
 const RING_WINDOW: Duration = Duration::from_millis(3200);
 
 /// Hard memory bound per ring. A correctness bound, not a tuning knob: an
@@ -394,6 +398,12 @@ struct Ring {
     status: Mutex<ServiceStatus>,
 }
 
+/// Lock, recovering from poisoning — a panicked capture thread must not take
+/// the render thread down with it.
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A per-cue read handle onto a device's delay ring. Pull-based: the app polls
 /// it on the frame-drain tick; nothing blocks and idle taps cost nothing. Each
 /// tap has its own delay offset and swscale cache, so cues on the same device
@@ -413,7 +423,7 @@ impl CameraTap {
     /// empty). Conversion touches only the emitted frame.
     pub fn poll(&mut self, now: Instant) -> Option<DecodedFrame> {
         let target = now.checked_sub(Duration::from_secs_f64(self.delay_eff.max(0.0)))?;
-        let state = self.ring.state.lock().expect("ring lock");
+        let state = lock_unpoisoned(&self.ring.state);
         let picked = state.peek_at(target)?;
         if self.last_wall == Some(picked.wall) {
             return None;
@@ -433,7 +443,7 @@ impl CameraTap {
             self.scaler = Some((ctx, (w, h, fmt)));
         }
         let mut rgba = ff::frame::Video::empty();
-        let (scaler, _) = self.scaler.as_mut().expect("scaler just set");
+        let (scaler, _) = self.scaler.as_mut()?;
         if let Err(e) = scaler.run(&picked.frame, &mut rgba) {
             log::warn!("camera tap convert failed: {e}");
             return None;
@@ -464,7 +474,7 @@ pub struct CaptureService {
 }
 
 impl CaptureService {
-    /// Start capturing from the device with AVFoundation uid `uid`.
+    /// Start capturing from the device with `AVFoundation` uid `uid`.
     pub fn start(uid: String) -> Self {
         let ring = Arc::new(Ring {
             state: Mutex::new(RingState::new(RING_WINDOW, RING_BYTE_CAP)),
@@ -489,7 +499,7 @@ impl CaptureService {
     }
 
     pub fn status(&self) -> ServiceStatus {
-        self.ring.status.lock().expect("status lock").clone()
+        lock_unpoisoned(&self.ring.status).clone()
     }
 }
 
@@ -507,7 +517,7 @@ impl Drop for CaptureService {
 }
 
 fn set_status(ring: &Ring, s: ServiceStatus) {
-    *ring.status.lock().expect("status lock") = s;
+    *lock_unpoisoned(&ring.status) = s;
 }
 
 /// Sleep in stop-checkable slices before an open retry.
@@ -581,7 +591,7 @@ fn capture_once(uid: &str, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()>
             let wall = Instant::now();
             let pts_sec = wall.duration_since(start).as_secs_f64();
             let frame = std::mem::replace(&mut decoded, ff::frame::Video::empty());
-            ring.state.lock().expect("ring lock").push(wall, pts_sec, frame);
+            lock_unpoisoned(&ring.state).push(wall, pts_sec, frame);
         }
     }
     // The packet iterator only ends on read error / EOF — a live input
@@ -590,7 +600,7 @@ fn capture_once(uid: &str, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()>
 }
 
 /// The on-air registry: one persistent [`CaptureService`] per toggled-on
-/// device, keyed by AVFoundation uid. Owned by the app; deliberately not
+/// device, keyed by `AVFoundation` uid. Owned by the app; deliberately not
 /// touched by cue-lifetime bookkeeping like `retain_decoders`.
 #[derive(Default)]
 pub struct CaptureRegistry {

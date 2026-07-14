@@ -19,11 +19,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::analysis::AudioFrame;
 use crate::audio::{self, AudioCapture};
 use crate::bank::{Bank, Cue, CueId};
-use crate::clippool::{self, Clip, ClipBank, Thumbnail};
+use crate::clippool::{self, Clip, ClipBank, ClipSource, Thumbnail};
 use crate::clock::{BoundaryTracker, ClockSource, InternalClock, LinkClock};
 use crate::commands::{
-    BankView, Cadence, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command, CueParam,
-    CueView, SlotRef, SyncKind, TimeSig, UiMirror, LOOP_TICKS_PER_BEAT,
+    BankView, Cadence, CameraEntry, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command,
+    CueParam, CueView, SlotRef, SyncKind, TimeSig, UiMirror, LOOP_TICKS_PER_BEAT,
 };
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
@@ -31,11 +31,16 @@ use crate::sequencer::{CueStep, Sequencer, SequencerEvent};
 use crate::shader::lang_of;
 use crate::shaderwatch::ShaderWatcher;
 use crate::ui::EguiCtl;
+use crate::video::capture;
 use crate::video::decoder;
 use crate::video::SourceHandle;
-use crate::video::frame::DecodedFrame;
+use crate::video::frame::{DecodedFrame, PixelData};
 
 const SHADER_DEBOUNCE: Duration = Duration::from_millis(75);
+
+/// How fast a camera cue's effective delay glides toward its target, in
+/// seconds of delay per second of wall clock. Tuned by feel.
+const DELAY_SLEW_RATE: f64 = 1.0;
 
 /// Tap-tempo: a gap longer than this starts a fresh measurement, and at most
 /// this many recent taps are averaged.
@@ -119,6 +124,17 @@ pub struct App {
     selected_cue: Option<CueId>,
     next_cue_id: CueId,
     decoders: HashMap<CueId, SourceHandle>,
+    // Camera capture: one persistent service per on-air device, deliberately
+    // outside cue-lifetime bookkeeping (`retain_decoders` never touches it).
+    // `camera_devices` is the last enumeration (startup + manual refresh).
+    captures: capture::CaptureRegistry,
+    camera_devices: Vec<capture::DeviceInfo>,
+    // Wall-clock of the previous engine tick, for delay-slew integration.
+    last_tick: Instant,
+    // The cue a placeholder black frame was last uploaded for, so a source-less
+    // cue (camera off-air, failed spawn) blanks the output once instead of
+    // leaving the previous cue's frame up.
+    blanked_for: Option<CueId>,
     current: Option<CueId>,
     current_pts: f64, // playhead of the displayed clip, for set-in/out-to-playhead
     video_mode: i32,
@@ -211,6 +227,10 @@ impl App {
             selected_cue: None,
             next_cue_id,
             decoders: HashMap::new(),
+            captures: capture::CaptureRegistry::default(),
+            camera_devices: capture::enumerate(),
+            last_tick: Instant::now(),
+            blanked_for: None,
             current: None,
             current_pts: 0.0,
             video_mode: 0,
@@ -261,7 +281,18 @@ impl App {
     }
 
     fn clip_path(&self, id: ClipId) -> Option<PathBuf> {
-        self.clips.iter().find(|c| c.id == id).map(|c| c.path.clone())
+        self.clips
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.file_path().map(Path::to_path_buf))
+    }
+
+    /// The capture-device uid behind a clip, if it's camera-sourced.
+    fn clip_camera_uid(&self, id: ClipId) -> Option<Arc<str>> {
+        self.clips.iter().find(|c| c.id == id).and_then(|c| match &c.source {
+            ClipSource::Camera { uid, .. } => Some(uid.clone()),
+            ClipSource::File(_) => None,
+        })
     }
 
     fn clip_name(&self, id: ClipId) -> Arc<str> {
@@ -330,8 +361,19 @@ impl App {
         }
         let Some(cue) = self.live_cue(id).cloned() else { return };
         let clip = cue.clip;
-        // Advanced mode: sample-start nudge shifts the in-point, and playback
-        // speed (BPM-sync × user multiplier) is baked in at spawn time.
+        // Camera cues: a fresh tap onto the device's ring, starting at the
+        // dialed delay (slew only handles later changes). Off-air devices give
+        // no tap; the per-tick resolver retries, so toggling the device on-air
+        // picks the cue up without a re-trigger.
+        if let Some(uid) = self.clip_camera_uid(clip) {
+            if let Some(mut tap) = self.captures.tap(&uid) {
+                tap.delay_eff = cue.delay.seconds(self.last_bpm).clamp(0.0, capture::DELAY_CAP);
+                self.decoders.insert(id, SourceHandle::Camera(tap));
+            }
+            return;
+        }
+        // File cues. Advanced mode: sample-start nudge shifts the in-point, and
+        // playback speed (BPM-sync × user multiplier) is baked in at spawn time.
         let nudge = if self.advanced && cue.start_nudge.on { cue.start_nudge.val } else { 0.0 };
         let in_sec = (cue.in_sec + nudge).max(0.0);
         let out_sec = cue.out_sec.filter(|&o| o > in_sec);
@@ -522,6 +564,7 @@ impl App {
             CueParam::Bpm(v) => c.bpm = v,
             CueParam::BpmSync(on) => c.bpm_sync_on = on,
             CueParam::SpeedMul(t) => c.speed_mul = t,
+            CueParam::CamDelay(d) => c.delay = d,
         });
         if matches!(p, CueParam::Dwell(_) | CueParam::TrigDelay(_)) {
             self.resync_live_if_editing();
@@ -850,6 +893,106 @@ impl App {
         self.set_loop_len(self.loop_cadence.map(|c| c.ticks(self.time_sig)));
     }
 
+    /// Per-tick camera-cue upkeep. Re-attaches taps for camera cues that had
+    /// none (the device was off-air when they armed), then moves each tap's
+    /// effective delay toward the cue's target: slewing by default, snapping at
+    /// loop-grid boundary crossings with the cue's quantize toggle on. Targets
+    /// re-resolve every tick, so beats-mode delays track BPM drift musically.
+    fn resolve_camera_delays(&mut self, boundary_crossed: bool) {
+        let now = Instant::now();
+        // Clamp dt so a stall (window drag, sleep) doesn't teleport the delay.
+        let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
+        self.last_tick = now;
+
+        let want: Vec<CueId> = [self.current, self.sequencer.armed()]
+            .into_iter()
+            .flatten()
+            .filter(|&id| {
+                !self.decoders.contains_key(&id)
+                    && self
+                        .live_cue(id)
+                        .is_some_and(|c| self.clip_camera_uid(c.clip).is_some())
+            })
+            .collect();
+        for id in want {
+            self.ensure_decoder(id);
+        }
+
+        let bpm = self.last_bpm;
+        let targets: Vec<(CueId, f64, bool)> = self
+            .decoders
+            .iter()
+            .filter(|(_, h)| matches!(h, SourceHandle::Camera(_)))
+            .filter_map(|(&id, _)| {
+                let cue = self.live_cue(id)?;
+                let target = cue.delay.seconds(bpm).clamp(0.0, capture::DELAY_CAP);
+                Some((id, target, cue.delay.quantize))
+            })
+            .collect();
+        for (id, target, quantize) in targets {
+            let is_current = self.current == Some(id);
+            if let Some(tap) = self.decoders.get_mut(&id).and_then(SourceHandle::camera_mut) {
+                if quantize && is_current {
+                    if boundary_crossed {
+                        tap.delay_eff = target;
+                    }
+                } else if quantize {
+                    // Not on screen: re-target immediately, nothing to glide.
+                    tap.delay_eff = target;
+                } else {
+                    tap.delay_eff = capture::slew(tap.delay_eff, target, dt, DELAY_SLEW_RATE);
+                }
+            }
+        }
+    }
+
+    /// Re-enumerate capture devices (startup does one pass; this is the manual
+    /// refresh for hotplug).
+    fn refresh_cameras(&mut self) {
+        self.camera_devices = capture::enumerate();
+        log::info!("cameras: {} device(s)", self.camera_devices.len());
+    }
+
+    /// Toggle a device's capture service. Turning on when permission was never
+    /// asked fires the TCC prompt alongside the open attempt.
+    fn set_camera_on_air(&mut self, uid: &str, on: bool) {
+        if on && capture::authorization() == capture::Authorization::NotDetermined {
+            capture::request_access(|granted| {
+                log::info!("camera access request: granted={granted}");
+            });
+        }
+        self.captures.set_on_air(uid, on);
+    }
+
+    /// Add a cue for a capture device to the edit bank, creating the device's
+    /// pool clip on first use.
+    fn add_camera_cue(&mut self, uid: &str) {
+        let existing = self
+            .clips
+            .iter()
+            .find(|c| c.camera_uid() == Some(uid))
+            .map(|c| c.id);
+        let clip_id = existing.unwrap_or_else(|| {
+            let name: Arc<str> = self
+                .camera_devices
+                .iter()
+                .find(|d| d.uid == uid)
+                .map(|d| d.name.as_str())
+                .unwrap_or("camera")
+                .into();
+            let id = self.next_clip_id;
+            self.next_clip_id += 1;
+            self.clips.push(Clip {
+                id,
+                source: ClipSource::Camera { uid: uid.into(), name: name.clone() },
+                name,
+                bpm: None,
+            });
+            id
+        });
+        self.add_cue(clip_id);
+    }
+
     /// Reset the beat grid to its origin (bar 1, beat 1, phrase 1) and re-prime
     /// the phrase/loop boundary trackers so nothing misfires on the backward
     /// jump. Playlist position and playhead are untouched.
@@ -946,6 +1089,9 @@ impl App {
             Command::SetClipDir(dir) => self.set_clip_dir(dir),
             Command::AddClipDirAsBank(dir) => self.add_clip_dir_as_bank(dir),
             Command::SetActiveClipBank(i) => self.set_active_clip_bank(i),
+            Command::RefreshCameras => self.refresh_cameras(),
+            Command::SetCameraOnAir(uid, on) => self.set_camera_on_air(&uid, on),
+            Command::AddCameraCue(uid) => self.add_camera_cue(&uid),
             Command::SetShaderPath(p) => {
                 self.shader_path = p;
                 self.watcher = ShaderWatcher::new(&self.shader_path).ok();
@@ -1021,10 +1167,14 @@ impl App {
         // rate/phase come from the playing cue in advanced mode, else the global
         // loop setting; a loop phase shifts the grid for swing/micro-timing.
         let (loop_ticks, loop_phase) = self.current_loop_params();
+        let mut boundary_crossed = false;
         if let (Some(ticks), Some(cur)) = (loop_ticks, self.current) {
             let grid = ticks as f64 / LOOP_TICKS_PER_BEAT as f64;
             if snap.is_playing && self.loop_tracker.crossed(snap.beat - loop_phase, grid).is_some() {
+                boundary_crossed = true;
                 if let Some(h) = self.decoders.get(&cur) {
+                    // No-op for cameras — a live feed has nothing to seek. The
+                    // crossing still feeds quantized delay re-targeting below.
                     h.request_restart();
                 }
             }
@@ -1032,13 +1182,36 @@ impl App {
             self.loop_tracker.reset();
         }
 
-        // 6. Pull the newest frame from the current source and upload it.
+        // 5c. Camera cues: pick up taps that couldn't attach earlier and move
+        // each effective delay toward its target (slew, or snap on the grid).
+        self.resolve_camera_delays(boundary_crossed);
+
+        // 6. Pull the newest frame from the current source and upload it. A
+        // source-less cue (camera off-air, failed spawn) blanks the output
+        // once rather than leaving the previous cue's frame up.
         if let Some(cur) = self.current {
+            if !self.decoders.contains_key(&cur) && self.blanked_for != Some(cur) {
+                self.blanked_for = Some(cur);
+                self.current_pts = 0.0;
+                self.video_mode = 0;
+                if !self.output_occluded {
+                    if let (Some(g), Some(r)) = (self.graphics.as_ref(), self.renderer.as_mut()) {
+                        let black = DecodedFrame {
+                            pixels: PixelData::Rgba { data: vec![0; 16], stride: 8 },
+                            w: 2,
+                            h: 2,
+                            pts_sec: 0.0,
+                        };
+                        r.upload_frame(&g.device, &g.queue, &black);
+                    }
+                }
+            }
             let newest: Option<DecodedFrame> = self
                 .decoders
                 .get_mut(&cur)
                 .and_then(|h| h.poll_newest(Instant::now()));
             if let Some(frame) = newest {
+                self.blanked_for = None;
                 self.current_pts = frame.pts_sec;
                 self.video_mode = frame.pixels.video_mode();
                 // Skipped while occluded — nothing will ever present this
@@ -1207,6 +1380,45 @@ impl App {
                 bank: active,
             })
             .collect();
+        // The cameras section: last enumeration + live service status, with the
+        // same active/role marking as clip tiles (via the device's pool clip).
+        self.mirror.cameras = self
+            .camera_devices
+            .iter()
+            .map(|d| {
+                let clip_id = self
+                    .clips
+                    .iter()
+                    .find(|c| c.camera_uid() == Some(d.uid.as_str()))
+                    .map(|c| c.id);
+                let on_air = self.captures.is_on_air(&d.uid);
+                let status: Arc<str> = if on_air {
+                    match self.captures.status(&d.uid) {
+                        Some(capture::ServiceStatus::Running { width, height, fps }) => {
+                            format!("{width}x{height} @ {fps:.0}").into()
+                        }
+                        Some(capture::ServiceStatus::Failed(e)) => format!("error: {e}").into(),
+                        Some(capture::ServiceStatus::Starting) | None => "starting…".into(),
+                    }
+                } else {
+                    "off air".into()
+                };
+                CameraEntry {
+                    uid: d.uid.as_str().into(),
+                    name: d.name.as_str().into(),
+                    on_air,
+                    status,
+                    active: clip_id.is_some_and(|id| active_clips.contains(&id)),
+                    role: if clip_id.is_some() && playing_clip == clip_id {
+                        ClipRole::Playing
+                    } else if clip_id.is_some() && armed_clip == clip_id {
+                        ClipRole::Armed
+                    } else {
+                        ClipRole::None
+                    },
+                }
+            })
+            .collect();
         // Cue banks: the bank bar, and the edit bank's cues (with live roles).
         let armed_cue = self.sequencer.armed();
         let playing_cue = self.current;
@@ -1233,6 +1445,22 @@ impl App {
         let last_bpm = self.last_bpm;
         let clips = &self.clips;
         let clip_bpm = |id: ClipId| clips.iter().find(|c| c.id == id).and_then(|c| c.bpm);
+        let clip_camera = |id: ClipId| {
+            clips
+                .iter()
+                .find(|c| c.id == id)
+                .is_some_and(|c| c.camera_uid().is_some())
+        };
+        // Live tap delays for the editor's "effective" readout; cues without a
+        // tap fall back to their resolved target.
+        let delay_effs: HashMap<CueId, f64> = self
+            .decoders
+            .iter()
+            .filter_map(|(&id, h)| match h {
+                SourceHandle::Camera(t) => Some((id, t.delay_eff)),
+                SourceHandle::File(_) => None,
+            })
+            .collect();
         self.mirror.cues = self.banks[self.edit_bank]
             .cues
             .iter()
@@ -1264,6 +1492,12 @@ impl App {
                     bpm_sync_on: c.bpm_sync_on,
                     speed_mul: c.speed_mul,
                     speed: resolve_speed(advanced, last_bpm, c, clip_bpm),
+                    camera: clip_camera(c.clip),
+                    delay: c.delay,
+                    delay_eff: delay_effs
+                        .get(&c.id)
+                        .copied()
+                        .unwrap_or_else(|| c.delay.seconds(last_bpm).clamp(0.0, capture::DELAY_CAP)),
                 }
             })
             .collect();

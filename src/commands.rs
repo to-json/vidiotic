@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::bank::{CueId, Toggle};
+use crate::bank::{CamDelay, CueId, Toggle};
 use crate::isf::IsfValue;
 
 /// Identifies a source clip in the pool (its scan index).
@@ -199,6 +199,13 @@ pub enum Command {
     SetClipDir(PathBuf),                // replace the whole pool with one bank from this dir
     AddClipDirAsBank(PathBuf),          // append this dir as a new clip bank (keeps existing clips/cues)
     SetActiveClipBank(usize),           // which clip bank the pool grid shows
+    // Cameras. Devices are enumerated on demand (`RefreshCameras`); the on-air
+    // toggle runs/stops the device's capture service independent of cue
+    // rotation; `AddCameraCue` find-or-creates the device's pool clip and adds
+    // a cue for it to the edit bank.
+    RefreshCameras,
+    SetCameraOnAir(Arc<str>, bool),     // device uid
+    AddCameraCue(Arc<str>),             // device uid
     SetShaderPath(PathBuf),
     SetAudioDevice(Option<String>), // id key; None = default
     ToggleFullscreen,               // shell-intercepted
@@ -224,6 +231,7 @@ pub enum CueParam {
     Bpm(Option<f64>),          // source tempo override; None = inherit clip
     BpmSync(bool),             // retime to session tempo
     SpeedMul(Toggle<f64>),     // user speed multiplier
+    CamDelay(CamDelay),        // camera cues: voluntary delay behind the live edge
 }
 
 /// A clip/cue's live-playback role, for UI markers.
@@ -253,6 +261,18 @@ pub struct ClipBankView {
     pub clip_count: usize,
 }
 
+/// One capture device in the pool's cameras section.
+#[derive(Clone, Debug)]
+pub struct CameraEntry {
+    pub uid: Arc<str>,
+    pub name: Arc<str>,
+    pub on_air: bool,
+    /// Human status line: "off air", "1920x1080 @ 30", or an error.
+    pub status: Arc<str>,
+    pub active: bool,   // has a cue in the live bank
+    pub role: ClipRole, // playing/armed if its clip's cue is
+}
+
 /// One cue of the edit bank, as shown in the sequencer section / editor.
 #[derive(Clone, Debug)]
 pub struct CueView {
@@ -276,6 +296,9 @@ pub struct CueView {
     pub bpm_sync_on: bool,
     pub speed_mul: Toggle<f64>,
     pub speed: f64,             // resolved effective playback speed (for the readout)
+    pub camera: bool,           // camera-sourced: timeline knobs inert, delay applies
+    pub delay: CamDelay,        // camera cues: voluntary delay behind the live edge
+    pub delay_eff: f64,         // current slewed/quantized delay, seconds (readout)
 }
 
 /// A bank's identity for the bank bar.
@@ -330,6 +353,7 @@ pub struct UiMirror {
     pub clip_banks: Vec<ClipBankView>,
     pub active_clip_bank: usize,
     pub clips: Vec<ClipEntry>, // the active clip bank's clips, in id order
+    pub cameras: Vec<CameraEntry>, // enumerated capture devices (RefreshCameras)
     // Cue banks.
     pub banks: Vec<BankView>,
     pub live_bank: usize,
