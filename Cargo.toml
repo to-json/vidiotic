@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "phosphor"]
+members = ["."]
 
 [package]
 name = "vidiotic"
@@ -58,7 +58,7 @@ rtrb = "0.3"
 winit = "0.30.13"
 notify = "8.2"
 clap = { version = "4", features = ["derive"] }
-phosphor = { path = "phosphor" }
+phosphor = { path = "../phosphor" }
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false, features = ["links"] }
