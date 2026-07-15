@@ -25,6 +25,7 @@ use crate::commands::{
     BankView, Cadence, CameraEntry, ChainSlot, ClipBankView, ClipEntry, ClipId, ClipRole, Command,
     CueParam, CueView, SlotRef, SyncKind, TimeSig, UiMirror, LOOP_TICKS_PER_BEAT,
 };
+use crate::control_input::ControlInput;
 use crate::gfx::Graphics;
 use crate::render::{Globals, Renderer};
 use crate::sequencer::{CueStep, Sequencer, SequencerEvent};
@@ -84,6 +85,9 @@ pub struct Boot {
     pub audio_devices: Vec<Arc<str>>,
     pub cmd_tx: Sender<Command>,
     pub cmd_rx: Receiver<Command>,
+    /// This session's `.viproj`-embedded control-mapping layer (empty for
+    /// the non-project `--clip`/`--clip-dir` path).
+    pub controls: vidiotic_ctl::ControlMap,
 }
 
 /// The engine: owns the clock, sequencer, banks, decoders, renderer, and both
@@ -176,6 +180,7 @@ pub struct App {
     cmd_tx: Sender<Command>,
     cmd_rx: Receiver<Command>,
     mirror: UiMirror,
+    control_input: ControlInput,
 
     // window/input
     windowed: bool,
@@ -204,6 +209,7 @@ impl App {
         let next_clip_id = boot.clips.iter().map(|c| c.id).max().map_or(0, |m| m + 1);
         let cue_banks = if seeded { boot.cue_banks } else { vec![Bank::new("A")] };
         let next_cue_id = cue_banks.iter().flat_map(Bank::ids).max().map_or(1, |m| m + 1);
+        let control_input = ControlInput::new(boot.controls);
         let mut app = Self {
             graphics: None,
             renderer: None,
@@ -254,6 +260,7 @@ impl App {
             cmd_tx: boot.cmd_tx,
             cmd_rx: boot.cmd_rx,
             mirror: UiMirror::default(),
+            control_input,
             windowed: boot.windowed,
             monitor: boot.monitor,
             fullscreen_applied: false,
@@ -330,7 +337,7 @@ impl App {
             // against the save dir on load and be lost.
             shader_path: Some(project::relativize(dir, &project::absolutize(&self.shader_path))),
         };
-        let proj = Project::from_runtime(
+        let mut proj = Project::from_runtime(
             dir,
             &self.clips,
             &self.clip_banks,
@@ -338,6 +345,7 @@ impl App {
             &self.clip_meta,
             defaults,
         );
+        proj.controls = self.control_input.project_map().clone();
         match project::save(&proj, path) {
             Ok(()) => log::info!("saved project to {}", path.display()),
             Err(e) => log::error!("failed to save project to {}: {e:#}", path.display()),
@@ -1155,6 +1163,10 @@ impl App {
     }
 
     fn update(&mut self, event_loop: &ActiveEventLoop) {
+        // 0. Mapped MIDI/gamepad input — resolved commands land in cmd_rx,
+        // drained by step 1 below in this same tick.
+        self.control_input.pump(&self.cmd_tx);
+
         // 1. Commands (from UI + async pickers + keys).
         let cmds: Vec<Command> = self.cmd_rx.try_iter().collect();
         for c in cmds {
@@ -1638,6 +1650,24 @@ impl App {
     fn handle_key(&mut self, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
             return;
+        }
+        // Mapped keys override the hardcoded defaults below (a binding —
+        // including a masking `Nothing` one — always suppresses the
+        // built-in); unmapped keys fall through unchanged.
+        if let Some(key) = crate::control_input::canon_key(&ev.logical_key) {
+            let m = self.modifiers.state();
+            let consumed = self.control_input.offer_key(
+                &key,
+                m.control_key(),
+                m.alt_key(),
+                m.shift_key(),
+                m.super_key(),
+                ev.repeat,
+                &self.cmd_tx,
+            );
+            if consumed {
+                return;
+            }
         }
         let tx = &self.cmd_tx;
         match &ev.logical_key {

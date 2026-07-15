@@ -8,6 +8,7 @@ pub mod bank;
 pub mod clippool;
 pub mod clock;
 pub mod commands;
+pub mod control_input;
 pub mod gfx;
 pub mod isf;
 pub mod project;

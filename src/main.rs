@@ -123,6 +123,7 @@ struct Loaded {
     loop_cadence: Option<Cadence>,
     advanced: bool,
     shader: PathBuf,
+    controls: vidiotic_ctl::ControlMap,
 }
 
 /// Build the pool from `--clip`/`--clip-dir`: a flat pool wrapped in one clip
@@ -187,6 +188,7 @@ fn load_from_flags(cli: &RunArgs) -> anyhow::Result<Loaded> {
         loop_cadence: None,
         advanced: false,
         shader,
+        controls: vidiotic_ctl::ControlMap::default(),
     })
 }
 
@@ -313,6 +315,7 @@ fn load_from_project(cli: &RunArgs, path: &Path) -> anyhow::Result<Loaded> {
         loop_cadence: d.loop_cadence(),
         advanced: d.advanced,
         shader,
+        controls: resolved.project.controls.clone(),
     })
 }
 
@@ -372,6 +375,7 @@ fn run_player(cli: RunArgs) -> anyhow::Result<()> {
         audio_devices,
         cmd_tx,
         cmd_rx,
+        controls: loaded.controls,
     };
     app::run(boot)
 }
