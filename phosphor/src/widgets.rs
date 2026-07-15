@@ -628,8 +628,10 @@ pub fn theme_toggle(ui: &mut Ui, rect: Rect) {
 /// The shared statusline strip: a full-width `select`-filled bar with a mode
 /// segment (`mode.0`, tinted with `mode.1` when something is happening, else
 /// neutral), a `summary` readout, and the collapsed [`theme_toggle`] at the
-/// right edge. Used as the last row of each app's bottom panel.
-pub fn statusline(ui: &mut Ui, mode: (&str, Option<Color32>), summary: &str) {
+/// right edge. Used as the last row of each app's bottom panel. Returns
+/// whether the mode segment was clicked, so a tinted mode (e.g. "ERROR") can
+/// double as a click target without the widget knowing what that means.
+pub fn statusline(ui: &mut Ui, mode: (&str, Option<Color32>), summary: &str) -> bool {
     let p = palette();
     let cw = cell_width(ui);
     let (rect, _) =
@@ -640,15 +642,13 @@ pub fn statusline(ui: &mut Ui, mode: (&str, Option<Color32>), summary: &str) {
     // Mode segment: its own fill when something is happening.
     let (mode_label, mode_bg) = mode;
     let mode_cells = mode_label.chars().count() as f32 + 2.0;
+    let mode_rect = Rect::from_min_size(rect.min, egui::vec2(cw * mode_cells, rect.height()));
     if let Some(bg) = mode_bg {
-        painter.rect_filled(
-            Rect::from_min_size(rect.min, egui::vec2(cw * mode_cells, rect.height())),
-            CornerRadius::ZERO,
-            bg,
-        );
+        painter.rect_filled(mode_rect, CornerRadius::ZERO, bg);
     }
+    let mode_resp = ui.interact(mode_rect, ui.id().with("statusline_mode"), Sense::click());
     let mode_fg = if mode_bg.is_some() { p.bg_inset } else { p.fg_primary };
-    painter.text(
+    ui.painter().text(
         egui::pos2(rect.min.x + cw, rect.center().y),
         Align2::LEFT_CENTER,
         mode_label,
@@ -675,6 +675,7 @@ pub fn statusline(ui: &mut Ui, mode: (&str, Option<Color32>), summary: &str) {
         egui::vec2(cw * THEME_TOGGLE_CELLS, rect.height()),
     );
     theme_toggle(ui, toggle_rect);
+    mode_resp.clicked()
 }
 
 #[cfg(test)]

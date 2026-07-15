@@ -89,9 +89,9 @@ pub(super) fn show(ui: &mut Ui, m: &UiMirror, tx: &Sender<Command>) {
             });
         }
 
-        error_drawer(ui, m);
         ui.add_space(SP_SM);
         statusline(ui, m);
+        error_window(ui, m);
     });
 }
 
@@ -205,64 +205,47 @@ fn spectrum(ui: &mut Ui, m: &UiMirror) {
     });
 }
 
-/// Slide-open drawer under the bar for the shader compile error: `error`-tinted
-/// fill, a 2px `error` left border, monospace `fg_primary` text (the border
-/// alone carries the red — a red-on-dark error wall was unreadable). Collapsed
-/// to the first line of the message by default; click the chevron to open a
-/// scrollable view of the full text.
-fn error_drawer(ui: &mut Ui, m: &UiMirror) {
+/// Floating, resizable window with the full shader compile-error text.
+/// Opened via the indicator in the statusline; stays open (showing the last
+/// error) until the user closes it, even after the error clears.
+fn error_window(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
-    let openness = ui.ctx().animate_bool(egui::Id::new("shader_err_drawer"), m.shader_error.is_some());
-    if openness <= 0.001 {
-        return;
-    }
 
-    // Keep the last error text in temp memory so the drawer still has
-    // something to show while it eases closed after the error clears.
+    // Keep the last error text in memory so the window still has something
+    // to show if it's left open after the error clears.
     let text_id = egui::Id::new("shader_err_text");
     if let Some(err) = &m.shader_error {
         ui.data_mut(|d| d.insert_temp(text_id, err.to_string()));
     }
     let text = ui.data_mut(|d| d.get_temp::<String>(text_id)).unwrap_or_default();
-    let first_line = text.lines().next().unwrap_or_default().to_string();
 
-    let expanded_id = egui::Id::new("shader_err_expanded");
-    let mut expanded = ui.data_mut(|d| d.get_temp::<bool>(expanded_id)).unwrap_or(false);
-
-    let frame = egui::Frame::new()
-        .fill(p.error.linear_multiply(0.08))
-        .inner_margin(egui::Margin::symmetric(SP_MD as i8, SP_SM as i8));
-    let outer = frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let chevron = if expanded { icon::MOVE_UP } else { icon::MOVE_DOWN };
-            if widgets::bracket_button(ui, chevron, Some(p.error), 0.0)
-                .on_hover_text(if expanded { "collapse" } else { "expand full message" })
-                .clicked()
-            {
-                expanded = !expanded;
-                ui.data_mut(|d| d.insert_temp(expanded_id, expanded));
-            }
-            ui.add(
-                egui::Label::new(egui::RichText::new(&first_line).monospace().color(p.fg_primary)).truncate(),
-            );
-        });
-        if expanded {
-            egui::ScrollArea::vertical().id_salt("shader_err").max_height(160.0 * openness).show(ui, |ui| {
+    let open_id = egui::Id::new("shader_err_window_open");
+    let mut open = ui.data_mut(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    if !open {
+        return;
+    }
+    egui::Window::new("Shader error")
+        .id(egui::Id::new("shader_err_window"))
+        .open(&mut open)
+        .default_size(egui::vec2(480.0, 240.0))
+        .resizable(true)
+        .show(ui.ctx(), |ui| {
+            egui::ScrollArea::vertical().id_salt("shader_err").show(ui, |ui| {
                 ui.label(egui::RichText::new(&text).monospace().color(p.fg_primary));
             });
-        }
-    });
-    let border = egui::Rect::from_min_size(outer.response.rect.min, egui::vec2(2.0, outer.response.rect.height()));
-    ui.painter().rect_filled(border, egui::CornerRadius::ZERO, p.error);
+        });
+    ui.data_mut(|d| d.insert_temp(open_id, open));
 }
 
 /// The statusline: a full-width `select`-filled strip with the mode word
 /// (NORMAL / ENTRY while typing a BPM / ERROR on a failed compile), the
 /// loaded shader, a session summary, and the collapsed theme toggle on the
-/// right.
+/// right. When the mode is ERROR, its segment doubles as the indicator that
+/// opens [`error_window`] with the full compile-error text.
 fn statusline(ui: &mut Ui, m: &UiMirror) {
     let p = palette();
-    let mode = if m.shader_error.is_some() {
+    let has_error = m.shader_error.is_some();
+    let mode = if has_error {
         ("ERROR", Some(p.error))
     } else if m.bpm_entry.is_some() {
         ("ENTRY", Some(p.accent))
@@ -276,5 +259,9 @@ fn statusline(ui: &mut Ui, m: &UiMirror) {
         m.cues.len(),
         m.bpm,
     );
-    widgets::statusline(ui, mode, &summary);
+    let mode_clicked = widgets::statusline(ui, mode, &summary);
+    if mode_clicked && has_error {
+        let open_id = egui::Id::new("shader_err_window_open");
+        ui.data_mut(|d| d.insert_temp(open_id, true));
+    }
 }
