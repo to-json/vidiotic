@@ -28,7 +28,10 @@ use crate::isf::IsfValue;
 /// v2: camera clips (`ClipSpec.camera`) and per-cue live delay
 /// (`CueSpec.cam_delay`). v1 files load unchanged (the new fields default);
 /// v2 files fail in v1 binaries at the unknown `camera`/`cam_delay` keys.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3: embedded control mappings (`Project.controls`). v2 files load
+/// unchanged (an absent `controls` key defaults to an empty map).
+pub const FORMAT_VERSION: u32 = 3;
 
 /// A whole saved session: a flat clip pool, named clip-bank groupings over it,
 /// and the cue banks the sequencer plays.
@@ -45,6 +48,13 @@ pub struct Project {
     /// (an id may appear in several banks, or none).
     pub clip_banks: Vec<ClipBankSpec>,
     pub cue_banks: Vec<CueBankSpec>,
+    /// The project's control-mapping layer, layered over the user's global
+    /// map at resolve time (project wins). The one deliberate exception to
+    /// "on-disk specs mirror the runtime": `vidiotic_ctl::ControlMap` *is*
+    /// a format type by construction — `vidiotic-ctl` must not depend on
+    /// this crate, so it can't hand back a separate runtime type to mirror.
+    #[nserde(default)]
+    pub controls: vidiotic_ctl::ControlMap,
 }
 
 /// On-disk mirror of [`crate::commands::Cadence`].
@@ -358,6 +368,10 @@ fn migrate(p: &mut Project) {
     // v1 → v2: nothing to fix up — the added camera fields default to absent.
     if p.version == 1 {
         p.version = 2;
+    }
+    // v2 → v3: nothing to fix up — `controls` defaults to an empty map.
+    if p.version == 2 {
+        p.version = 3;
     }
 }
 
@@ -737,6 +751,9 @@ impl Project {
                 .collect(),
             clip_banks: clip_banks.iter().map(ClipBankSpec::from_bank).collect(),
             cue_banks: cue_banks.iter().map(|b| CueBankSpec::from_bank(b, dir)).collect(),
+            // Callers that track live control mappings overwrite this after
+            // `from_runtime` returns (Phase 7: `App::save_project_to`).
+            controls: vidiotic_ctl::ControlMap::default(),
         }
     }
 }
@@ -812,6 +829,7 @@ mod tests {
                     cam_delay: None,
                 }],
             }],
+            controls: vidiotic_ctl::ControlMap::default(),
         }
     }
 
@@ -1070,6 +1088,51 @@ mod tests {
             Cadence::Note(16 * crate::commands::LOOP_TICKS_PER_BEAT)
         );
         assert_eq!(p.defaults.loop_cadence(), None);
+    }
+
+    #[test]
+    fn v2_file_without_controls_migrates_to_v3_with_empty_map() {
+        // A hand-written v2 file (no `controls` key) parses and migrates.
+        let text = r#"(
+            version: 2,
+            defaults: (bpm: 120.0, quantum: 4.0, phrase_len: 16),
+            clips: [],
+            clip_banks: [],
+            cue_banks: [],
+        )"#;
+        let mut p = Project::deserialize_ron(text).expect("parse hand-written v2");
+        assert!(p.controls.bindings.is_empty());
+        migrate(&mut p);
+        assert_eq!(p.version, FORMAT_VERSION);
+        assert!(p.controls.bindings.is_empty());
+    }
+
+    #[test]
+    fn controls_round_trip_through_ron() {
+        let mut p = sample();
+        p.controls.bindings = vec![
+            vidiotic_ctl::Binding {
+                source: vidiotic_ctl::ControlSource::Key {
+                    key: "t".into(),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    cmd: false,
+                },
+                action: vidiotic_ctl::Action::TapDownbeat,
+            },
+            vidiotic_ctl::Binding {
+                source: vidiotic_ctl::ControlSource::MidiCc {
+                    device: "Launchkey Mini MK3".into(),
+                    channel: 1,
+                    cc: 21,
+                },
+                action: vidiotic_ctl::Action::SetBpm { min: 60.0, max: 180.0 },
+            },
+        ];
+        let text = p.serialize_ron();
+        let back = Project::deserialize_ron(&text).expect("parse");
+        assert_eq!(back.controls.bindings, p.controls.bindings);
     }
 
     #[test]
