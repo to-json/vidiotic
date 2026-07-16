@@ -39,8 +39,9 @@ pub struct ControlInput {
 }
 
 impl ControlInput {
-    /// `project_map` is this session's `.viproj`-embedded layer; the global
-    /// layer loads from the user config dir.
+    /// `project_map` is this session's `.viproj`-embedded layer, which wins
+    /// over (`Mapper`'s `over`) the user's global map from the config dir
+    /// (`Mapper`'s `base`).
     #[must_use]
     pub fn new(project_map: ControlMap) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -58,7 +59,7 @@ impl ControlInput {
 
     #[must_use]
     pub fn project_map(&self) -> &ControlMap {
-        &self.mapper.project
+        &self.mapper.over
     }
 
     /// Poll gamepads, rescan MIDI on a timer, and resolve+fire any pending
@@ -115,9 +116,15 @@ impl ControlInput {
 
 /// `Action -> Command`. `value` (normalized `0..=1`) only matters for
 /// `SetBpm`; every other variant carries its own params.
+///
+/// Returns `None` for `Nothing` and for every `Prep` verb: the player and
+/// `vidiotic-prep` share one `Action` enum (they share the `.vmap` format and
+/// its editor) and each rejects the other's half. A prep verb reaching here
+/// means a map was hand-edited or authored in the ctl bin against the wrong
+/// app — the binding simply doesn't fire.
 fn to_command(action: &Action, value: f32) -> Option<Command> {
     match action {
-        Action::Nothing => None,
+        Action::Nothing | Action::Prep(_) => None,
         Action::TapDownbeat => Some(Command::TapDownbeat),
         Action::TapTempo => Some(Command::TapTempo),
         Action::SoftReset => Some(Command::SoftReset),
@@ -144,6 +151,18 @@ mod tests {
     #[test]
     fn nothing_yields_no_command() {
         assert!(to_command(&Action::Nothing, 0.0).is_none());
+    }
+
+    /// The other half of the shared `Action` enum is `vidiotic-prep`'s, and
+    /// none of it means anything to the player.
+    #[test]
+    fn prep_verbs_yield_no_player_command() {
+        for action in vidiotic_ctl::Action::prep_catalog() {
+            assert!(
+                to_command(action, 1.0).is_none(),
+                "{action:?} must not resolve to a player command"
+            );
+        }
     }
 
     #[test]
