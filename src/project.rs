@@ -31,7 +31,13 @@ use crate::isf::IsfValue;
 ///
 /// v3: embedded control mappings (`Project.controls`). v2 files load
 /// unchanged (an absent `controls` key defaults to an empty map).
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// v4: `vidiotic-prep`'s `Action::Prep` verbs became bindable, widening the
+/// embedded map's vocabulary (`vidiotic_ctl::store::MAP_VERSION` 2). v3 files
+/// load unchanged — the player's action names are untouched, which is why the
+/// namespacing was additive; a v4 file whose map actually uses a Prep verb
+/// fails in a v3 binary at the unknown variant.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// A whole saved session: a flat clip pool, named clip-bank groupings over it,
 /// and the cue banks the sequencer plays.
@@ -372,6 +378,11 @@ fn migrate(p: &mut Project) {
     // v2 → v3: nothing to fix up — `controls` defaults to an empty map.
     if p.version == 2 {
         p.version = 3;
+    }
+    // v3 → v4: nothing to fix up — the action vocabulary only gained variants,
+    // so an existing `controls` map parses and means exactly what it did.
+    if p.version == 3 {
+        p.version = 4;
     }
 }
 
@@ -1091,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_file_without_controls_migrates_to_v3_with_empty_map() {
+    fn v2_file_without_controls_migrates_with_an_empty_map() {
         // A hand-written v2 file (no `controls` key) parses and migrates.
         let text = r#"(
             version: 2,
@@ -1105,6 +1116,35 @@ mod tests {
         migrate(&mut p);
         assert_eq!(p.version, FORMAT_VERSION);
         assert!(p.controls.bindings.is_empty());
+    }
+
+    /// v4 only widened the action vocabulary, so a v3 file's bindings must
+    /// survive migration meaning exactly what they meant before. This is the
+    /// property that let the namespacing be additive instead of a rename.
+    #[test]
+    fn v3_file_with_player_bindings_migrates_to_v4_unchanged() {
+        let text = r#"(
+            version: 3,
+            defaults: (bpm: 120.0, quantum: 4.0, phrase_len: 16),
+            clips: [],
+            clip_banks: [],
+            cue_banks: [],
+            controls: (bindings: [
+                (source: Key(key:"t", ctrl:false, alt:false, shift:false, cmd:false),
+                 action: TapDownbeat),
+                (source: MidiCc(device:"Launchkey", channel:1, cc:21),
+                 action: SetBpm(min:60.0, max:180.0)),
+            ]),
+        )"#;
+        let mut p = Project::deserialize_ron(text).expect("parse hand-written v3");
+        migrate(&mut p);
+        assert_eq!(p.version, 4);
+        assert_eq!(p.controls.bindings.len(), 2);
+        assert_eq!(p.controls.bindings[0].action, vidiotic_ctl::Action::TapDownbeat);
+        assert_eq!(
+            p.controls.bindings[1].action,
+            vidiotic_ctl::Action::SetBpm { min: 60.0, max: 180.0 }
+        );
     }
 
     #[test]
